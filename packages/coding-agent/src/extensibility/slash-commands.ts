@@ -6,6 +6,7 @@ import type { SlashCommand } from "../discovery";
 import { loadCapability } from "../discovery";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
+	getBuiltinSlashCommandDefs,
 	type BuiltinSlashCommand,
 	type SubcommandDef,
 } from "../slash-commands/builtin-registry";
@@ -115,6 +116,31 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<
 	}
 	return cmd;
 });
+
+/** Dynamic version that respects disabledCommands setting */
+export function getBuiltinSlashCommands(): ReadonlyArray<
+	BuiltinSlashCommand & {
+		getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null;
+		getInlineHint?: (argumentText: string) => string | null;
+	}
+> {
+	return getBuiltinSlashCommandDefs().map(cmd => {
+		if (cmd.subcommands) {
+			return {
+				...cmd,
+				getArgumentCompletions: buildArgumentCompletions(cmd.subcommands),
+				getInlineHint: buildSubcommandInlineHint(cmd.subcommands),
+			};
+		}
+		if (cmd.inlineHint) {
+			return {
+				...cmd,
+				getInlineHint: buildStaticInlineHint(cmd.inlineHint),
+			};
+		}
+		return cmd;
+	});
+}
 
 /**
  * Represents a custom slash command loaded from a file

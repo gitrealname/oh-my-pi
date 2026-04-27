@@ -1014,6 +1014,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 	},
 ];
 
+function isCommandEnabled(name: string): boolean {
+	const disabled = settings.get("disabledCommands" as SettingPath) as string[] | undefined;
+	return !disabled?.includes(name);
+}
+
 const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, BuiltinSlashCommandSpec>();
 for (const command of BUILTIN_SLASH_COMMAND_REGISTRY) {
 	BUILTIN_SLASH_COMMAND_LOOKUP.set(command.name, command);
@@ -1023,6 +1028,18 @@ for (const command of BUILTIN_SLASH_COMMAND_REGISTRY) {
 }
 
 /** Builtin command metadata used for slash-command autocomplete and help text. */
+export function getBuiltinSlashCommandDefs(): ReadonlyArray<BuiltinSlashCommand> {
+	return BUILTIN_SLASH_COMMAND_REGISTRY
+		.filter(c => isCommandEnabled(c.name))
+		.map(command => ({
+			name: command.name,
+			description: command.description,
+			subcommands: command.subcommands,
+			inlineHint: command.inlineHint,
+		}));
+}
+
+/** @deprecated Use getBuiltinSlashCommandDefs() for filtered list */
 export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BUILTIN_SLASH_COMMAND_REGISTRY.map(
 	command => ({
 		name: command.name,
@@ -1048,6 +1065,7 @@ export async function executeBuiltinSlashCommand(
 
 	const command = BUILTIN_SLASH_COMMAND_LOOKUP.get(parsed.name);
 	if (!command) return false;
+	if (!isCommandEnabled(command.name)) return false;
 	if (parsed.args.length > 0 && !command.allowArgs) {
 		return false;
 	}

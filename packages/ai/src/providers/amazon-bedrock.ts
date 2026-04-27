@@ -209,12 +209,14 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					delete Bun.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME;
 					delete process.env.AWS_ENDPOINT_URL;
 					delete Bun.env.AWS_ENDPOINT_URL;
-					// Use static credentials from env (set by aws-corp provider)
-					if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+					// Use credentials from aws-corp provider (module-scoped, not in process.env)
+					const { getCorpCredentials } = await import("./aws-corp");
+					const corpCreds = getCorpCredentials();
+					if (corpCreds) {
 						config.credentials = {
-							accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-							secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-							sessionToken: process.env.AWS_SESSION_TOKEN,
+							accessKeyId: corpCreds.accessKeyId,
+							secretAccessKey: corpCreds.secretAccessKey,
+							sessionToken: corpCreds.sessionToken,
 						};
 					}
 				}
