@@ -43,6 +43,7 @@ import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TreeSelectorComponent } from "../components/tree-selector";
+import { TreePeekComponent } from "../components/tree-peek";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 
@@ -567,7 +568,11 @@ export class SelectorController {
 		});
 	}
 
-	showTreeSelector(): void {
+	showTreeSelectorOriginal(): void {
+		this.showTreeSelector(true);
+	}
+
+	showTreeSelector(useOriginal = false): void {
 		const tree = this.ctx.sessionManager.getTree();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
@@ -577,11 +582,7 @@ export class SelectorController {
 		}
 
 		this.showSelector(done => {
-			const selector = new TreeSelectorComponent(
-				tree,
-				realLeafId,
-				this.ctx.ui.terminal.rows,
-				async entryId => {
+			const onNavigate = async (entryId: string) => {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === realLeafId) {
 						done();
@@ -679,17 +680,16 @@ export class SelectorController {
 						}
 						this.ctx.editor.onEscape = originalOnEscape;
 					}
-				},
-				() => {
-					done();
-					this.ctx.ui.requestRender();
-				},
-				(entryId, label) => {
-					this.ctx.sessionManager.appendLabelChange(entryId, label);
-					this.ctx.ui.requestRender();
-				},
-				settings.get("treeFilterMode"),
-			);
+				};
+			const onClose = () => { done(); this.ctx.ui.requestRender(); };
+			const onLabel = (entryId: string, label: string) => {
+				this.ctx.sessionManager.appendLabelChange(entryId, label);
+				this.ctx.ui.requestRender();
+			};
+			const filterMode = settings.get("treeFilterMode");
+			const selector = useOriginal
+				? new TreeSelectorComponent(tree, realLeafId, this.ctx.ui.terminal.rows, onNavigate, onClose, onLabel as any, filterMode)
+				: new TreePeekComponent(tree, realLeafId, this.ctx.ui.terminal.rows, this.ctx.ui, onNavigate, onClose);
 			return { component: selector, focus: selector };
 		});
 	}
