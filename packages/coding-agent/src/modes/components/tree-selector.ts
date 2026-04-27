@@ -407,6 +407,24 @@ class TreeList implements Component {
 		return this.#searchQuery;
 	}
 
+	get toolCallMap(): Map<string, ToolCallInfo> {
+		return this.#toolCallMap;
+	}
+
+	setSelectedIndex(index: number): void {
+		if (this.#filteredNodes.length === 0) return;
+		this.#selectedIndex = Math.max(0, Math.min(index, this.#filteredNodes.length - 1));
+		this.#lastSelectedId = this.#filteredNodes[this.#selectedIndex]?.node.entry.id ?? this.#lastSelectedId;
+	}
+
+	getSelectedIndex(): number {
+		return this.#selectedIndex;
+	}
+
+	getFilteredCount(): number {
+		return this.#filteredNodes.length;
+	}
+
 	getSelectedNode(): SessionTreeNode | undefined {
 		return this.#filteredNodes[this.#selectedIndex]?.node;
 	}
