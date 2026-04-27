@@ -9,9 +9,11 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 } from "./model-thinking";
-import type { BedrockOptions } from "./providers/amazon-bedrock";
-import type { AnthropicOptions } from "./providers/anthropic";
-import type { CursorOptions } from "./providers/cursor";
+import { type BedrockOptions, streamBedrock } from "./providers/amazon-bedrock";
+import { streamAwsCorp } from "./providers/aws-corp";
+import { type AnthropicOptions, streamAnthropic } from "./providers/anthropic";
+import { streamAzureOpenAIResponses } from "./providers/azure-openai-responses";
+import { type CursorOptions, streamCursor } from "./providers/cursor";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
@@ -142,6 +144,11 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
+	"aws-corp": () => {
+		if ($env.AWS_CORP_PROFILE || $env.AWS_CORP_SSO_SESSION) {
+			return "<authenticated>";
+		}
+	},
 	synthetic: "SYNTHETIC_API_KEY",
 	"cloudflare-ai-gateway": "CLOUDFLARE_AI_GATEWAY_API_KEY",
 	huggingface: () => $pickenv("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"),
@@ -203,6 +210,9 @@ export function stream<TApi extends Api>(
 		return streamGoogleVertex(model as Model<"google-vertex">, context, options as GoogleVertexOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
+		if (model.provider === "aws-corp") {
+			return streamAwsCorp(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
+		}
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
 	}
 
