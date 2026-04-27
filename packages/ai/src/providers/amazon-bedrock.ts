@@ -200,6 +200,22 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			};
 
 			while (true) {
+				// Force endpoint if AWS_CORP_REGION is set (aws-corp provider)
+				if (Bun.env.AWS_CORP_REGION) {
+					config.endpoint = `https://bedrock-runtime.${config.region}.amazonaws.com`;
+					delete process.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME;
+					delete Bun.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME;
+					delete process.env.AWS_ENDPOINT_URL;
+					delete Bun.env.AWS_ENDPOINT_URL;
+					// Use static credentials from env (set by aws-corp provider)
+					if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+						config.credentials = {
+							accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+							secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+							sessionToken: process.env.AWS_SESSION_TOKEN,
+						};
+					}
+				}
 				const client = new BedrockRuntimeClient(config);
 				try {
 					const command = new ConverseStreamCommand(commandInput);

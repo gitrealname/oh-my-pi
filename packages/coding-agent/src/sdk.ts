@@ -736,6 +736,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const modelMatchPreferences = {
 		usageOrder: settings.getStorage()?.getModelUsageOrder(),
 	};
+	// DEBUG: Log model resolution inputs
 	const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
 		resolveModelRoleValue(settings.getModelRole("default"), modelRegistry.getAvailable(), {
 			settings,
@@ -1156,6 +1157,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionsResult.runtime.pendingProviderRegistrations = [];
 		}
 
+
 		// Resolve deferred --model pattern now that extension models are registered.
 		if (!model && options.modelPattern) {
 			const availableModels = modelRegistry.getAll();
@@ -1178,7 +1180,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!model && !options.modelPattern) {
 			const allModels = modelRegistry.getAll();
 			for (const candidate of allModels) {
-				if (await hasModelApiKey(candidate)) {
+				const hasKey = await hasModelApiKey(candidate);
+				if (hasKey) {
 					model = candidate;
 					break;
 				}
