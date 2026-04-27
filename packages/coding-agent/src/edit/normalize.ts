@@ -12,13 +12,20 @@ import { padding } from "@oh-my-pi/pi-tui";
 
 export type LineEnding = "\r\n" | "\n";
 
-/** Detect the predominant line ending in content */
+/** Detect the predominant line ending in content (count-based, handles mixed endings) */
 export function detectLineEnding(content: string): LineEnding {
-	const crlfIdx = content.indexOf("\r\n");
-	const lfIdx = content.indexOf("\n");
-	if (lfIdx === -1) return "\n";
-	if (crlfIdx === -1) return "\n";
-	return crlfIdx < lfIdx ? "\r\n" : "\n";
+	let crlf = 0;
+	let lf = 0;
+	for (let i = 0; i < content.length; i++) {
+		if (content[i] === "\r" && content[i + 1] === "\n") {
+			crlf++;
+			i++; // skip the \n
+		} else if (content[i] === "\n") {
+			lf++;
+		}
+	}
+	if (crlf === 0 && lf === 0) return "\n";
+	return crlf >= lf ? "\r\n" : "\n";
 }
 
 /** Normalize all line endings to LF */
