@@ -76,7 +76,20 @@ function toInferenceProfileArn(modelId: string, region: string, accountId: strin
 	return `arn:aws:bedrock:${region}:${accountId}:inference-profile/${modelId}`;
 }
 
-// ── Credential loading via SDK ─────────────────────────────────────────
+// ── Credential storage (module-scoped, not in process.env) ─────────────
+
+interface CorpCredentials {
+	accessKeyId: string;
+	secretAccessKey: string;
+	sessionToken: string;
+}
+
+let _corpCreds: CorpCredentials | null = null;
+
+/** Get current corp credentials without polluting process.env */
+export function getCorpCredentials(): CorpCredentials | null {
+	return _corpCreds;
+}
 
 async function tryLoadCredentials(): Promise<boolean> {
 	const profile = getProfile();
@@ -84,14 +97,12 @@ async function tryLoadCredentials(): Promise<boolean> {
 	try {
 		const creds = await fromSSO({ profile })();
 		if (!creds.accessKeyId) return false;
-		for (const [k, v] of Object.entries({
-			AWS_ACCESS_KEY_ID: creds.accessKeyId,
-			AWS_SECRET_ACCESS_KEY: creds.secretAccessKey,
-			AWS_SESSION_TOKEN: creds.sessionToken || "",
-		})) {
-			process.env[k] = v;
-			Bun.env[k] = v;
-		}
+		_corpCreds = {
+			accessKeyId: creds.accessKeyId,
+			secretAccessKey: creds.secretAccessKey,
+			sessionToken: creds.sessionToken || "",
+		};
+		// Do NOT set process.env — subprocesses should not inherit corp credentials
 		delete process.env.AWS_PROFILE;
 		delete Bun.env.AWS_PROFILE;
 		credsExpiry = Date.now() + 50 * 60 * 1000;
