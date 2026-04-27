@@ -1,105 +1,261 @@
 /**
  * aws-corp provider — wraps streamBedrock with SSO credentials.
- * Loads credentials via `aws configure export-credentials` at startup.
- * Auto-triggers `aws sso login` if token is expired.
+ * Uses AWS SDK credential-provider-sso + OIDC device auth (no AWS CLI dependency).
  *
  * Env vars: AWS_CORP_PROFILE (required), AWS_CORP_REGION (default: us-east-1)
  */
-import { execSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { fromSSO } from "@aws-sdk/credential-provider-sso";
+import { parseKnownFiles, loadSsoSessionData, getSSOTokenFromFile } from "@smithy/shared-ini-file-loader";
 import { type BedrockOptions, streamBedrock } from "./amazon-bedrock";
 import type { AssistantMessageEventStream, Context, Model, StreamFunction } from "../types";
 
 const log = (msg: string) => console.error("[aws-corp] " + msg);
 
+function env(k: string): string {
+	return Bun.env[k] || process.env[k] || "";
+}
+
 function getProfile(): string {
-	return Bun.env.AWS_CORP_PROFILE || Bun.env.AWS_CORP_SSO_SESSION || process.env.AWS_CORP_PROFILE || process.env.AWS_CORP_SSO_SESSION || "";
+	return env("AWS_CORP_PROFILE") || env("AWS_CORP_SSO_SESSION") || "";
 }
 
 function getRegion(): string {
-	return Bun.env.AWS_CORP_REGION || process.env.AWS_CORP_REGION || "us-east-1";
-}
-
-// Resolve sso-session name from profile via: aws configure get sso_session --profile <p>
-let _ssoSession: string | null = null;
-function getSsoSession(): string {
-	if (_ssoSession !== null) return _ssoSession;
-	const profile = getProfile();
-	if (!profile) { _ssoSession = ""; return ""; }
-	try {
-		_ssoSession = execSync(`aws configure get sso_session --profile ${profile}`, {
-			encoding: "utf-8", timeout: 10000, windowsHide: true,
-		}).trim();
-	} catch {
-		_ssoSession = profile; // fallback: use profile name as session name
-	}
-	return _ssoSession;
+	return env("AWS_CORP_REGION") || "us-east-1";
 }
 
 let credsExpiry = 0;
 
-function tryExportCredentials(): { ok: boolean; error?: string } {
+// ── SSO config resolution ──────────────────────────────────────────────
+
+interface SsoInfo {
+	ssoSession: string;
+	startUrl: string;
+	ssoRegion: string;
+}
+
+async function resolveSsoInfo(): Promise<SsoInfo | null> {
 	const profile = getProfile();
-	if (!profile) return { ok: false, error: "no AWS_CORP_PROFILE" };
+	if (!profile) return null;
 	try {
-		const out = execSync(`aws configure export-credentials --profile ${profile} --format env-no-export`, {
-			encoding: "utf-8", timeout: 30000, windowsHide: true,
-		});
-		const lines = out.trim().split("\n");
-		let gotKey = false;
-		for (const line of lines) {
-			const eq = line.indexOf("=");
-			if (eq > 0) {
-				const k = line.slice(0, eq).trim();
-				const v = line.slice(eq + 1).trim();
-				process.env[k] = v;
-				Bun.env[k] = v;
-				if (k === "AWS_ACCESS_KEY_ID") gotKey = true;
-			}
+		const profiles = await parseKnownFiles({});
+		const p = profiles[profile];
+		if (!p?.sso_session) return null;
+		const sessions = await loadSsoSessionData({});
+		const s = sessions[p.sso_session];
+		if (!s) return null;
+		return { ssoSession: p.sso_session, startUrl: s.sso_start_url || "", ssoRegion: s.sso_region || "us-east-1" };
+	} catch {
+		return null;
+	}
+}
+
+// ── Credential loading via SDK ─────────────────────────────────────────
+
+async function tryLoadCredentials(): Promise<boolean> {
+	const profile = getProfile();
+	if (!profile) return false;
+	try {
+		const creds = await fromSSO({ profile })();
+		if (!creds.accessKeyId) return false;
+		for (const [k, v] of Object.entries({
+			AWS_ACCESS_KEY_ID: creds.accessKeyId,
+			AWS_SECRET_ACCESS_KEY: creds.secretAccessKey,
+			AWS_SESSION_TOKEN: creds.sessionToken || "",
+		})) {
+			process.env[k] = v;
+			Bun.env[k] = v;
 		}
-		if (!gotKey) return { ok: false, error: "export returned no AWS_ACCESS_KEY_ID" };
 		delete process.env.AWS_PROFILE;
 		delete Bun.env.AWS_PROFILE;
 		credsExpiry = Date.now() + 50 * 60 * 1000;
-		return { ok: true };
-	} catch (e: any) {
-		return { ok: false, error: e.stderr?.toString().trim() || e.message || "unknown" };
-	}
-}
-
-function ssoLogin(): boolean {
-	const session = getSsoSession();
-	if (!session) return false;
-	console.error("[aws-corp] SSO token expired. Logging in...");
-	const result = spawnSync("aws", ["sso", "login", "--sso-session", session], {
-		stdio: "inherit", timeout: 120000, windowsHide: false,
-	});
-	if (result.status !== 0) {
-		log("SSO login failed, exit=" + result.status);
+		return true;
+	} catch {
 		return false;
 	}
-	log("SSO login succeeded");
-	return true;
 }
 
-function ensureCredentials(): boolean {
-	if (Date.now() < credsExpiry) return true;
+// ── OIDC device authorization flow (replaces `aws sso login`) ──────────
 
-	const first = tryExportCredentials();
-	if (first.ok) { log("credentials loaded"); return true; }
-	log("export failed: " + first.error);
+function oidcEndpoint(region: string): string {
+	return `https://oidc.${region}.amazonaws.com`;
+}
 
-	if (!ssoLogin()) return false;
+async function oidcPost(url: string, body: Record<string, unknown>): Promise<any> {
+	const res = await fetch(url, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(`OIDC ${res.status}: ${text}`);
+	}
+	return res.json();
+}
 
-	// Poll for credentials after login — back off
-	const delays = [500, 1000, 2000, 3000, 5000];
-	for (let i = 0; i < delays.length; i++) {
-		Bun.sleepSync(delays[i]);
-		const result = tryExportCredentials();
-		if (result.ok) { log("credentials loaded after login"); return true; }
+function ssoTokenCachePath(sessionName: string): string {
+	const hash = createHash("sha1").update(sessionName).digest("hex");
+	return join(homedir(), ".aws", "sso", "cache", `${hash}.json`);
+}
+
+function openBrowser(url: string): void {
+	try {
+		if (process.platform === "win32") {
+			spawnSync("cmd", ["/c", "start", "", url], { windowsHide: true });
+		} else if (process.platform === "darwin") {
+			spawnSync("open", [url]);
+		} else {
+			spawnSync("xdg-open", [url]);
+		}
+	} catch {}
+}
+
+function clientCachePath(region: string): string {
+	return join(homedir(), ".aws", "sso", "cache", `omp-client-${region}.json`);
+}
+
+async function getOrRegisterClient(base: string, region: string): Promise<{ clientId: string; clientSecret: string; clientSecretExpiresAt: number }> {
+	const cachePath = clientCachePath(region);
+	// Try cached registration
+	try {
+		const cached = JSON.parse(await Bun.file(cachePath).text());
+		if (cached.clientId && cached.clientSecret && cached.clientSecretExpiresAt * 1000 > Date.now() + 60000) {
+			return cached;
+		}
+	} catch {}
+
+	// Register new client
+	log("registering OIDC client...");
+	const reg = await oidcPost(`${base}/client/register`, {
+		clientName: "omp-aws-corp",
+		clientType: "public",
+		scopes: ["sso:account:access"],
+	});
+	// Cache for reuse (valid ~90 days)
+	try {
+		mkdirSync(join(homedir(), ".aws", "sso", "cache"), { recursive: true });
+		writeFileSync(cachePath, JSON.stringify({
+			clientId: reg.clientId,
+			clientSecret: reg.clientSecret,
+			clientSecretExpiresAt: reg.clientSecretExpiresAt,
+		}));
+	} catch {}
+	return reg;
+}
+
+async function deviceAuthLogin(info: SsoInfo): Promise<boolean> {
+	const base = oidcEndpoint(info.ssoRegion);
+
+	// Step 1: Get or register client (cached to avoid repeated consent)
+	const { clientId, clientSecret, clientSecretExpiresAt } = await getOrRegisterClient(base, info.ssoRegion);
+
+	// Step 2: Start device authorization
+	const auth = await oidcPost(`${base}/device_authorization`, {
+		clientId,
+		clientSecret,
+		startUrl: info.startUrl,
+	});
+	const { deviceCode, verificationUriComplete, userCode, interval: pollInterval, expiresIn } = auth;
+
+	// Step 3: Open browser
+	console.error(`[aws-corp] Authorize this device: ${verificationUriComplete}`);
+	if (userCode) console.error(`[aws-corp] Confirmation code: ${userCode}`);
+	openBrowser(verificationUriComplete);
+
+	// Step 4: Poll for token
+	const intervalMs = ((pollInterval || 5) + 1) * 1000; // add 1s buffer
+	const deadline = Date.now() + (expiresIn || 600) * 1000;
+
+	while (Date.now() < deadline) {
+		Bun.sleepSync(intervalMs);
+		try {
+			const token = await oidcPost(`${base}/token`, {
+				clientId,
+				clientSecret,
+				deviceCode,
+				grantType: "urn:ietf:params:oauth:grant-type:device_code",
+			});
+
+			// Step 5: Write token to cache
+			const cacheData = {
+				startUrl: info.startUrl,
+				region: info.ssoRegion,
+				accessToken: token.accessToken,
+				expiresAt: new Date(Date.now() + token.expiresIn * 1000).toISOString(),
+				clientId,
+				clientSecret,
+				registrationExpiresAt: new Date(clientSecretExpiresAt * 1000).toISOString(),
+				refreshToken: token.refreshToken,
+			};
+			const cachePath = ssoTokenCachePath(info.ssoSession);
+			mkdirSync(join(homedir(), ".aws", "sso", "cache"), { recursive: true });
+			writeFileSync(cachePath, JSON.stringify(cacheData, null, 2));
+			log("SSO login succeeded, token cached");
+			return true;
+		} catch (e: any) {
+			const body = e.message || "";
+			if (body.includes("authorization_pending") || body.includes("slow_down")) {
+				continue; // user hasn't authorized yet
+			}
+			log("token poll error: " + body);
+			return false;
+		}
 	}
 
-	console.error("[aws-corp] Failed to obtain credentials. Run: aws sso login --profile " + getProfile());
+	log("device authorization timed out");
 	return false;
+}
+
+// ── Main credential flow ───────────────────────────────────────────────
+
+async function ssoLogin(): Promise<boolean> {
+	const info = await resolveSsoInfo();
+	if (!info?.startUrl) {
+		log("cannot resolve SSO config for profile: " + getProfile());
+		return false;
+	}
+	log("SSO token expired or missing");
+	try {
+		if (await deviceAuthLogin(info)) {
+			return await tryLoadCredentials();
+		}
+	} catch (e: any) {
+		log("device auth failed: " + (e.message || e));
+	}
+	return false;
+}
+
+let _credentialPromise: Promise<boolean> | null = null;
+
+async function ensureCredentials(): Promise<boolean> {
+	if (Date.now() < credsExpiry) return true;
+
+	// Prevent concurrent auth flows
+	if (_credentialPromise) return _credentialPromise;
+
+	_credentialPromise = (async () => {
+		try {
+			if (await tryLoadCredentials()) {
+				log("credentials loaded");
+				return true;
+			}
+			if (await ssoLogin()) {
+				log("credentials loaded after login");
+				return true;
+			}
+			console.error("[aws-corp] Failed to obtain credentials. Ensure SSO is configured for profile: " + getProfile());
+			return false;
+		} finally {
+			_credentialPromise = null;
+		}
+	})();
+
+	return _credentialPromise;
 }
 
 // Deferred startup — module scope runs at compile time in bun --compile
