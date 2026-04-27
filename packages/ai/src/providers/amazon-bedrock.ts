@@ -51,6 +51,8 @@ import { transformMessages } from "./transform-messages";
 export interface BedrockOptions extends StreamOptions {
 	region?: string;
 	profile?: string;
+	/** Override the model ID sent to Bedrock (e.g. full inference profile ARN) */
+	modelIdOverride?: string;
 	toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string };
 	/* See https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html for supported models. */
 	reasoning?: Effort;
@@ -182,7 +184,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			}
 
 			const commandInput = {
-				modelId: model.id,
+				modelId: options.modelIdOverride || model.id,
 				messages: convertMessages(context, model, cacheRetention),
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: { maxTokens: options.maxTokens, temperature: options.temperature, topP: options.topP },

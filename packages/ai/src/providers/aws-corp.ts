@@ -36,6 +36,7 @@ interface SsoInfo {
 	ssoSession: string;
 	startUrl: string;
 	ssoRegion: string;
+	accountId: string;
 }
 
 async function resolveSsoInfo(): Promise<SsoInfo | null> {
@@ -48,10 +49,31 @@ async function resolveSsoInfo(): Promise<SsoInfo | null> {
 		const sessions = await loadSsoSessionData({});
 		const s = sessions[p.sso_session];
 		if (!s) return null;
-		return { ssoSession: p.sso_session, startUrl: s.sso_start_url || "", ssoRegion: s.sso_region || "us-east-1" };
+		return {
+			ssoSession: p.sso_session,
+			startUrl: s.sso_start_url || "",
+			ssoRegion: s.sso_region || "us-east-1",
+			accountId: p.sso_account_id || "",
+		};
 	} catch {
 		return null;
 	}
+}
+
+// Cache resolved account ID for ARN construction
+let _accountId = "";
+
+async function getAccountId(): Promise<string> {
+	if (_accountId) return _accountId;
+	const info = await resolveSsoInfo();
+	if (info?.accountId) _accountId = info.accountId;
+	return _accountId;
+}
+
+/** Convert short profile ID to full inference profile ARN */
+function toInferenceProfileArn(modelId: string, region: string, accountId: string): string {
+	if (modelId.startsWith("arn:")) return modelId; // already an ARN
+	return `arn:aws:bedrock:${region}:${accountId}:inference-profile/${modelId}`;
 }
 
 // ── Credential loading via SDK ─────────────────────────────────────────
@@ -240,6 +262,8 @@ async function ensureCredentials(): Promise<boolean> {
 
 	_credentialPromise = (async () => {
 		try {
+			// Resolve account ID for ARN construction
+			if (!_accountId) await getAccountId();
 			if (await tryLoadCredentials()) {
 				log("credentials loaded");
 				return true;
@@ -269,5 +293,8 @@ export const streamAwsCorp: StreamFunction<"bedrock-converse-stream"> = (
 	options: BedrockOptions,
 ): AssistantMessageEventStream => {
 	ensureCredentials();
-	return streamBedrock(model, context, { ...options, region: getRegion(), profile: undefined });
+	const region = getRegion();
+	// Construct full inference profile ARN for corp accounting
+	const modelIdOverride = _accountId ? toInferenceProfileArn(model.id, region, _accountId) : undefined;
+	return streamBedrock(model, context, { ...options, region, profile: undefined, modelIdOverride });
 };
