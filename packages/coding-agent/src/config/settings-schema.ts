@@ -1862,6 +1862,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Launch browser in headless mode (disable to show browser UI)",
 		},
 	},
+	"browser.connectUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Browser Connect URL",
+			description:
+				"Connect to an existing Chrome/Edge instance at this debug URL (e.g. http://localhost:9222) instead of launching a new browser. Falls back to launching if the instance is not reachable.",
+		},
+	},
 	"browser.screenshotDir": {
 		type: "string",
 		default: undefined,
