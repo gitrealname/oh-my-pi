@@ -732,6 +732,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	#browser: Browser | null = null;
 	#page: Page | null = null;
 	#currentHeadless: boolean | null = null;
+	#isConnected = false;
 	#browserSession: CDPSession | null = null;
 	#userAgentOverride: UserAgentOverride | null = null;
 	#elementIdCounter = 0;
@@ -749,11 +750,16 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		}
 		this.#page = null;
 		if (this.#browser?.connected) {
-			await this.#browser.close();
+			if (this.#isConnected) {
+				this.#browser.disconnect();
+			} else {
+				await this.#browser.close();
+			}
 		}
 		this.#browser = null;
 		this.#browserSession = null;
 		this.#userAgentOverride = null;
+		this.#isConnected = false;
 	}
 
 	async #resetBrowser(params?: BrowserParams): Promise<Page> {
@@ -793,6 +799,19 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 			launchArgs.push("--ignore-certificate-errors");
 		}
+		const connectUrl = this.session.settings.get("browser.connectUrl") as string | undefined;
+		if (connectUrl) {
+			try {
+				this.#browser = await puppeteer.connect({ browserURL: connectUrl, defaultViewport: null });
+				this.#isConnected = true;
+				const pages = await this.#browser.pages();
+				this.#page = pages[0] ?? await this.#browser.newPage();
+				return this.#page;
+			} catch {
+				logger.debug("Could not connect to browser at", { url: connectUrl }, "— falling back to launch");
+			}
+		}
+		this.#isConnected = false;
 		this.#browser = await puppeteer.launch({
 			headless: this.#currentHeadless,
 			defaultViewport: this.#currentHeadless ? initialViewport : null,
@@ -810,7 +829,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 
 	async #ensurePage(params?: BrowserParams): Promise<Page> {
 		const desiredHeadless = this.session.settings.get("browser.headless");
-		if (this.#currentHeadless !== null && this.#currentHeadless !== desiredHeadless) {
+		if (!this.#isConnected && this.#currentHeadless !== null && this.#currentHeadless !== desiredHeadless) {
 			return this.#resetBrowser(params);
 		}
 		if (this.#page && !this.#page.isClosed()) {
