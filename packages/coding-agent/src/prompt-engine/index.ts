@@ -29,6 +29,7 @@ import {
 	readSkillContent,
 	resolveSkillPath,
 } from "./prompt-loader";
+import { DEFAULTS as SC_DEFAULTS, SessionState, type SessionContinuityConfig } from "./session-state";
 
 // ── Arg substitution ────────────────────────────────────────────────────
 
@@ -187,6 +188,20 @@ export function createPromptEngine(pi: ExtensionAPI): void {
 	let previousModel: Model<Api> | undefined;
 	let previousThinking: ThinkingLevel | undefined;
 	let runtimeModel: Model<Api> | undefined;
+
+	// Session continuity — read config from settings
+	function readSCConfig(): Partial<SessionContinuityConfig> {
+		try {
+			const raw = (settings as any).get("sessionContinuity") as Record<string, unknown> | undefined;
+			if (!raw || typeof raw !== "object") return {};
+			return {
+				...(typeof raw.enabled === "boolean" ? { enabled: raw.enabled } : {}),
+				...(typeof raw.maxEvents === "number" ? { maxEvents: raw.maxEvents } : {}),
+				...(typeof raw.maxContextLines === "number" ? { maxContextLines: raw.maxContextLines } : {}),
+			};
+		} catch { return {}; }
+	}
+	const sessionState = new SessionState(readSCConfig());
 
 	function getCurrentModel(ctx: Pick<ExtensionContext, "model">): Model<Api> | undefined {
 		return runtimeModel ?? ctx.model;
@@ -447,5 +462,43 @@ export function createPromptEngine(pi: ExtensionAPI): void {
 			pendingSkillRestore = undefined;
 			await restoreState(ctx, model, thinking);
 		}
+	});
+
+	// ── Session continuity handlers ─────────────────────────────────────
+
+	pi.on("tool_result", async (event) => {
+		if (!sessionState.enabled) return;
+		const name = event.toolName;
+		if (name === "bash") {
+			const cmd = (event.input as { command?: string }).command;
+			const cwd = (event.input as { working_dir?: string }).working_dir;
+			if (cmd) sessionState.trackCommand(cmd, cwd);
+		} else if (name === "read" || name === "edit" || name === "write") {
+			const path = (event.input as { path?: string }).path;
+			if (path) sessionState.trackFile(path, name as "read" | "edit" | "write");
+		} else if (name === "grep" || name === "find") {
+			// Track searched paths from results
+			const path = (event.input as { path?: string }).path;
+			if (path) sessionState.trackFile(path, name as "grep" | "find");
+		}
+	});
+
+	pi.on("session.compacting", async (_event) => {
+		if (!sessionState.enabled) return;
+		// Re-read config in case it changed mid-session
+		sessionState.updateConfig(readSCConfig());
+		const context = sessionState.buildContextLines();
+		const preserveData = sessionState.buildPreserveData();
+		// Clear accumulated state — it's now captured in the summary
+		sessionState.clear();
+		if (context.length === 0) return;
+		return { context, preserveData };
+	});
+
+	pi.on("session_compact", async (event) => {
+		if (!sessionState.enabled) return;
+		// Restore file tracking from previous compaction's preserveData
+		const pd = (event.compactionEntry as any)?.preserveData;
+		if (pd) sessionState.restoreFrom(pd);
 	});
 }
