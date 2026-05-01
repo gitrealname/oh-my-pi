@@ -2,6 +2,179 @@
 
 ## [Unreleased]
 
+## [14.5.14] - 2026-05-01
+### Changed
+
+- Changed markdown conversion and archive tooling to defer loading heavy dependencies (Turndown, fflate, and browser agent content) until first use, reducing startup overhead for CLI startup and command initialization
+
+### Fixed
+
+- Fixed changelog state tracking by flushing `lastChangelogVersion` to settings immediately when showing new entries, so the updated version is persisted across restarts
+
+## [14.5.13] - 2026-05-01
+
+### Breaking Changes
+
+- Removed the built-in `python` tool in favor of `eval`, so tool allowlists and tool-call handlers referencing `python` need to migrate
+- Removed the `python.toolMode` setting and replaced mode control with separate `eval.py` and `eval.js` toggles
+- Changed the tool runtime config surface by migrating `python` execution timeout/export behavior to `eval` and replacing `./ipy/*` internal exports with `./eval/*` paths
+- Changed the `eval` tool wire format to a single `input` string composed of markdown fenced code blocks (with per-fence language, timeout, title, and reset metadata in the info string) instead of top-level `cells`, `language`, `timeout`, and `reset` fields
+
+### Added
+
+- Added a JavaScript backend to the `eval` tool with an in-process VM runtime and JS helper bridge (`read`, `write`, `glob`, etc.)
+- Added `eval.py` and `eval.js` settings so Python and JavaScript `eval` backends can be enabled or disabled independently
+- Added `rename_file` action to the Lsp tool to rename files and directories with LSP `workspace/willRenameFiles` and `workspace/didRenameFiles` flow, applying returned workspace edits before moving files
+- Added `apply: false` preview mode for `rename_file` so users can see planned LSP edits without performing filesystem changes
+- Added `request` action to invoke arbitrary LSP methods, with automatic `textDocument`/`position` parameter construction from `file`/`line`/`symbol` and support for explicit JSON `payload`
+- Added `capabilities` action to display language server capabilities (for a file or all configured servers) through the LSP tool
+
+### Changed
+
+- Changed AGENTS.md discovery to respect `.gitignore` files during project context collection so ignored context files are no longer loaded
+- Changed eval tool initialization to skip Python kernel preflight when the JavaScript backend is enabled, avoiding unnecessary startup checks
+- Changed model registry refresh flow to defer rebuilding the canonical model index until refresh operations complete, reducing refresh churn
+- Changed execution/tool discovery flow so `exec` maps to `eval` when any `eval` backend is enabled, while `bash` stays independently available
+- Changed `eval` dispatch to automatically fall back to JavaScript when Python is unavailable and JavaScript backend is enabled
+- Parallelized plugin root preloading with other startup initialization in `runRootCommand` to reduce startup latency
+- Parallelized session bootstrap work in `createAgentSession`, including AGENTS.md scanning, context discovery, prompt template loading, slash command loading, and skill discovery, to reduce time to first available session
+
+### Fixed
+
+- Fixed eval startup messaging to report `eval` as unavailable when Python is unreachable and JavaScript backend is disabled
+
+### Fixed
+- Stabilized MCP tool ordering so reconnects and refreshes no longer reorder the tools array sent to the model. Anthropic prompt caching is keyed on byte-identical tool definitions; previously, the order depended on connection sequence and a single MCP server reconnect could shuffle tools across servers and invalidate the tools cache breakpoint.
+- Skipped redundant system-prompt rebuilds in `AgentSession.refreshMCPTools` when the active tool set is unchanged. MCP transport flapping (e.g. routine 5-minute SSE reconnects) used to call `rebuildSystemPrompt` on every reconnect even though the resulting prompt was byte-identical, eating CPU and risking cache misses if the rebuild ever became non-deterministic. The applied-tool signature also covers `customWireName` so a wire-name flip with the rest of the tool metadata constant still forces a rebuild.
+
+## [14.5.12] - 2026-04-30
+
+### Breaking Changes
+
+- Removed the legacy browser action verbs (`goto`, `observe`, `click`, `type`, `fill`, `press`, `scroll`, `drag`, `wait_for_selector`, `extract_readable`, and `screenshot`) in favor of invoking those workflows through `run`
+
+### Added
+
+- Added a `browser` tool `open`/`run`/`close` flow with a `run` action that executes async JavaScript and provides `page`, `browser`, `tab`, `display`, `assert`, and `wait` in scope
+- Added named tabs on `open` with default name `main` so browser state can be reused across `run` calls and subagents
+- Added support for `app.path` and `app.cdp_url` on `open` to launch/connect to CDP-capable desktop apps
+
+### Changed
+
+- Changed browser tool output rendering to display `run` calls as JavaScript code cells with status and output previews while showing `open`/`close` as compact status lines
+- Changed `open` to open or reuse named tabs and `close` to support `all: true` and `kill`-based process termination behavior
+- Changed app attachment behavior to reuse an existing CDP endpoint when available and avoid unnecessary respawn of matching app processes
+- Changed tab closing so closing a tab no longer implicitly affects unnamed sessions when multiple tabs are used
+- Changed browser export rendering to label outputs under the `browser` tool and include app metadata badges
+
+### Fixed
+
+- Fixed Electron/CDP attachment target selection to skip helper windows and pick the most likely user-visible page target
+- Fixed connection startup by waiting for the CDP endpoint and surfacing a timeout error when it does not become available
+- Fixed plan mode to auto-redirect `write` and `edit` calls targeting a bare `PLAN.md` (or any same-basename cwd-relative path) to the canonical `local://PLAN.md` plan artifact instead of rejecting them
+
+## [14.5.11] - 2026-04-30
+### Breaking Changes
+
+- `todo_write`: renamed `replace` op to `init` and reshaped its input to `list: [{phase: string, items: string[]}]`. Tasks no longer accept a `status` field; all start `pending` and the first auto-promotes to `in_progress`. The `append` op's `items` is now `string[]` (was `{id, label}[]`)
+- `todo_write`: removed the synthetic `task-N` / `phase-N` ids — task identity is now its `content` and phase identity is its `name`. The `task` field on `start`/`done`/`drop`/`note` and the `phase` field on `done`/`drop`/`rm`/`append` take those values directly
+- `todo_write`: phase names no longer accept a numeric/roman prefix (`I.`, `1.`, `Phase 1:`, …). The renderer numbers phases visually (Ⅰ. Ⅱ. Ⅲ. …) and the model-facing state stores the bare noun phrase
+
+### Changed
+
+- Changed `/todo` task and phase operations to target items by fuzzy content or phase name matching instead of numeric IDs
+- Changed initial todo markdown export template heading from `# I. Todos` to `# Todos`
+
+### Fixed
+
+- Fixed todo auto-clear scheduling to identify completed tasks by phase and content so only the matching task is cleared after delays
+
+## [14.5.10] - 2026-04-30
+
+### Breaking Changes
+
+- Removed the `worktree` parameter from `github` `pr_checkout`. Worktrees are now always written to `~/.omp/wt/<encoded-primary-repo>/pr-<number>/`, derived from the primary repository path
+- Stopped reading the `branch` parameter for `github` `pr_checkout`. The local branch is now always `pr-<number>`; the `branch` schema field is still accepted by `pr_push`, `repo_view`, and `run_watch`
+
+### Added
+
+- Added `checkouts` summary entries to `pr_checkout` results, including each checkout's branch, worktree path, remote, and reuse status
+- Added combined summaries for `pr_view` and `pr_diff` when `pr` is an array, so multi-request responses now include all requested pull requests in one return
+- Added array support to the `pr` parameter on `github` `pr_view`, `pr_diff`, and `pr_checkout` so a single call can fetch, diff, or check out multiple pull requests in one batch
+- Added a per-repo serialization lock (`withRepoLock`) so concurrent `pr_checkout` calls against the same repository no longer race on git's internal `.git/config.lock`, commit-graph, and worktree lock files
+
+### Changed
+
+- Changed the diff preview shown after edits so changed lines are never collapsed: removed runs and the global preview budget no longer truncate, only unchanged context still collapses
+- Changed adjacent `-`/`+` pairs in edit previews to fold into a single `*<line><hash>|<new-content>` modification line so 1:1 line replacements stay compact
+- Changed `git.remote.add` to be idempotent when the remote already exists with the same URL (instead of failing with `remote ... already exists`), and to surface a clear error when the existing URL differs
+- Changed `pr_checkout` to run `gh pr view` calls in parallel for batch invocations while serializing the in-repo git mutations to keep the operation race-free
+- Changed `pr_checkout` to auto-derive the worktree location and local branch name (see Breaking Changes), removing the per-call overrides that previously let callers pin a worktree path or local branch
+
+### Removed
+
+- Removed the `./hooks` and `./hooks/*` package export entries
+- Removed the `Suspicious duplicate` warning emitted after edits — it produced too many false positives (e.g. legitimate adjacent `\t});\n\t});`); the auto-fix path that uses bracket balance to safely de-duplicate is unchanged
+
+### Fixed
+
+- Fixed bash interceptor rules to also check the original command before `cd` normalization, so leading `cd ... &&` wrappers no longer bypass interception
+- Fixed LSP client shutdown to properly await the language server's exit instead of fire-and-forget, preventing premature process termination on SIGINT and SIGTERM
+- Fixed concurrent bash commands being tracked independently so aborting one no longer silently drops tracking of others
+
+## [14.5.9] - 2026-04-30
+
+### Added
+
+- Added the `/context` slash command to display an estimated context-usage breakdown panel for the current session
+- Added `-LidA..LidB` syntax to delete inclusive line ranges in a single atom operation
+- Added `LidA..LidB=TEXT` range-replace syntax with `\TEXT` and `\` continuation lines for multi-line replacement blocks
+- Added shorthand cursor+insert operations in atom edits, including `^Lid` (insert before anchor), `^+TEXT`, `$+TEXT`, and `Lid+TEXT`/`@Lid+TEXT`
+- Added standalone file-op fallback so `!rm` and `!mv DEST` inputs can be normalized into sections when using split input parsing
+
+### Changed
+
+- Changed token counting to use tokenizer-based estimates instead of a character-per-4 heuristic for context and compaction calculations
+- Changed hashline anchor auto-rebase tolerance from ±2 lines to ±5 lines for stale Lid recovery
+- Changed atom input handling so `#`-prefixed lines are treated as comments and ignored
+- Changed execution when all edits are no-op `Lid=TEXT` replacements to return success with a no-change explanation instead of throwing
+
+### Fixed
+
+- Fixed malformed range and unified-diff-like atom syntax by rejecting reversed ranges, mismatched range endpoint hashes, and forms like `+Lid|TEXT`, `+Lid=TEXT`, and `-LidA..LidB|TEXT` with explicit actionable errors
+- Fixed hash mismatch errors to include likely-shifted anchor hints when a unique matching line is found elsewhere in the file
+
+## [14.5.8] - 2026-04-29
+### Breaking Changes
+
+- Changed the task runner toggle from `just.enabled` to `runCommand.enabled`, so existing configurations using `just.enabled` must be migrated
+- Removed the legacy `just` tool and replaced it with `run_command`
+- Renamed the built-in tool API from `just` to `run_command`, so clients requesting/handling the old tool name must update
+
+### Added
+
+- Added a new `run_command` tool that runs project tasks via a single `op` argument, auto-detecting and supporting recipes from justfiles, `package.json` scripts (including workspace packages), Cargo bin/example/test targets, Makefiles, and Taskfiles
+- Added support for explicit runner-qualified tasks via `run_command` with `runnerId:task` syntax in the prompt guidance
+
+### Changed
+
+- Changed automatic tool availability so requesting `bash` can now auto-include `run_command` when a supported task runner manifest is detected in the working directory
+- Changed task resolution to disambiguate identical task names across multiple runners and show runner-aware command execution errors
+
+### Fixed
+
+- Fixed editor draft being erased when a user message queued during streaming was eventually submitted; the queue/steer path now preserves any new prompt the user has typed since queuing, matching the existing optimistic-send protection.
+
+## [14.5.7] - 2026-04-29
+
+### Fixed
+
+- Fixed hook editors to recognize Ctrl+Enter when terminals include NumLock or keypad Enter metadata.
+## [14.5.6] - 2026-04-29
+### Changed
+
+- Removed the atom edit mode's multi-anchor auto-rebase rejection so stale-but-uniquely-rebasable block edits apply with warnings instead of failing.
+
 ## [14.5.5] - 2026-04-29
 ### Breaking Changes
 
@@ -29,6 +202,7 @@
 
 ### Added
 
+- Added the `after_provider_response` extension event for observing provider response status, headers, and request IDs.
 - Added internal URL support to the `search` tool, allowing `artifact://`-style paths that resolve to local files to be searched directly
 - Added IRC relay observation in the main agent UI so every IRC exchange between agents is rendered in the main transcript, even when the main agent is not a direct participant
 - Added stateful `href`/`hrefr` prompt helpers that can reuse anchors remembered from prior `hline` helper calls

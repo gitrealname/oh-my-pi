@@ -59,7 +59,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 export type StatusLineSegmentId =
 	| "pi"
 	| "model"
-	| "plan_mode"
+	| "mode"
 	| "path"
 	| "git"
 	| "pr"
@@ -609,6 +609,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"loop.mode": {
+		type: "enum",
+		values: ["prompt", "compact", "reset"] as const,
+		default: "prompt",
+		ui: {
+			tab: "interaction",
+			label: "Loop Mode",
+			description: "What happens between /loop iterations before re-submitting the prompt",
+			submenu: true,
+		},
+	},
+
 	// Input and startup
 	doubleEscapeAction: {
 		type: "enum",
@@ -1126,14 +1138,28 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	// Python
-	"python.toolMode": {
-		type: "enum",
-		values: ["ipy-only", "bash-only", "both"] as const,
-		default: "both",
-		ui: { tab: "editing", label: "Python Tool Mode", description: "How Python code is executed" },
+	// Eval (per-backend toggles; add more as new backends ship, e.g. eval.ts)
+	"eval.py": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "editing",
+			label: "Eval: Python backend",
+			description: "Allow the eval tool to dispatch to the IPython kernel",
+		},
 	},
 
+	"eval.js": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "editing",
+			label: "Eval: JavaScript backend",
+			description: "Allow the eval tool to dispatch to the in-process JavaScript runtime",
+		},
+	},
+
+	// Python kernel knobs (consumed by the eval py backend and the /python slash command)
 	"python.kernelMode": {
 		type: "enum",
 		values: ["session", "per-call"] as const,
@@ -1292,6 +1318,17 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Calculator",
 			description: "Enable the calculator tool for basic calculations",
+		},
+	},
+
+	"recipe.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Recipe",
+			description:
+				"Enable the recipe tool when a justfile / package.json / Cargo.toml / Makefile / Taskfile is present",
 		},
 	},
 
@@ -1791,38 +1828,33 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "providers",
 			label: "SearXNG Endpoint",
-			description: "Base URL of the SearXNG instance (e.g. https://searx.example.org)",
+			description: "Self-hosted search base URL",
 		},
 	},
 
 	"searxng.token": {
 		type: "string",
 		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "SearXNG Token",
-			description: "Optional bearer token for SearXNG authentication",
-		},
+	},
+
+	"searxng.basicUsername": {
+		type: "string",
+		default: undefined,
+	},
+
+	"searxng.basicPassword": {
+		type: "string",
+		default: undefined,
 	},
 
 	"searxng.categories": {
 		type: "string",
 		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "SearXNG Categories",
-			description: "Comma-separated categories filter (e.g. general,news,science)",
-		},
 	},
 
 	"searxng.language": {
 		type: "string",
 		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "SearXNG Language",
-			description: "Language code for search results (e.g. en, zh-CN)",
-		},
 	},
 
 	"commit.mapReduceEnabled": { type: "boolean", default: true },

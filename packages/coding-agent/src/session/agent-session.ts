@@ -46,21 +46,14 @@ import {
 	calculateRateLimitBackoffMs,
 	getSupportedEfforts,
 	isContextOverflow,
+	isUnexpectedSocketCloseMessage,
 	isUsageLimitError,
 	modelsAreEqual,
 	parseRateLimitReason,
 	streamSimple,
 } from "@oh-my-pi/pi-ai";
-import { killTree, MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
-import {
-	abortableSleep,
-	getAgentDbPath,
-	isEnoent,
-	logger,
-	prompt,
-	Snowflake,
-	setNativeKillTree,
-} from "@oh-my-pi/pi-utils";
+import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
+import { abortableSleep, getAgentDbPath, isEnoent, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import { MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
@@ -75,6 +68,11 @@ import {
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
+import {
+	disposeKernelSessionsByOwner,
+	executePython as executePythonCommand,
+	type PythonResult,
+} from "../eval/py/executor";
 import { type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
 import { exportSessionToHtml } from "../export/html";
 import type { TtsrManager, TtsrMatchContext } from "../export/ttsr";
@@ -104,12 +102,7 @@ import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
-import { resolveLocalUrlToPath } from "../internal-urls";
-import {
-	disposeKernelSessionsByOwner,
-	executePython as executePythonCommand,
-	type PythonResult,
-} from "../ipy/executor";
+import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import {
 	buildDiscoverableMCPSearchIndex,
 	collectDiscoverableMCPTools,
@@ -120,6 +113,7 @@ import {
 } from "../mcp/discoverable-tool-metadata";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
+import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import autoHandoffThresholdFocusPrompt from "../prompts/system/auto-handoff-threshold-focus.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import handoffDocumentPrompt from "../prompts/system/handoff-document.md" with { type: "text" };
@@ -244,10 +238,19 @@ export interface AgentSessionConfig {
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider payload hook used by the active session request path */
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Provider response hook used by the active session request path */
+	onResponse?: SimpleStreamOptions["onResponse"];
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability */
 	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<string>;
+	/**
+	 * Optional accessor for live MCP server instructions. Read by the session's
+	 * `rebuildSystemPrompt`-skip optimization to detect server-side instruction
+	 * changes (e.g. an MCP server upgrade) that would otherwise pass the tool-set
+	 * signature comparison and silently keep a stale prompt cached.
+	 */
+	getMcpServerInstructions?: () => Map<string, string> | undefined;
 	/** Enable hidden-by-default MCP tool discovery for this session. */
 	mcpDiscoveryEnabled?: boolean;
 	/** MCP tool names to activate for the current session when discovery mode is enabled. */
@@ -263,7 +266,7 @@ export interface AgentSessionConfig {
 	/** Secret obfuscator for deobfuscating streaming edit content */
 	obfuscator?: SecretObfuscator;
 	/** Logical owner for retained Python kernels created by this session. */
-	pythonKernelOwnerId?: string;
+	evalKernelOwnerId?: string;
 	/** Agent identity (registry id like "0-Main" or "3-Alice") used for IRC routing. */
 	agentId?: string;
 	/** Shared agent registry (for forwarding IRC observations to the main session UI). */
@@ -383,6 +386,11 @@ function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): strin
 	return `${selector.provider}/${selector.id}`;
 }
 
+/** Composite key for auto-clear timers, keyed by phase name + task content. */
+function todoClearKey(phaseName: string, taskContent: string): string {
+	return `${phaseName}\u0000${taskContent}`;
+}
+
 const noOpUIContext: ExtensionUIContext = {
 	select: async (_title, _options, _dialogOptions) => undefined,
 	confirm: async (_title, _message, _dialogOptions) => false,
@@ -469,15 +477,15 @@ export class AgentSession {
 	#toolChoiceQueue = new ToolChoiceQueue();
 
 	// Bash execution state
-	#bashAbortController: AbortController | undefined = undefined;
+	#bashAbortControllers = new Set<AbortController>();
 	#pendingBashMessages: BashExecutionMessage[] = [];
 
 	// Python execution state
-	#pythonAbortControllers = new Set<AbortController>();
-	#pythonKernelOwnerId: string;
+	#evalAbortControllers = new Set<AbortController>();
+	#evalKernelOwnerId: string;
 	#pendingPythonMessages: PythonExecutionMessage[] = [];
-	#activePythonExecutions = new Set<Promise<unknown>>();
-	#pythonExecutionDisposing = false;
+	#activeEvalExecutions = new Set<Promise<unknown>>();
+	#evalExecutionDisposing = false;
 
 	// Background-channel IRC exchanges queued while the recipient was streaming.
 	// Drained into history (via emitExternalEvent) once the recipient becomes idle.
@@ -507,9 +515,18 @@ export class AgentSession {
 	#toolRegistry: Map<string, AgentTool>;
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
+	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#rebuildSystemPrompt: ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<string>) | undefined;
+	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
 	#baseSystemPrompt: string;
+	/**
+	 * Signature of the (toolNames, tool descriptions) tuple passed to the most
+	 * recent successful `rebuildSystemPrompt` call. Used to skip redundant rebuilds
+	 * when MCP servers reconnect without changing their tool definitions, which is
+	 * the dominant cause of prompt-cache invalidation in long sessions.
+	 */
+	#lastAppliedToolSignature: string | undefined;
 	#mcpDiscoveryEnabled = false;
 	#discoverableMCPTools = new Map<string, DiscoverableMCPTool>();
 	#discoverableMCPSearchIndex: DiscoverableMCPSearchIndex | null = null;
@@ -526,8 +543,7 @@ export class AgentSession {
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
-	#postPromptTaskCounter = 0;
-	#postPromptTaskIds = new Set<number>();
+	#postPromptTasks = new Set<Promise<void>>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
@@ -571,14 +587,12 @@ export class AgentSession {
 	}
 
 	constructor(config: AgentSessionConfig) {
-		setNativeKillTree(killTree);
-
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#startPowerAssertion();
 		this.#asyncJobManager = config.asyncJobManager;
-		this.#pythonKernelOwnerId = config.pythonKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
+		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -593,8 +607,10 @@ export class AgentSession {
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#onPayload = config.onPayload;
+		this.#onResponse = config.onResponse;
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
+		this.#getMcpServerInstructions = config.getMcpServerInstructions;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
@@ -1144,14 +1160,13 @@ export class AgentSession {
 	}
 
 	#trackPostPromptTask(task: Promise<void>): void {
-		const taskId = ++this.#postPromptTaskCounter;
-		this.#postPromptTaskIds.add(taskId);
+		this.#postPromptTasks.add(task);
 		this.#ensurePostPromptTasksPromise();
 		void task
 			.catch(() => {})
 			.finally(() => {
-				this.#postPromptTaskIds.delete(taskId);
-				if (this.#postPromptTaskIds.size === 0) {
+				this.#postPromptTasks.delete(task);
+				if (this.#postPromptTasks.size === 0) {
 					this.#resolvePostPromptTasks();
 				}
 			});
@@ -1217,11 +1232,11 @@ export class AgentSession {
 			await this.#promptWithMessage(
 				{
 					role: "developer",
-					content: [{ type: "text", text: "Continue if you have next steps." }],
+					content: [{ type: "text", text: autoContinuePrompt }],
 					attribution: "agent",
 					timestamp: Date.now(),
 				},
-				"Continue if you have next steps.",
+				autoContinuePrompt,
 				{ skipPostPromptRecoveryWait: true },
 			);
 		};
@@ -1235,11 +1250,21 @@ export class AgentSession {
 		);
 	}
 
-	#cancelPostPromptTasks(): void {
+	async #cancelPostPromptTasks(): Promise<void> {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
-		this.#postPromptTaskIds.clear();
-		this.#resolvePostPromptTasks();
+		this.#resolveTtsrResume();
+
+		const pendingTasks = Array.from(this.#postPromptTasks);
+		if (pendingTasks.length === 0) {
+			this.#resolvePostPromptTasks();
+			return;
+		}
+
+		await Promise.allSettled(pendingTasks);
+		if (this.#postPromptTasks.size === 0) {
+			this.#resolvePostPromptTasks();
+		}
 	}
 	/**
 	 * Wait for retry, TTSR resume, and any background continuation to settle.
@@ -1523,10 +1548,19 @@ export class AgentSession {
 		const path = typeof args.path === "string" ? args.path : undefined;
 		if (!path) return undefined;
 
+		// `local://` URLs (e.g. local://PLAN.md for plan-mode) resolve to a real
+		// on-disk artifacts path; pre-caching works as long as we ask the
+		// local-protocol handler. Other internal-scheme URLs (agent://, skill://,
+		// rule://, mcp://, artifact://) have no stable filesystem representation;
+		// skip pre-cache entirely for those — the edit tool itself will reject
+		// them through its normal dispatch path.
+		const resolvedPath = this.#resolveSessionFsPath(path);
+		if (resolvedPath === undefined) return undefined;
+
 		return {
 			toolCall,
 			path,
-			resolvedPath: resolveToCwd(path, this.sessionManager.getCwd()),
+			resolvedPath,
 			diff: typeof args.diff === "string" ? args.diff : undefined,
 			op: typeof args.op === "string" ? args.op : undefined,
 			rename: typeof args.rename === "string" ? args.rename : undefined,
@@ -1600,9 +1634,45 @@ export class AgentSession {
 	}
 
 	/** Invalidate cache for a file after an edit completes to prevent stale data */
-	#invalidateFileCacheForPath(path: string): void {
-		const resolvedPath = resolveToCwd(path, this.sessionManager.getCwd());
+	#invalidateFileCacheForPath(filePath: string): void {
+		const resolvedPath = this.#resolveSessionFsPath(filePath);
+		if (resolvedPath === undefined) return;
 		this.#streamingEditFileCache.delete(resolvedPath);
+	}
+
+	/**
+	 * Resolve a path supplied to a tool to a real filesystem path.
+	 *
+	 * - `local://` URLs route through the local-protocol handler so they map
+	 *   onto the session's on-disk artifacts directory; pre-caching, ENOENT
+	 *   handling, and post-edit invalidation all work normally.
+	 * - Other internal-scheme URLs (agent://, skill://, rule://, mcp://,
+	 *   artifact://) have no stable filesystem path; this returns `undefined`
+	 *   so callers skip filesystem-only operations.
+	 * - Cwd-relative and absolute paths resolve via `resolveToCwd`.
+	 */
+	#resolveSessionFsPath(filePath: string): string | undefined {
+		const normalized = normalizeLocalScheme(filePath);
+		if (normalized.startsWith("local:")) {
+			return resolveLocalUrlToPath(normalized, this.#localProtocolOptions());
+		}
+		if (
+			normalized.startsWith("agent://") ||
+			normalized.startsWith("skill://") ||
+			normalized.startsWith("rule://") ||
+			normalized.startsWith("mcp://") ||
+			normalized.startsWith("artifact://")
+		) {
+			return undefined;
+		}
+		return resolveToCwd(normalized, this.sessionManager.getCwd());
+	}
+
+	#localProtocolOptions(): LocalProtocolOptions {
+		return {
+			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+			getSessionId: () => this.sessionManager.getSessionId(),
+		};
 	}
 
 	#maybeAbortStreamingEdit(event: AgentEvent): void {
@@ -1884,7 +1954,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	async dispose(): Promise<void> {
-		this.#pythonExecutionDisposing = true;
+		this.#evalExecutionDisposing = true;
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await this.#extensionRunner.emit({ type: "session_shutdown" });
@@ -1892,20 +1962,20 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
-		this.#cancelPostPromptTasks();
+		await this.#cancelPostPromptTasks();
 		this.#clearTodoClearTimers();
 		const drained = await this.#asyncJobManager?.dispose({ timeoutMs: 3_000 });
 		const deliveryState = this.#asyncJobManager?.getDeliveryState();
 		if (drained === false && deliveryState) {
 			logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
 		}
-		const pythonExecutionsSettled = await this.#preparePythonExecutionsForDispose();
+		const pythonExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
 		if (!pythonExecutionsSettled) {
 			logger.warn(
 				"Detaching retained Python kernel ownership during dispose while Python execution is still active",
 			);
 		}
-		await disposeKernelSessionsByOwner(this.#pythonKernelOwnerId);
+		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
 		this.#stopPowerAssertion();
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
@@ -2157,10 +2227,18 @@ export class AgentSession {
 		}
 		this.agent.setTools(tools);
 
-		// Rebuild base system prompt with new tool set
+		// Rebuild base system prompt with new tool set, but only when the tool set
+		// actually changed. MCP servers can reconnect at arbitrary times and call
+		// `refreshMCPTools` -> `#applyActiveToolsByName` even though the resulting
+		// tool list is byte-identical. Skipping the rebuild keeps the system prompt
+		// stable, which is required for Anthropic prompt caching to keep hitting.
 		if (this.#rebuildSystemPrompt) {
-			this.#baseSystemPrompt = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
-			this.agent.setSystemPrompt(this.#baseSystemPrompt);
+			const signature = this.#computeAppliedToolSignature(validToolNames, tools);
+			if (signature !== this.#lastAppliedToolSignature) {
+				this.#baseSystemPrompt = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
+				this.agent.setSystemPrompt(this.#baseSystemPrompt);
+				this.#lastAppliedToolSignature = signature;
+			}
 		}
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(previousSelectedMCPToolNames);
@@ -2202,6 +2280,86 @@ export class AgentSession {
 		const activeToolNames = this.getActiveToolNames();
 		this.#baseSystemPrompt = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
 		this.agent.setSystemPrompt(this.#baseSystemPrompt);
+		// Refresh the cached signature so a subsequent `#applyActiveToolsByName` with
+		// the same tool set does not re-rebuild on top of the explicit refresh we
+		// just performed (and conversely, a different set forces a fresh rebuild).
+		const activeTools = activeToolNames
+			.map(name => this.#toolRegistry.get(name))
+			.filter((tool): tool is AgentTool => tool != null);
+		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
+	}
+
+	/**
+	 * Compose a stable signature for the inputs that `rebuildSystemPrompt` reads.
+	 * Two calls producing identical signatures are guaranteed to produce identical
+	 * system prompt bytes, so the rebuild can be skipped.
+	 *
+	 * The signature covers:
+	 *   1. Active tool names in order (the prompt renders them in this order).
+	 *   2. Active tool labels, descriptions, and wire-visible names — all are
+	 *      rendered into the prompt body (see `system-prompt.md` `{{label}}: \`{{name}}\``
+	 *      and `toolPromptNames` in `buildSystemPrompt`). The wire name comes from
+	 *      `tool.customWireName` and overrides the internal name on the model wire
+	 *      (e.g. `edit` exposes itself as `apply_patch` to GPT-5 in apply_patch mode);
+	 *      a stale wire name would desync prompt guidance from actual tool routing.
+	 *   3. When MCP discovery is on, every registry tool's name+label+description+
+	 *      customWireName, since `rebuildSystemPrompt` summarizes discoverable MCP
+	 *      tools that are not in the active set.
+	 *   4. MCP server instructions text (per server), since `rebuildSystemPrompt`
+	 *      embeds these in the appended prompt under "## MCP Server Instructions".
+	 *      A server upgrade can change instructions while keeping tools identical.
+	 *
+	 * Settings-driven tool metadata is covered automatically: built-in tools that
+	 * depend on settings expose `description`/`label` via getters (see `TaskTool`,
+	 * `SearchToolBm25Tool`, `EditTool`), and the signature reads them live on every
+	 * call - so a settings flip that mutates the rendered string differs the signature
+	 * the next time `#applyActiveToolsByName` runs. Do not refactor `describeTool` to
+	 * cache per-tool strings without preserving this property.
+	 *
+	 * Inputs NOT covered: tool input schemas; memory instructions read from disk;
+	 * and SDK-init-time closure constants in `sdk.ts` (`repeatToolDescriptions`,
+	 * `eagerTasks`, `intentField`, `mcpDiscoveryEnabled`, `secretsEnabled`). The
+	 * closure-captured ones cannot change at runtime regardless of skip behavior.
+	 * For everything else, callers must explicitly call `refreshBaseSystemPrompt()`
+	 * after side-effecting changes; see e.g. the memory hooks and
+	 * `#syncEditToolModeAfterModelChange`.
+	 *
+	 * The current calendar date IS covered (appended as a segment) because
+	 * `buildSystemPrompt` injects it into the prompt body (`Today is '{{date}}'`).
+	 * Without this, a session spanning midnight with only tool-stable MCP
+	 * reconnects would keep yesterday's date indefinitely.
+	 */
+	#computeAppliedToolSignature(toolNames: string[], tools: AgentTool[]): string {
+		// Order-preserving join: any reorder must produce a different signature so
+		// the rebuild fires and the new tool list reaches the API.
+		const nameSegment = toolNames.join("\u0001");
+		const describeTool = (tool: AgentTool): string =>
+			`${tool.name}=${tool.label ?? ""}|${tool.description ?? ""}|${tool.customWireName ?? ""}`;
+		const descriptionSegment = tools.map(describeTool).join("\u0002");
+		let registrySegment = "";
+		if (this.#mcpDiscoveryEnabled) {
+			// Registry iteration order is not load-bearing for the prompt content, so we
+			// sort to keep the signature insensitive to incidental insertion order.
+			const entries: string[] = [];
+			for (const tool of this.#toolRegistry.values()) {
+				entries.push(describeTool(tool));
+			}
+			entries.sort();
+			registrySegment = entries.join("\u0004");
+		}
+		let instructionsSegment = "";
+		const serverInstructions = this.#getMcpServerInstructions?.();
+		if (serverInstructions && serverInstructions.size > 0) {
+			// Sort by server name so transport flap order does not perturb the signature.
+			const entries: string[] = [];
+			for (const [server, instructions] of serverInstructions) {
+				entries.push(`${server}=${instructions}`);
+			}
+			entries.sort();
+			instructionsSegment = entries.join("\u0006");
+		}
+		const date = new Date().toISOString().slice(0, 10);
+		return `${nameSegment}\u0003${descriptionSegment}\u0005${registrySegment}\u0007${instructionsSegment}|${date}`;
 	}
 
 	/**
@@ -2318,21 +2476,39 @@ export class AgentSession {
 
 	/** Apply session-level stream hooks to a direct side request. */
 	prepareSimpleStreamOptions(options: SimpleStreamOptions): SimpleStreamOptions {
-		if (!this.#onPayload) return options;
-		if (!options.onPayload) {
-			return { ...options, onPayload: this.#onPayload };
-		}
 		const sessionOnPayload = this.#onPayload;
-		const requestOnPayload = options.onPayload;
-		return {
-			...options,
-			onPayload: async (payload, model) => {
-				const sessionPayload = await sessionOnPayload(payload, model);
-				const sessionResolvedPayload = sessionPayload ?? payload;
-				const requestPayload = await requestOnPayload(sessionResolvedPayload, model);
-				return requestPayload ?? sessionResolvedPayload;
-			},
-		};
+		const sessionOnResponse = this.#onResponse;
+		if (!sessionOnPayload && !sessionOnResponse) return options;
+
+		const preparedOptions: SimpleStreamOptions = { ...options };
+
+		if (sessionOnPayload) {
+			if (!options.onPayload) {
+				preparedOptions.onPayload = sessionOnPayload;
+			} else {
+				const requestOnPayload = options.onPayload;
+				preparedOptions.onPayload = async (payload, model) => {
+					const sessionPayload = await sessionOnPayload(payload, model);
+					const sessionResolvedPayload = sessionPayload ?? payload;
+					const requestPayload = await requestOnPayload(sessionResolvedPayload, model);
+					return requestPayload ?? sessionResolvedPayload;
+				};
+			}
+		}
+
+		if (sessionOnResponse) {
+			if (!options.onResponse) {
+				preparedOptions.onResponse = sessionOnResponse;
+			} else {
+				const requestOnResponse = options.onResponse;
+				preparedOptions.onResponse = async (response, model) => {
+					await sessionOnResponse(response, model);
+					await requestOnResponse(response, model);
+				};
+			}
+		}
+
+		return preparedOptions;
 	}
 
 	/** Current steering mode */
@@ -2466,10 +2642,7 @@ export class AgentSession {
 		if (this.#planReferenceSent) return null;
 
 		const planFilePath = this.#planReferencePath;
-		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
-			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-			getSessionId: () => this.sessionManager.getSessionId(),
-		});
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, this.#localProtocolOptions());
 		let planContent: string;
 		try {
 			planContent = await Bun.file(resolvedPlanPath).text();
@@ -2502,15 +2675,9 @@ export class AgentSession {
 		if (!state?.enabled) return null;
 		const sessionPlanUrl = "local://PLAN.md";
 		const resolvedPlanPath = state.planFilePath.startsWith("local:")
-			? resolveLocalUrlToPath(normalizeLocalScheme(state.planFilePath), {
-					getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-					getSessionId: () => this.sessionManager.getSessionId(),
-				})
+			? resolveLocalUrlToPath(normalizeLocalScheme(state.planFilePath), this.#localProtocolOptions())
 			: resolveToCwd(state.planFilePath, this.sessionManager.getCwd());
-		const resolvedSessionPlan = resolveLocalUrlToPath(sessionPlanUrl, {
-			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-			getSessionId: () => this.sessionManager.getSessionId(),
-		});
+		const resolvedSessionPlan = resolveLocalUrlToPath(sessionPlanUrl, this.#localProtocolOptions());
 		const displayPlanPath =
 			state.planFilePath.startsWith("local:") || resolvedPlanPath !== resolvedSessionPlan
 				? state.planFilePath
@@ -3279,10 +3446,9 @@ export class AgentSession {
 
 	#cloneTodoPhases(phases: TodoPhase[]): TodoPhase[] {
 		return phases.map(phase => ({
-			id: phase.id,
 			name: phase.name,
 			tasks: phase.tasks.map(task => {
-				const out: TodoItem = { id: task.id, content: task.content, status: task.status };
+				const out: TodoItem = { content: task.content, status: task.status };
 				if (task.notes && task.notes.length > 0) out.notes = [...task.notes];
 				return out;
 			}),
@@ -3294,43 +3460,43 @@ export class AgentSession {
 		const delaySec = this.settings.get("tasks.todoClearDelay") ?? 60;
 		if (delaySec < 0) return; // "Never" — no auto-clear
 		const delayMs = delaySec * 1000;
-		const doneTaskIds = new Set<string>();
+		const doneKeys = new Set<string>();
 		for (const phase of phases) {
 			for (const task of phase.tasks) {
 				if (task.status === "completed" || task.status === "abandoned") {
-					doneTaskIds.add(task.id);
+					doneKeys.add(todoClearKey(phase.name, task.content));
 				}
 			}
 		}
 
 		// Cancel timers for tasks that are no longer done (e.g. status was reverted)
-		for (const [id, timer] of this.#todoClearTimers) {
-			if (!doneTaskIds.has(id)) {
+		for (const [key, timer] of this.#todoClearTimers) {
+			if (!doneKeys.has(key)) {
 				clearTimeout(timer);
-				this.#todoClearTimers.delete(id);
+				this.#todoClearTimers.delete(key);
 			}
 		}
 
 		// Schedule new timers for newly-done tasks
-		for (const id of doneTaskIds) {
-			if (this.#todoClearTimers.has(id)) continue;
+		for (const key of doneKeys) {
+			if (this.#todoClearTimers.has(key)) continue;
 			if (delayMs === 0) {
 				// Instant — run synchronously on next microtask to batch removals
-				const timer = setTimeout(() => this.#runTodoAutoClear(id), 0);
-				this.#todoClearTimers.set(id, timer);
+				const timer = setTimeout(() => this.#runTodoAutoClear(key), 0);
+				this.#todoClearTimers.set(key, timer);
 			} else {
-				const timer = setTimeout(() => this.#runTodoAutoClear(id), delayMs);
-				this.#todoClearTimers.set(id, timer);
+				const timer = setTimeout(() => this.#runTodoAutoClear(key), delayMs);
+				this.#todoClearTimers.set(key, timer);
 			}
 		}
 	}
 
 	/** Remove a single completed task and notify the UI. */
-	#runTodoAutoClear(taskId: string): void {
-		this.#todoClearTimers.delete(taskId);
+	#runTodoAutoClear(key: string): void {
+		this.#todoClearTimers.delete(key);
 		let removed = false;
 		for (const phase of this.#todoPhases) {
-			const idx = phase.tasks.findIndex(t => t.id === taskId);
+			const idx = phase.tasks.findIndex(t => todoClearKey(phase.name, t.content) === key);
 			if (idx !== -1 && (phase.tasks[idx].status === "completed" || phase.tasks[idx].status === "abandoned")) {
 				phase.tasks.splice(idx, 1);
 				removed = true;
@@ -3358,9 +3524,13 @@ export class AgentSession {
 		this.abortRetry();
 		this.#promptGeneration++;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#resolveTtsrResume();
-		this.#cancelPostPromptTasks();
+		this.abortCompaction();
+		this.abortHandoff();
+		this.abortBash();
+		this.abortEval();
+		const postPromptDrain = this.#cancelPostPromptTasks();
 		this.agent.abort();
+		await postPromptDrain;
 		await this.agent.waitForIdle();
 		// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
@@ -3555,8 +3725,9 @@ export class AgentSession {
 		);
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Re-apply the current thinking level for the newly selected model
-		this.setThinkingLevel(this.thinkingLevel);
+		// Re-apply thinking for the newly selected model. Prefer the model's
+		// configured defaultLevel; otherwise preserve the current level.
+		this.setThinkingLevel(model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
@@ -3577,8 +3748,9 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Apply explicit thinking level, or re-clamp current level to new model's capabilities
-		this.setThinkingLevel(thinkingLevel ?? this.thinkingLevel);
+		// Apply explicit thinking level if given; otherwise prefer the model's
+		// configured defaultLevel; otherwise re-clamp the current level.
+		this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
@@ -3876,9 +4048,13 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		if (this.#compactionAbortController) {
+			throw new Error("Compaction already in progress");
+		}
 		this.#disconnectFromAgent();
 		await this.abort();
-		this.#compactionAbortController = new AbortController();
+		const compactionAbortController = new AbortController();
+		this.#compactionAbortController = compactionAbortController;
 
 		try {
 			if (!this.model) {
@@ -3916,7 +4092,7 @@ export class AgentSession {
 					preparation,
 					branchEntries: pathEntries,
 					customInstructions,
-					signal: this.#compactionAbortController.signal,
+					signal: compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (result?.cancel) {
@@ -3963,7 +4139,7 @@ export class AgentSession {
 					compactionModel,
 					apiKey,
 					customInstructions,
-					this.#compactionAbortController.signal,
+					compactionAbortController.signal,
 					{ promptOverride: hookPrompt, extraContext: hookContext, remoteInstructions: this.#baseSystemPrompt },
 				);
 				summary = result.summary;
@@ -3974,7 +4150,7 @@ export class AgentSession {
 				preserveData = { ...(preserveData ?? {}), ...(result.preserveData ?? {}) };
 			}
 
-			if (this.#compactionAbortController.signal.aborted) {
+			if (compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
@@ -4021,7 +4197,9 @@ export class AgentSession {
 			options?.onError?.(err);
 			throw error;
 		} finally {
-			this.#compactionAbortController = undefined;
+			if (this.#compactionAbortController === compactionAbortController) {
+				this.#compactionAbortController = undefined;
+			}
 			this.#reconnectToAgent();
 		}
 	}
@@ -4174,9 +4352,10 @@ export class AgentSession {
 			}
 
 			// Start a new session
+			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
 			this.#asyncJobManager?.cancelAll();
-			await this.sessionManager.newSession();
+			await this.sessionManager.newSession(previousSessionFile ? { parentSession: previousSessionFile } : undefined);
 			this.agent.reset();
 			this.agent.sessionId = this.sessionManager.getSessionId();
 			this.#steeringMessages = [];
@@ -4188,6 +4367,7 @@ export class AgentSession {
 			// Inject the handoff document as a custom message
 			const handoffContent = `<handoff-context>\n${handoffText}\n</handoff-context>\n\nThe above is a handoff document from a previous session. Use this context to continue the work seamlessly.`;
 			this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
+			await this.sessionManager.ensureOnDisk();
 			let savedPath: string | undefined;
 			if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
 				const artifactsDir = this.sessionManager.getArtifactsDir();
@@ -4488,7 +4668,7 @@ export class AgentSession {
 						(task): task is TodoItem & { status: "pending" | "in_progress" } =>
 							task.status === "pending" || task.status === "in_progress",
 					)
-					.map(task => ({ id: task.id, content: task.content, status: task.status })),
+					.map(task => ({ content: task.content, status: task.status })),
 			}))
 			.filter(phase => phase.tasks.length > 0);
 		const incomplete = incompleteByPhase.flatMap(phase => phase.tasks);
@@ -5263,9 +5443,12 @@ export class AgentSession {
 
 	#isTransientTransportErrorMessage(errorMessage: string): boolean {
 		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504,
-		// service unavailable, network/connection errors, fetch failed, terminated, retry delay exceeded
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall/i.test(
-			errorMessage,
+		// service unavailable, network/connection/socket errors, fetch failed, terminated, retry delay exceeded
+		return (
+			isUnexpectedSocketCloseMessage(errorMessage) ||
+			/overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall/i.test(
+				errorMessage,
+			)
 		);
 	}
 
@@ -5608,15 +5791,16 @@ export class AgentSession {
 			this.agent.replaceMessages(messages.slice(0, -1));
 		}
 
-		// Wait with exponential backoff (abortable)
-		// Properly abort and null existing controller before replacing
-		if (this.#retryAbortController) {
-			this.#retryAbortController.abort();
-		}
-		this.#retryAbortController = new AbortController();
+		// Wait with exponential backoff (abortable).
+		const retryAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = retryAbortController;
 		try {
-			await abortableSleep(delayMs, this.#retryAbortController.signal);
+			await abortableSleep(delayMs, retryAbortController.signal);
 		} catch {
+			if (this.#retryAbortController !== retryAbortController) {
+				return false;
+			}
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
@@ -5630,7 +5814,9 @@ export class AgentSession {
 			this.#resolveRetry();
 			return false;
 		}
-		this.#retryAbortController = undefined;
+		if (this.#retryAbortController === retryAbortController) {
+			this.#retryAbortController = undefined;
+		}
 
 		// Retry via continue() outside the agent_end event callback chain.
 		this.#scheduleAgentContinue({ delayMs: 1, generation });
@@ -5722,12 +5908,13 @@ export class AgentSession {
 			}
 		}
 
-		this.#bashAbortController = new AbortController();
+		const abortController = new AbortController();
+		this.#bashAbortControllers.add(abortController);
 
 		try {
 			const result = await executeBashCommand(command, {
 				onChunk,
-				signal: this.#bashAbortController.signal,
+				signal: abortController.signal,
 				sessionKey: this.sessionId,
 				timeout: clampTimeout("bash") * 1000,
 				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
@@ -5736,7 +5923,7 @@ export class AgentSession {
 			this.recordBashResult(command, result, options);
 			return result;
 		} finally {
-			this.#bashAbortController = undefined;
+			this.#bashAbortControllers.delete(abortController);
 		}
 	}
 
@@ -5775,12 +5962,14 @@ export class AgentSession {
 	 * Cancel running bash command.
 	 */
 	abortBash(): void {
-		this.#bashAbortController?.abort();
+		for (const abortController of this.#bashAbortControllers) {
+			abortController.abort();
+		}
 	}
 
 	/** Whether a bash command is currently running */
 	get isBashRunning(): boolean {
-		return this.#bashAbortController !== undefined;
+		return this.#bashAbortControllers.size > 0;
 	}
 
 	/** Whether there are pending bash messages waiting to be flushed */
@@ -5812,7 +6001,7 @@ export class AgentSession {
 
 	/**
 	 * Execute Python code in the shared kernel.
-	 * Uses the same kernel session as the agent's Python tool, allowing collaborative editing.
+	 * Uses the same kernel session as eval's Python backend, allowing collaborative editing.
 	 * @param code The Python code to execute
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
@@ -5824,7 +6013,7 @@ export class AgentSession {
 	): Promise<PythonResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		const cwd = this.sessionManager.getCwd();
-		this.assertPythonExecutionAllowed();
+		this.assertEvalExecutionAllowed();
 
 		const abortController = new AbortController();
 		const execution = (async (): Promise<PythonResult> => {
@@ -5835,20 +6024,20 @@ export class AgentSession {
 					excludeFromContext,
 					cwd,
 				});
-				this.assertPythonExecutionAllowed();
+				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {
 					this.recordPythonResult(code, hookResult.result, options);
 					return hookResult.result;
 				}
 			}
 
-			// Use the same session ID as the Python tool for kernel sharing
+			// Use the same session ID as eval's Python backend for kernel sharing
 			const sessionFile = this.sessionManager.getSessionFile();
 			const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 			const result = await executePythonCommand(code, {
 				cwd,
 				sessionId,
-				kernelOwnerId: this.#pythonKernelOwnerId,
+				kernelOwnerId: this.#evalKernelOwnerId,
 				kernelMode: this.settings.get("python.kernelMode"),
 				useSharedGateway: this.settings.get("python.sharedGateway"),
 				onChunk,
@@ -5857,11 +6046,11 @@ export class AgentSession {
 			this.recordPythonResult(code, result, options);
 			return result;
 		})();
-		return await this.trackPythonExecution(execution, abortController);
+		return await this.trackEvalExecution(execution, abortController);
 	}
 
-	assertPythonExecutionAllowed(): void {
-		if (this.#pythonExecutionDisposing) {
+	assertEvalExecutionAllowed(): void {
+		if (this.#evalExecutionDisposing) {
 			throw new Error("Python execution is unavailable while session disposal is in progress");
 		}
 	}
@@ -5869,17 +6058,17 @@ export class AgentSession {
 	/**
 	 * Track Python work started outside AgentSession.executePython so dispose can await and abort it too.
 	 */
-	trackPythonExecution<T>(execution: Promise<T>, abortController: AbortController): Promise<T> {
-		this.#pythonAbortControllers.add(abortController);
-		this.#activePythonExecutions.add(execution);
+	trackEvalExecution<T>(execution: Promise<T>, abortController: AbortController): Promise<T> {
+		this.#evalAbortControllers.add(abortController);
+		this.#activeEvalExecutions.add(execution);
 		void execution.then(
 			() => {
-				this.#pythonAbortControllers.delete(abortController);
-				this.#activePythonExecutions.delete(execution);
+				this.#evalAbortControllers.delete(abortController);
+				this.#activeEvalExecutions.delete(execution);
 			},
 			() => {
-				this.#pythonAbortControllers.delete(abortController);
-				this.#activePythonExecutions.delete(execution);
+				this.#evalAbortControllers.delete(abortController);
+				this.#activeEvalExecutions.delete(execution);
 			},
 		);
 		return execution;
@@ -5914,35 +6103,35 @@ export class AgentSession {
 	/**
 	 * Cancel running Python execution.
 	 */
-	abortPython(): void {
-		for (const abortController of this.#pythonAbortControllers) {
+	abortEval(): void {
+		for (const abortController of this.#evalAbortControllers) {
 			abortController.abort();
 		}
 	}
 
-	async #waitForPythonExecutionsToSettle(timeoutMs: number): Promise<boolean> {
+	async #waitForEvalExecutionsToSettle(timeoutMs: number): Promise<boolean> {
 		const deadline = Date.now() + timeoutMs;
-		while (this.#activePythonExecutions.size > 0) {
+		while (this.#activeEvalExecutions.size > 0) {
 			const remainingMs = deadline - Date.now();
 			if (remainingMs <= 0) {
 				return false;
 			}
 			const settled = await Promise.race([
-				Promise.allSettled(Array.from(this.#activePythonExecutions)).then(() => true),
+				Promise.allSettled(Array.from(this.#activeEvalExecutions)).then(() => true),
 				Bun.sleep(remainingMs).then(() => false),
 			]);
-			if (!settled && this.#activePythonExecutions.size > 0) {
+			if (!settled && this.#activeEvalExecutions.size > 0) {
 				return false;
 			}
 		}
 		return true;
 	}
 
-	async #preparePythonExecutionsForDispose(): Promise<boolean> {
-		if (!(await this.#waitForPythonExecutionsToSettle(3_000))) {
+	async #prepareEvalExecutionsForDispose(): Promise<boolean> {
+		if (!(await this.#waitForEvalExecutionsToSettle(3_000))) {
 			logger.warn("Aborting active Python execution during dispose before retained kernel cleanup");
-			this.abortPython();
-			if (!(await this.#waitForPythonExecutionsToSettle(1_000))) {
+			this.abortEval();
+			if (!(await this.#waitForEvalExecutionsToSettle(1_000))) {
 				logger.warn(
 					"Python execution is still active after dispose aborted all active runs; retained kernel ownership will still be detached",
 				);
@@ -5953,8 +6142,8 @@ export class AgentSession {
 	}
 
 	/** Whether a Python execution is currently running */
-	get isPythonRunning(): boolean {
-		return this.#pythonAbortControllers.size > 0;
+	get isEvalRunning(): boolean {
+		return this.#evalAbortControllers.size > 0;
 	}
 
 	/** Whether there are pending Python messages waiting to be flushed */
@@ -6518,6 +6707,8 @@ export class AgentSession {
 		cancelled: boolean;
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
+		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
+		sessionContext?: SessionContext;
 	}> {
 		const oldLeafId = this.sessionManager.getLeafId();
 
@@ -6647,15 +6838,20 @@ export class AgentSession {
 			this.sessionManager.branch(newLeafId);
 		}
 
-		// Update agent state
-		const sessionContext = this.buildDisplaySessionContext();
-		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-		this.agent.replaceMessages(sessionContext.messages);
+		// Update agent state — build display context to populate agent messages.
+		const stateContext = this.sessionManager.buildSessionContext();
+		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
+		await this.#restoreMCPSelectionsForSessionContext(displayContext);
+		this.agent.replaceMessages(displayContext.messages);
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
-		// Emit session_tree event
-		if (this.#extensionRunner) {
+		this.#branchSummaryAbortController = undefined;
+
+		// Emit session_tree event; only handlers can mutate session entries, so skip
+		// the emit and the context rebuild when no handlers are registered (mirrors
+		// the session_before_tree guard above).
+		if (this.#extensionRunner?.hasHandlers("session_tree")) {
 			await this.#extensionRunner.emit({
 				type: "session_tree",
 				newLeafId: this.sessionManager.getLeafId(),
@@ -6663,10 +6859,10 @@ export class AgentSession {
 				summaryEntry,
 				fromExtension: summaryText ? fromExtension : undefined,
 			});
+			const rawContext = this.sessionManager.buildSessionContext();
+			return { editorText, cancelled: false, summaryEntry, sessionContext: rawContext };
 		}
-
-		this.#branchSummaryAbortController = undefined;
-		return { editorText, cancelled: false, summaryEntry };
+		return { editorText, cancelled: false, summaryEntry, sessionContext: stateContext };
 	}
 
 	/**

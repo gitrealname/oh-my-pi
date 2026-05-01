@@ -68,3 +68,11 @@ packages/coding-agent/src/internal-urls/docs-index.generated.ts
 **/.index.html
 /runs/
 python/omp-rpc/src/omp_rpc.egg-info/
+
+scripts/session-stats/Cargo.lock
+
+scripts/session-stats/edit-analysis.csv
+
+# parallel-agent worktrees
+.wt/
+CPU*.md

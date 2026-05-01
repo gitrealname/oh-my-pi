@@ -7,9 +7,11 @@
  *   @Lid                    move cursor to just after the anchored line
  *   Lid=TEXT                set the anchored line to TEXT and move cursor after it
  *   -Lid                    delete the anchored line and move cursor to its slot
+ *   LidA..LidB=TEXT         replace a range; following \TEXT lines continue it
+ *   \TEXT                   append TEXT to the active replacement (set or range)
  *   +TEXT                   insert TEXT at the cursor
- *   $                       move cursor to beginning of file
- *   ^                       move cursor to end of file
+ *   ^                       move cursor to beginning of file
+ *   $                       move cursor to end of file
  */
 
 import * as fs from "node:fs/promises";
@@ -57,6 +59,11 @@ export type AtomParams = Static<typeof atomEditParamsSchema>;
 const LID_RE = /^([1-9]\d*)([a-z]{2})/;
 const LID_EXACT_RE = /^([1-9]\d*)([a-z]{2})$/;
 
+// Sentinel hash used for interior line anchors synthesized from `-LidA..LidB`
+// range deletes. validateAtomAnchors recognizes this and skips hash checking
+// (only the start and end Lids' hashes are validated by the user).
+const RANGE_INTERIOR_HASH = "**";
+
 interface ParsedAnchor {
 	line: number;
 	hash: string;
@@ -67,6 +74,7 @@ type ParsedOp = { op: "set"; text: string; allowOldNewRepair: boolean } | { op: 
 type AnchorStmt =
 	| { kind: "bare_anchor"; anchor: ParsedAnchor; lineNum: number }
 	| { kind: "anchor_op"; anchor: ParsedAnchor; op: ParsedOp; lineNum: number }
+	| { kind: "before_anchor"; anchor: ParsedAnchor; lineNum: number }
 	| { kind: "bof"; lineNum: number }
 	| { kind: "eof"; lineNum: number };
 
@@ -79,6 +87,7 @@ type InsertStmt = {
 type DiffishAddStmt = {
 	kind: "diffish_add";
 	anchor: ParsedAnchor;
+	separator: "=" | "|";
 	text: string;
 	lineNum: number;
 };
@@ -92,7 +101,11 @@ type DeleteWithOldStmt = {
 
 type ParsedStmt = AnchorStmt | InsertStmt | DiffishAddStmt | DeleteWithOldStmt;
 
-type AtomCursor = { kind: "bof" } | { kind: "eof" } | { kind: "anchor"; anchor: Anchor };
+type AtomCursor =
+	| { kind: "bof" }
+	| { kind: "eof" }
+	| { kind: "anchor"; anchor: Anchor }
+	| { kind: "before_anchor"; anchor: Anchor };
 
 export type AtomEdit =
 	| { kind: "insert"; cursor: AtomCursor; text: string; lineNum: number; index: number }
@@ -119,11 +132,12 @@ interface IndexedAnchorEdit {
 }
 
 function cloneCursor(cursor: AtomCursor): AtomCursor {
-	if (cursor.kind !== "anchor") return cursor;
-	return { kind: "anchor", anchor: { ...cursor.anchor } };
+	if (cursor.kind === "anchor") return { kind: "anchor", anchor: { ...cursor.anchor } };
+	if (cursor.kind === "before_anchor") return { kind: "before_anchor", anchor: { ...cursor.anchor } };
+	return cursor;
 }
 
-function parseLidStmt(body: string, lineNum: number): AnchorStmt | null {
+function parseLidStmt(body: string, lineNum: number): ParsedStmt[] | null {
 	const m = LID_RE.exec(body);
 	if (!m) return null;
 
@@ -131,22 +145,133 @@ function parseLidStmt(body: string, lineNum: number): AnchorStmt | null {
 	const hash = m[2];
 	const rest = body.slice(m[0].length);
 	const anchor = { line: ln, hash };
+
+	// Range replace: `LidA..LidB=TEXT` deletes the inclusive range LidA..LidB
+	// and inserts TEXT in its place. Following insert statements append more
+	// replacement lines through the normal hunk reorder path. Legacy `|` is
+	// accepted as a set separator for parity with single-line `Lid|TEXT`.
+	// Bare `LidA..LidB` recovers the common missing-`-` typo for range delete.
+	if (rest.startsWith("..")) {
+		const m2 = LID_RE.exec(rest.slice(2));
+		if (m2) {
+			const endLn = Number.parseInt(m2[1], 10);
+			const endHash = m2[2];
+			const after = rest.slice(2 + m2[0].length);
+			const range = `${ln}${hash}..${endLn}${endHash}`;
+			if (endLn < ln) {
+				throw new Error(
+					`Diff line ${lineNum}: range \`${range}\` ends before it starts. Use \`LidA..LidB=TEXT\` with LidA's line number ≤ LidB's.`,
+				);
+			}
+			if (endLn === ln && endHash !== hash) {
+				throw new Error(
+					`Diff line ${lineNum}: range \`${range}\` uses two different hashes for the same line. Copy the same Lid at both endpoints or use \`${ln}${hash}=TEXT\` for a single-line replacement.`,
+				);
+			}
+
+			const stmts: ParsedStmt[] = [];
+			for (let l = ln; l <= endLn; l++) {
+				const h = l === ln ? hash : l === endLn ? endHash : RANGE_INTERIOR_HASH;
+				stmts.push({
+					kind: "anchor_op",
+					anchor: { line: l, hash: h },
+					op: { op: "delete" },
+					lineNum,
+				});
+			}
+
+			if (after.trim().length === 0) return stmts;
+
+			const replacement = /^[ \t]*([=|])(.*)$/.exec(after);
+			if (replacement) {
+				if (replacement[2].includes("\r")) {
+					throw new Error(`Diff line ${lineNum}: set value contains a carriage return; use a single-line value.`);
+				}
+				stmts.push({ kind: "insert", text: replacement[2], lineNum });
+				return stmts;
+			}
+		}
+	}
+
 	if (rest.length === 0) {
-		return { kind: "bare_anchor", anchor, lineNum };
+		return [{ kind: "bare_anchor", anchor, lineNum }];
 	}
 
 	const replacement = /^[ \t]*([=|])(.*)$/.exec(rest);
-	if (!replacement) return null;
-	return {
-		kind: "anchor_op",
-		anchor,
-		op: { op: "set", text: replacement[2], allowOldNewRepair: replacement[1] === "|" },
-		lineNum,
-	};
+	if (replacement) {
+		return [
+			{
+				kind: "anchor_op",
+				anchor,
+				op: { op: "set", text: replacement[2], allowOldNewRepair: replacement[1] === "|" },
+				lineNum,
+			},
+		];
+	}
+
+	// Compound shorthand: `Lid+TEXT` collapses cursor-after-Lid + insert TEXT.
+	// Models sometimes write a run like `103rd=A` / `103rd+B` / `103rd+C` to
+	// mean "set 103 to A, then insert B and C below it". Treat each `Lid+...`
+	// as an independent cursor-move + insert; this matches semantics of the
+	// canonical `@Lid` + `+TEXT` two-line form.
+	if (rest[0] === "+") {
+		return [
+			{ kind: "bare_anchor", anchor, lineNum },
+			{ kind: "insert", text: rest.slice(1), lineNum },
+		];
+	}
+
+	return null;
 }
 
 function parseDeleteStmt(body: string, lineNum: number): ParsedStmt[] | null {
 	const trimmedBody = body.trimStart();
+
+	// Range delete: `-LidA..LidB` deletes the contiguous range LidA..LidB inclusive.
+	const rangeRe = /^([1-9]\d*)([a-z]{2})\.\.([1-9]\d*)([a-z]{2})$/;
+	const rangeMatch = rangeRe.exec(trimmedBody);
+	if (rangeMatch) {
+		const startLine = Number.parseInt(rangeMatch[1], 10);
+		const startHash = rangeMatch[2];
+		const endLine = Number.parseInt(rangeMatch[3], 10);
+		const endHash = rangeMatch[4];
+		if (endLine < startLine) {
+			throw new Error(
+				`Diff line ${lineNum}: range \`-${startLine}${startHash}..${endLine}${endHash}\` ends before it starts. Use \`-LidA..LidB\` with LidA's line number ≤ LidB's.`,
+			);
+		}
+		if (endLine === startLine && endHash !== startHash) {
+			throw new Error(
+				`Diff line ${lineNum}: range \`-${startLine}${startHash}..${endLine}${endHash}\` uses two different hashes for the same line. Copy the same Lid at both endpoints or use \`-${startLine}${startHash}\` for a single-line delete.`,
+			);
+		}
+		const stmts: ParsedStmt[] = [];
+		for (let ln = startLine; ln <= endLine; ln++) {
+			const hash = ln === startLine ? startHash : ln === endLine ? endHash : RANGE_INTERIOR_HASH;
+			stmts.push({
+				kind: "anchor_op",
+				anchor: { line: ln, hash },
+				op: { op: "delete" },
+				lineNum,
+			});
+		}
+		return stmts;
+	}
+
+	// `-LidA..LidB|TEXT` and `-LidA..LidB=TEXT` are not valid: ranges have no
+	// `|` (delete-with-old) form. Models reach for these when trying to
+	// "delete the range and replace with TEXT" — point at the `LidA..LidB=TEXT`
+	// shorthand instead.
+	const rangeWithSuffix = /^([1-9]\d*)([a-z]{2})\.\.([1-9]\d*)([a-z]{2})[ \t]*[=|](.*)$/.exec(trimmedBody);
+	if (rangeWithSuffix) {
+		const lidA = `${rangeWithSuffix[1]}${rangeWithSuffix[2]}`;
+		const lidB = `${rangeWithSuffix[3]}${rangeWithSuffix[4]}`;
+		const text = rangeWithSuffix[5];
+		throw new Error(
+			`Diff line ${lineNum}: \`-${lidA}..${lidB}\` cannot have a \`|\`/\`=\` suffix. To delete the range, use \`-${lidA}..${lidB}\` alone. To replace the range with one new line, drop the leading \`-\` and use \`${lidA}..${lidB}=${text}\`.`,
+		);
+	}
+
 	const exact = LID_EXACT_RE.exec(trimmedBody);
 	if (exact) {
 		const ln = Number.parseInt(exact[1], 10);
@@ -169,6 +294,17 @@ function parseDeleteStmt(body: string, lineNum: number): ParsedStmt[] | null {
 	}
 
 	return null;
+}
+
+function parseIndentedHashlineStmt(line: string, lineNum: number): ParsedStmt[] | null {
+	const trimmed = line.trimStart();
+	if (trimmed === line) return null;
+	const stmts = parseLidStmt(trimmed, lineNum);
+	if (!stmts) return null;
+	const safeHashlineEcho = stmts.every(
+		stmt => stmt.kind === "bare_anchor" || (stmt.kind === "anchor_op" && stmt.op.op === "set"),
+	);
+	return safeHashlineEcho ? stmts : null;
 }
 
 function throwMalformedLidDiagnostic(line: string, lineNum: number, raw: string): never {
@@ -200,18 +336,29 @@ function parseDiffLine(raw: string, lineNum: number): ParsedStmt[] {
 	const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
 	if (line.length === 0) return [];
 
+	// `# ...` comments are silently ignored. Models often add section headers
+	// or annotations like `# Test 1: replace enum`; treating these as literal
+	// inserts corrupts files, and the canonical syntax has no comment op.
+	if (line[0] === "#") return [];
+
+	const indentedHashline = parseIndentedHashlineStmt(line, lineNum);
+	if (indentedHashline) return indentedHashline;
+
 	// `+TEXT` inserts at the cursor. Everything after `+` is content. A
 	// `+Lid|TEXT` or `+Lid=TEXT` line is a diff-ish add (unified-diff trap):
 	// emit a tagged stmt so the normalizer can fuse it with a preceding `-Lid`.
 	if (line[0] === "+") {
 		const body = line.slice(1);
+		if (body.startsWith(RANGE_CONTINUATION_SENTINEL)) {
+			return [{ kind: "insert", text: body.slice(RANGE_CONTINUATION_SENTINEL.length), lineNum }];
+		}
 		const m = LID_RE.exec(body);
 		if (m) {
 			const sep = body[m[0].length];
 			if (sep === "=" || sep === "|") {
 				const ln = Number.parseInt(m[1], 10);
 				const text = body.slice(m[0].length + 1);
-				return [{ kind: "diffish_add", anchor: { line: ln, hash: m[2] }, text, lineNum }];
+				return [{ kind: "diffish_add", anchor: { line: ln, hash: m[2] }, separator: sep, text, lineNum }];
 			}
 		}
 
@@ -237,8 +384,58 @@ function parseDiffLine(raw: string, lineNum: number): ParsedStmt[] {
 	}
 
 	// Canonical file-scope locators.
-	if (line === "$") return [{ kind: "bof", lineNum }];
-	if (line === "^") return [{ kind: "eof", lineNum }];
+	if (line === "^") return [{ kind: "bof", lineNum }];
+	if (line === "$") return [{ kind: "eof", lineNum }];
+
+	// Compound shorthand: `^+TEXT` and `$+TEXT` collapse a file-scope cursor
+	// move and an insert onto one line. Models occasionally do this when
+	// creating files from scratch (`^+content`) instead of the canonical
+	// `^\n+content`. No legitimate op line starts with `^+` or `$+`, so the
+	// expansion is unambiguous.
+	if (line.length >= 2 && (line[0] === "^" || line[0] === "$") && line[1] === "+") {
+		const cursor: ParsedStmt = line[0] === "^" ? { kind: "bof", lineNum } : { kind: "eof", lineNum };
+		return [cursor, { kind: "insert", text: line.slice(2), lineNum }];
+	}
+
+	// `^=TEXT` and `$=TEXT` are not valid: `^` and `$` are cursor moves only.
+	// Models reach for these when trying to "replace the last line" or
+	// "replace the first line"; emit a clear diagnostic instead of falling
+	// through to "unrecognized op".
+	if (line.length >= 2 && (line[0] === "^" || line[0] === "$") && line[1] === "=") {
+		const where = line[0] === "^" ? "first" : "last";
+		const sym = line[0];
+		throw new Error(
+			`Diff line ${lineNum}: \`${sym}=TEXT\` is not a valid op. \`${sym}\` only moves the cursor (${sym === "^" ? "BOF" : "EOF"}); it cannot replace a line. To replace the ${where} line, use its Lid (e.g. \`5xx=TEXT\`). To insert at ${sym === "^" ? "BOF" : "EOF"}, use \`${sym}\` followed by \`+TEXT\` on the next line.`,
+		);
+	}
+
+	// `^Lid` cursor moves BEFORE the anchored line (insert above). Compound
+	// shorthand `^Lid+TEXT` collapses the cursor move and an insert into one
+	// line. `^Lid=TEXT` and `^Lid|TEXT` are flagged as ambiguous: pick either
+	// `^Lid` (cursor before) + `+TEXT`, or `Lid=TEXT` (replace in place).
+	if (line[0] === "^" && line.length > 1) {
+		const m = LID_RE.exec(line.slice(1));
+		if (m) {
+			const ln = Number.parseInt(m[1], 10);
+			const hash = m[2];
+			const sep = line[1 + m[0].length];
+			if (sep === undefined) {
+				return [{ kind: "before_anchor", anchor: { line: ln, hash }, lineNum }];
+			}
+			if (sep === "+") {
+				const text = line.slice(1 + m[0].length + 1);
+				return [
+					{ kind: "before_anchor", anchor: { line: ln, hash }, lineNum },
+					{ kind: "insert", text, lineNum },
+				];
+			}
+			if (sep === "=" || sep === "|") {
+				throw new Error(
+					`Diff line ${lineNum}: \`^${ln}${hash}${sep}...\` mixes \`^Lid\` (cursor before line) with \`Lid=TEXT\` (replace line). Pick one: \`^${ln}${hash}\` then \`+TEXT\` on the next line to insert above; or \`${ln}${hash}=TEXT\` to replace the line in place.`,
+				);
+			}
+		}
+	}
 
 	// `-Lid` deletes the anchored line. Leniently accept `- Lid` and the
 	// historical `-Lid TEXT` delete-then-insert recovery.
@@ -259,7 +456,7 @@ function parseDiffLine(raw: string, lineNum: number): ParsedStmt[] {
 		if (deleteStmt) return deleteStmt;
 
 		const lidStmt = parseLidStmt(body, lineNum);
-		if (lidStmt) return [lidStmt];
+		if (lidStmt) return lidStmt;
 
 		throwMalformedLidDiagnostic(line, lineNum, raw);
 	}
@@ -268,17 +465,17 @@ function parseDiffLine(raw: string, lineNum: number): ParsedStmt[] {
 	// `@Lid|TEXT`, `@$`, and `@^`.
 	if (line[0] === "@") {
 		const body = line.slice(1);
-		if (body === "$") return [{ kind: "bof", lineNum }];
-		if (body === "^") return [{ kind: "eof", lineNum }];
+		if (body === "^") return [{ kind: "bof", lineNum }];
+		if (body === "$") return [{ kind: "eof", lineNum }];
 		const lidStmt = parseLidStmt(body, lineNum);
-		if (lidStmt) return [lidStmt];
+		if (lidStmt) return lidStmt;
 		throwMalformedLidDiagnostic(line, lineNum, raw);
 	}
 
 	// `Lid=TEXT` sets the anchored line. Legacy `Lid|TEXT` remains accepted.
 	// A bare `Lid` is a cursor move.
 	const lidStmt = parseLidStmt(line, lineNum);
-	if (lidStmt) return [lidStmt];
+	if (lidStmt) return lidStmt;
 
 	if (/^[a-z]{2}(?=[ \t]*[=|])/.test(line) || /^[1-9]\d*(?=[ \t]*[=|]|$)/.test(line)) {
 		throwMalformedLidDiagnostic(line, lineNum, raw);
@@ -288,14 +485,105 @@ function parseDiffLine(raw: string, lineNum: number): ParsedStmt[] {
 	// emitted multi-line content after a `Lid=` or similar without `+` prefixes,
 	// or pasted raw context. Silently treating these as inserts corrupts files.
 	const preview = line.length > 80 ? `${line.slice(0, 80)}…` : line;
+	const trailingDash = /^([1-9]\d*[a-z]{2})-\s*$/.exec(line);
+	if (trailingDash) {
+		throw new Error(
+			`Diff line ${lineNum}: \`${line}\` looks like a delete with the operator on the wrong side. Use \`-${trailingDash[1]}\` to delete that line.`,
+		);
+	}
 	throw new Error(
 		`Diff line ${lineNum}: unrecognized op. Lines must start with \`+\`, \`-\`, \`@\`, \`$\`, \`^\`, or a Lid (\`Lid=TEXT\`). To insert literal text use \`+TEXT\`. Got "${preview}".`,
 	);
 }
 
+// Lines that look like recognized atom ops. Used to delimit range-replace
+// recovery continuation: after `LidA..LidB=TEXT` (or legacy `|` separator),
+// is treated as literal replacement text for backward compatibility.
+const OP_LINE_HEAD_RE = /^([+\-@$^!]|[1-9]\d*[a-z]{2}|[ \t]*$)/;
+const RANGE_CONTINUATION_SENTINEL = "\u0000";
+
+function isRangeReplaceStart(line: string): boolean {
+	return /^[1-9]\d*[a-z]{2}\.\.[1-9]\d*[a-z]{2}[ \t]*[=|]/.test(line);
+}
+
+// A single-line `Lid=TEXT` (or legacy `Lid|TEXT`, with optional leading `@`)
+// also opens a replacement that `\TEXT` continuation lines may extend. The
+// continuation lines become inserts at the cursor (which sits on the just-set
+// line), turning `Lid=A` + `\B` + `\C` into "set the line to A, then insert B
+// and C below it" — i.e. a multi-line rewrite of one anchor without forcing
+// the user to switch to the `LidA..LidB=` range form.
+function isReplaceStart(line: string): boolean {
+	if (isRangeReplaceStart(line)) return true;
+	const stripped = line.startsWith("@") ? line.slice(1) : line;
+	return /^[1-9]\d*[a-z]{2}[ \t]*[=|]/.test(stripped);
+}
+
+// Lookahead used by the blank-line forgiveness rule below: returns true when
+// the first non-blank line at or after `start` is a `\TEXT` continuation.
+function nextNonBlankIsBackslash(lines: readonly string[], start: number): boolean {
+	for (let j = start; j < lines.length; j++) {
+		const peek = lines[j].endsWith("\r") ? lines[j].slice(0, -1) : lines[j];
+		if (peek.length === 0) continue;
+		return peek.startsWith("\\");
+	}
+	return false;
+}
+
+// Explicit continuation uses `\TEXT` after a replacement op (`Lid=FIRST` or
+// `LidA..LidB=FIRST`). The leading backslash is the continuation marker; the
+// rest of the line is inserted literally, so `\\TEXT` inserts a line starting
+// with `\TEXT`. As a forgiveness rule, a literal blank line inside an active
+// replacement that is itself followed (possibly through more blanks) by another
+// `\TEXT` continuation is treated as an implicit `\` blank insert — authors
+// frequently drop a real blank between `\TEXT` lines instead of writing `\`.
+// Raw unprefixed continuation remains an undocumented best-effort recovery for
+// range replacements only, kept for old transcripts.
+function preprocessRangeReplaceContinuation(diff: string): string {
+	const lines = diff.split("\n");
+	let inRangeReplace = false;
+	let inReplace = false;
+	for (let i = 0; i < lines.length; i++) {
+		const rawLine = lines[i];
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+
+		if (line.startsWith("\\")) {
+			if (!inReplace) {
+				throw new Error(
+					`Diff line ${i + 1}: \\TEXT continuation is only valid immediately after a Lid=TEXT or LidA..LidB=FIRST_LINE replacement.`,
+				);
+			}
+			lines[i] = `+${RANGE_CONTINUATION_SENTINEL}${rawLine.slice(1)}`;
+			continue;
+		}
+
+		// Forgiveness: a blank line inside an active replacement that is followed
+		// by another `\TEXT` continuation is treated as an implicit `\` blank
+		// insert. Keeps the replacement open across the blank.
+		if (inReplace && line.length === 0 && nextNonBlankIsBackslash(lines, i + 1)) {
+			lines[i] = `+${RANGE_CONTINUATION_SENTINEL}`;
+			continue;
+		}
+
+		if (inRangeReplace) {
+			if (line.length === 0 || OP_LINE_HEAD_RE.test(line)) {
+				inRangeReplace = isRangeReplaceStart(line);
+				inReplace = isReplaceStart(line);
+				continue;
+			}
+
+			lines[i] = `+${RANGE_CONTINUATION_SENTINEL}${rawLine}`;
+			continue;
+		}
+
+		inRangeReplace = isRangeReplaceStart(line);
+		inReplace = isReplaceStart(line);
+	}
+	return lines.join("\n");
+}
+
 function tokenizeDiff(diff: string): ParsedStmt[] {
 	const out: ParsedStmt[] = [];
-	const lines = diff.split("\n");
+	const lines = preprocessRangeReplaceContinuation(diff).split("\n");
 	for (let i = 0; i < lines.length; i++) {
 		const lineNum = i + 1;
 		const stmts = parseDiffLine(lines[i], lineNum);
@@ -327,11 +615,14 @@ function tokenizeDiff(diff: string): ParsedStmt[] {
 // Detect contiguous `[delete | delete_with_old]+ [insert | diffish_add]+`
 // hunks and reorder so adds land at the FIRST delete's slot (block
 // replacement). Single-line `-Lid` + `+Lid|TEXT` (same Lid) fuses to a
-// `set`. Standalone `+Lid|TEXT` and `+Lid|TEXT` referencing a Lid not in
+// `set`; malformed standalone or mismatched `+Lid|TEXT`/`+Lid=TEXT` lines
+// throw instead of silently dropping the Lid prefix.
 function normalizeHunks(stmts: ParsedStmt[]): ParsedStmt[] {
 	const isDelete = (s: ParsedStmt): boolean =>
 		(s.kind === "anchor_op" && s.op.op === "delete") || s.kind === "delete_with_old";
 	const isAdd = (s: ParsedStmt): boolean => s.kind === "insert" || s.kind === "diffish_add";
+	const formatDiffishAdd = (stmt: DiffishAddStmt): string =>
+		`+${stmt.anchor.line}${stmt.anchor.hash}${stmt.separator}${stmt.text}`;
 	const out: ParsedStmt[] = [];
 	let i = 0;
 	while (i < stmts.length) {
@@ -340,7 +631,7 @@ function normalizeHunks(stmts: ParsedStmt[]): ParsedStmt[] {
 			if (stmt.kind === "diffish_add") {
 				const lid = `${stmt.anchor.line}${stmt.anchor.hash}`;
 				throw new Error(
-					`Diff line ${stmt.lineNum}: \`+${lid}|...\` looks like a unified-diff replacement marker. Use \`${lid}=TEXT\` to replace, or precede with \`-${lid}\` to delete-then-replace.`,
+					`Diff line ${stmt.lineNum}: \`${formatDiffishAdd(stmt)}\` is unified-diff syntax, not edit syntax. To replace a line, use \`${lid}=TEXT\`; to insert literal text, use \`+TEXT\` without a Lid prefix.`,
 				);
 			}
 			out.push(stmt);
@@ -368,7 +659,7 @@ function normalizeHunks(stmts: ParsedStmt[]): ParsedStmt[] {
 			const lid = `${add.anchor.line}${add.anchor.hash}`;
 			if (!deletedLids.has(lid)) {
 				throw new Error(
-					`Diff line ${add.lineNum}: \`+${lid}|...\` references a Lid that was not deleted in the preceding run. Use \`${lid}=TEXT\` to replace, or precede with \`-${lid}\`.`,
+					`Diff line ${add.lineNum}: \`${formatDiffishAdd(add)}\` references a Lid not in the preceding delete run. Use plain \`+TEXT\` for replacement lines, or delete \`${lid}\` before using a unified-diff recovery line for that Lid.`,
 				);
 			}
 		}
@@ -444,7 +735,12 @@ function splitContiguousDeletes(deletes: ParsedStmt[]): ParsedStmt[][] {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export function parseAtom(diff: string): AtomEdit[] {
+	return parseAtomWithWarnings(diff).edits;
+}
+
+export function parseAtomWithWarnings(diff: string): { edits: AtomEdit[]; warnings: string[] } {
 	const edits: AtomEdit[] = [];
+	const warnings: string[] = [];
 	let cursor: AtomCursor = { kind: "eof" };
 	let index = 0;
 
@@ -473,7 +769,12 @@ export function parseAtom(diff: string): AtomEdit[] {
 		}
 
 		if (stmt.kind === "diffish_add") {
-			throw new Error("Internal atom error: unresolved diff-ish add reached parseAtom.");
+			throw new Error("Internal edit error: unresolved diff-ish add reached parser.");
+		}
+
+		if (stmt.kind === "before_anchor") {
+			cursor = { kind: "before_anchor", anchor: makeAnchor(stmt.anchor) };
+			continue;
 		}
 
 		const anchor = makeAnchor(stmt.anchor);
@@ -502,7 +803,7 @@ export function parseAtom(diff: string): AtomEdit[] {
 		index++;
 	}
 
-	return edits;
+	return { edits, warnings };
 }
 
 function formatNoAtomEditDiagnostic(_path: string, diff: string): string {
@@ -523,19 +824,19 @@ function formatNoAtomEditDiagnostic(_path: string, diff: string): string {
 
 function getAtomEditAnchors(edit: AtomEdit): Anchor[] {
 	if (edit.kind === "set" || edit.kind === "delete") return [edit.anchor];
-	if (edit.cursor.kind === "anchor") return [edit.cursor.anchor];
+	if (edit.cursor.kind === "anchor" || edit.cursor.kind === "before_anchor") return [edit.cursor.anchor];
 	return [];
 }
 
 function validateAtomAnchors(edits: AtomEdit[], fileLines: string[], warnings: string[]): HashMismatch[] {
 	const mismatches: HashMismatch[] = [];
 	const rebasedAnchors = new Map<Anchor, HashMismatch>();
-	const rebasedMutatingAnchors: { original: string; rebased: number; hash: string }[] = [];
 	for (const edit of edits) {
 		for (const anchor of getAtomEditAnchors(edit)) {
 			if (anchor.line < 1 || anchor.line > fileLines.length) {
 				throw new Error(`Line ${anchor.line} does not exist (file has ${fileLines.length} lines)`);
 			}
+			if (anchor.hash === RANGE_INTERIOR_HASH) continue;
 			const actualHash = computeLineHash(anchor.line, fileLines[anchor.line - 1]);
 			if (actualHash === anchor.hash) continue;
 
@@ -544,9 +845,6 @@ function validateAtomAnchors(edits: AtomEdit[], fileLines: string[], warnings: s
 				const original = `${anchor.line}${anchor.hash}`;
 				rebasedAnchors.set(anchor, { line: anchor.line, expected: anchor.hash, actual: actualHash });
 				anchor.line = rebased;
-				if (edit.kind === "set" || edit.kind === "delete") {
-					rebasedMutatingAnchors.push({ original, rebased, hash: anchor.hash });
-				}
 				warnings.push(
 					`Auto-rebased anchor ${original} → ${rebased}${anchor.hash} (line shifted within ±${ANCHOR_REBASE_WINDOW}; hash matched).`,
 				);
@@ -554,20 +852,6 @@ function validateAtomAnchors(edits: AtomEdit[], fileLines: string[], warnings: s
 			}
 			mismatches.push({ line: anchor.line, expected: anchor.hash, actual: actualHash });
 		}
-	}
-
-	// Rebase cap: a single stale anchor (e.g. unrelated upstream edit) is fine,
-	// but multiple mutating anchors all rebasing is the signature of a miscounted
-	// block edit (agent stacked `Lid=X` ops over a contiguous range whose new
-	// length differs from the old). Refuse so the agent retries with the
-	// `-Lid`+`+TEXT` block-rewrite recipe instead of silently corrupting the file.
-	if (rebasedMutatingAnchors.length > 1) {
-		const detail = rebasedMutatingAnchors.map(r => `${r.original} → ${r.rebased}${r.hash}`).join(", ");
-		throw new Error(
-			`Refusing edit: ${rebasedMutatingAnchors.length} mutating anchors needed auto-rebase (${detail}). ` +
-				"This usually means a `Lid=X` chain was used to rewrite a contiguous block whose new length differs from the old. " +
-				"Rewrite the block by deleting each original line with `-Lid` (one per line) and emitting the new content as `+TEXT` lines.",
-		);
 	}
 
 	// Detect post-rebase conflicts. If any conflicting anchor was rebased, surface
@@ -676,8 +960,8 @@ function applyFileCursorInserts(
 
 function getAnchorForAnchorEdit(edit: IndexedAnchorEdit["edit"]): Anchor {
 	if (edit.kind !== "insert") return edit.anchor;
-	if (edit.cursor.kind !== "anchor") {
-		throw new Error("Internal atom error: file-scoped insert reached anchor application.");
+	if (edit.cursor.kind !== "anchor" && edit.cursor.kind !== "before_anchor") {
+		throw new Error("Internal edit error: file-scoped insert reached anchor application.");
 	}
 	return edit.cursor.anchor;
 }
@@ -688,6 +972,9 @@ function getAnchorForAnchorEdit(edit: IndexedAnchorEdit["edit"]): Anchor {
 // missed one delete on the front or back of the deletion range, leaving a
 // stale copy of a line the agent already re-emitted (e.g. inserting a new
 // closing `}` while the original `}` was never deleted, producing `}\n}`).
+// A single edit may damage multiple unrelated segments (e.g. two block
+// rewrites that each missed their trailing `}`), so detection and auto-fix
+// operate on every new adjacent duplicate at once.
 //
 // Auto-fix is gated on bracket balance: we only remove the duplicate line if
 // its removal restores the original file's `{}`/`()`/`[]` delta. That makes
@@ -747,23 +1034,28 @@ function detectAndAutoFixDuplicates(
 
 	const formatPreview = (text: string): string => JSON.stringify(text.length > 60 ? `${text.slice(0, 60)}…` : text);
 
-	// Auto-fix only when there is exactly one new adjacent duplicate AND the
-	// edit shifted bracket balance. Removing one of the two identical lines
-	// must restore the original delta exactly.
-	if (newDupPositions.length === 1) {
-		const pos = newDupPositions[0];
-		const origBalance = computeBalance(originalLines);
-		const finalBalance = computeBalance(finalLines);
-		if (!balancesEqual(origBalance, finalBalance)) {
-			const trial = finalLines.slice(0, pos).concat(finalLines.slice(pos + 1));
-			if (balancesEqual(computeBalance(trial), origBalance)) {
-				return {
-					fixed: trial,
-					warnings: [
-						`Auto-fixed: removed duplicate line ${pos + 1} (${formatPreview(finalLines[pos])}); the edit left two adjacent identical lines and bracket balance was off. Verify the result.`,
-					],
-				};
-			}
+	// Auto-fix when removing one line from each new adjacent duplicate pair
+	// collectively restores the original bracket balance. The balance check is
+	// the safety gate: if we over- or under-correct (e.g. when 3+ adjacent
+	// identical lines confuse the per-pair scan), the trial balance will not
+	// match and we fall through to warnings.
+	const origBalance = computeBalance(originalLines);
+	const finalBalance = computeBalance(finalLines);
+	if (!balancesEqual(origBalance, finalBalance)) {
+		const trial = finalLines.slice();
+		// Remove in reverse so earlier indices remain valid.
+		for (let i = newDupPositions.length - 1; i >= 0; i--) {
+			trial.splice(newDupPositions[i], 1);
+		}
+		if (balancesEqual(computeBalance(trial), origBalance)) {
+			const previews = newDupPositions.map(pos => `${pos + 1} (${formatPreview(finalLines[pos])})`).join(", ");
+			const noun = newDupPositions.length === 1 ? "duplicate line" : "duplicate lines";
+			return {
+				fixed: trial,
+				warnings: [
+					`Auto-fixed: removed ${noun} ${previews}; the edit left adjacent identical lines and bracket balance was off. Verify the result.`,
+				],
+			};
 		}
 	}
 
@@ -797,7 +1089,7 @@ export function applyAtomEdits(text: string, edits: AtomEdit[]): AtomApplyResult
 	const anchorEdits: IndexedAnchorEdit[] = [];
 	const fileInserts: Extract<AtomEdit, { kind: "insert" }>[] = [];
 	edits.forEach((edit, idx) => {
-		if (edit.kind === "insert" && edit.cursor.kind !== "anchor") {
+		if (edit.kind === "insert" && edit.cursor.kind !== "anchor" && edit.cursor.kind !== "before_anchor") {
 			fileInserts.push(edit);
 			return;
 		}
@@ -826,12 +1118,17 @@ export function applyAtomEdits(text: string, edits: AtomEdit[]): AtomApplyResult
 		let replacement: string[] = [currentLine];
 		let replacementSet = false;
 		let anchorMutated = false;
+		const beforeLines: string[] = [];
 		const afterLines: string[] = [];
 
 		for (const { edit } of bucket) {
 			switch (edit.kind) {
 				case "insert":
-					afterLines.push(edit.text);
+					if (edit.cursor.kind === "before_anchor") {
+						beforeLines.push(edit.text);
+					} else {
+						afterLines.push(edit.text);
+					}
 					break;
 				case "set":
 					replacement = [edit.allowOldNewRepair ? repairAtomOldNewSetLine(currentLine, edit.text) : edit.text];
@@ -839,11 +1136,9 @@ export function applyAtomEdits(text: string, edits: AtomEdit[]): AtomApplyResult
 					anchorMutated = true;
 					break;
 				case "delete":
-					if (edit.oldAssertion !== undefined && edit.oldAssertion !== currentLine) {
-						throw new Error(
-							`Diff line ${edit.lineNum}: \`-${edit.anchor.line}${edit.anchor.hash}\` asserts the deleted line is ${JSON.stringify(edit.oldAssertion)}, but the file has ${JSON.stringify(currentLine)}. Re-anchor and retry.`,
-						);
-					}
+					// `-Lid|OLD` / `-Lid=OLD`: the OLD payload is informational only.
+					// The Lid hash already validates the line content (and auto-rebases
+					// when lines have shifted), so we ignore any OLD mismatch here.
 					replacement = [];
 					replacementSet = true;
 					anchorMutated = true;
@@ -852,7 +1147,10 @@ export function applyAtomEdits(text: string, edits: AtomEdit[]): AtomApplyResult
 		}
 
 		const replacementProducesNoChange =
-			afterLines.length === 0 && replacement.length === 1 && replacement[0] === currentLine;
+			beforeLines.length === 0 &&
+			afterLines.length === 0 &&
+			replacement.length === 1 &&
+			replacement[0] === currentLine;
 		if (replacementProducesNoChange) {
 			const firstEdit = bucket[0]?.edit;
 			const anchor = firstEdit ? getAnchorForAnchorEdit(firstEdit) : undefined;
@@ -868,14 +1166,14 @@ export function applyAtomEdits(text: string, edits: AtomEdit[]): AtomApplyResult
 			continue;
 		}
 
-		const combined = [...replacement, ...afterLines];
+		const combined = [...beforeLines, ...replacement, ...afterLines];
 		fileLines.splice(idx, 1, ...combined);
-		if (anchorMutated) {
+		if (anchorMutated || beforeLines.length > 0) {
 			trackFirstChanged(line);
 		} else if (afterLines.length > 0) {
 			trackFirstChanged(line + 1);
 		}
-		if (!replacementSet && afterLines.length === 0) continue;
+		if (!replacementSet && beforeLines.length === 0 && afterLines.length === 0) continue;
 	}
 
 	const fileFirstChangedLine = applyFileCursorInserts(fileLines, fileInserts);
@@ -948,7 +1246,7 @@ function parseAtomHeaderLine(line: string, cwd?: string): string | null {
 	if (body.startsWith(" ")) body = body.slice(1);
 	const parsedPath = normalizeAtomPath(body, cwd);
 	if (parsedPath.length === 0) {
-		throw new Error(`atom input header "${FILE_HEADER_PREFIX}" is empty; provide a file path.`);
+		throw new Error(`Input header "${FILE_HEADER_PREFIX}" is empty; provide a file path.`);
 	}
 	return parsedPath;
 }
@@ -956,21 +1254,21 @@ function parseAtomHeaderLine(line: string, cwd?: string): string | null {
 function parseSingleAtomPathArgument(rawPath: string, directive: string, lineNum: number, cwd?: string): string {
 	const trimmed = rawPath.trim();
 	if (trimmed.length === 0) {
-		throw new Error(`Atom line ${lineNum}: ${directive} requires exactly one non-empty destination path.`);
+		throw new Error(`Diff line ${lineNum}: ${directive} requires exactly one non-empty destination path.`);
 	}
 
 	const quote = trimmed[0];
 	if (quote === '"' || quote === "'") {
 		if (trimmed.length < 2 || trimmed[trimmed.length - 1] !== quote) {
-			throw new Error(`Atom line ${lineNum}: ${directive} requires exactly one destination path.`);
+			throw new Error(`Diff line ${lineNum}: ${directive} requires exactly one destination path.`);
 		}
 	} else if (/\s/.test(trimmed)) {
-		throw new Error(`Atom line ${lineNum}: ${directive} requires exactly one destination path.`);
+		throw new Error(`Diff line ${lineNum}: ${directive} requires exactly one destination path.`);
 	}
 
 	const destination = normalizeAtomPath(trimmed, cwd);
 	if (destination.length === 0) {
-		throw new Error(`Atom line ${lineNum}: ${directive} requires exactly one non-empty destination path.`);
+		throw new Error(`Diff line ${lineNum}: ${directive} requires exactly one non-empty destination path.`);
 	}
 	return destination;
 }
@@ -985,11 +1283,11 @@ function parseAtomWholeFileOperationLine(
 		return { kind: "delete", lineNum };
 	}
 	if (line.startsWith(`${REMOVE_FILE_OPERATION} `) || line.startsWith(`${REMOVE_FILE_OPERATION}\t`)) {
-		throw new Error(`Atom line ${lineNum}: ${REMOVE_FILE_OPERATION} does not take a destination path.`);
+		throw new Error(`Diff line ${lineNum}: ${REMOVE_FILE_OPERATION} does not take a destination path.`);
 	}
 
 	if (line === MOVE_FILE_OPERATION) {
-		throw new Error(`Atom line ${lineNum}: ${MOVE_FILE_OPERATION} requires exactly one non-empty destination path.`);
+		throw new Error(`Diff line ${lineNum}: ${MOVE_FILE_OPERATION} requires exactly one non-empty destination path.`);
 	}
 	if (line.startsWith(`${MOVE_FILE_OPERATION} `) || line.startsWith(`${MOVE_FILE_OPERATION}\t`)) {
 		const rawDestination = line.slice(MOVE_FILE_OPERATION.length);
@@ -1021,7 +1319,7 @@ function getAtomWholeFileOperation(
 		if (parsed) {
 			if (operation) {
 				throw new Error(
-					`Atom section ${sectionPath}: use only one ${REMOVE_FILE_OPERATION} or ${MOVE_FILE_OPERATION} operation.`,
+					`Edit section ${sectionPath}: use only one ${REMOVE_FILE_OPERATION} or ${MOVE_FILE_OPERATION} operation.`,
 				);
 			}
 			operation = parsed;
@@ -1034,7 +1332,7 @@ function getAtomWholeFileOperation(
 
 	if (operation && hasLineEdit) {
 		throw new Error(
-			`Atom section ${sectionPath} mixes ${operationToken} with line edits; ${REMOVE_FILE_OPERATION} and ${MOVE_FILE_OPERATION} must be the only operation in their section.`,
+			`Edit section ${sectionPath} mixes ${operationToken} with line edits; ${REMOVE_FILE_OPERATION} and ${MOVE_FILE_OPERATION} must be the only operation in their section.`,
 		);
 	}
 
@@ -1052,8 +1350,10 @@ function containsRecognizableAtomOperations(input: string): boolean {
 		if (line.length === 0) continue;
 		if (line[0] === "+") return true;
 		if (line === "$" || line === "^") return true;
-		if (/^- ?[1-9]\d*[a-z]{2}(?: .*)?$/.test(line)) return true;
-		if (/^@?[1-9]\d*[a-z]{2}(?:[ \t]*[=|].*)?$/.test(line)) return true;
+		if (/^\$\+.*$/.test(line)) return true;
+		if (/^\^[1-9]\d*[a-z]{2}(?:\+.*)?$/.test(line)) return true;
+		if (/^- ?[1-9]\d*[a-z]{2}(?:\.\.[1-9]\d*[a-z]{2})?(?:[ \t]*[=|].*| .*)?$/.test(line)) return true;
+		if (/^@?[1-9]\d*[a-z]{2}(?:\+.*|[ \t]*[=|].*|\.\.[1-9]\d*[a-z]{2}[ \t]*=.*)?$/.test(line)) return true;
 		if (/^@@ (?:BOF|EOF|(?:- ?)?[1-9]\d*[a-z]{2}(?:[ \t]*[=|].*)?)$/.test(line)) return true;
 	}
 	return false;
@@ -1068,8 +1368,42 @@ function stripLeadingBlankLines(input: string): string {
 	return lines.join("\n");
 }
 
+function normalizeStandaloneFileOpInput(input: string, cwd?: string): string | null {
+	const stripped = input.startsWith("\uFEFF") ? input.slice(1) : input;
+	const lines = stripped.split("\n");
+	let firstIdx = -1;
+	for (let i = 0; i < lines.length; i++) {
+		if (lines[i].replace(/\r$/, "").trim().length > 0) {
+			firstIdx = i;
+			break;
+		}
+	}
+	if (firstIdx === -1) return null;
+	const firstLine = lines[firstIdx].replace(/\r$/, "");
+	const remaining = lines.slice(firstIdx + 1).join("\n");
+	if (remaining.trim().length > 0) return null;
+
+	const rmMatch = /^!rm\s+(\S.*)$/.exec(firstLine);
+	if (rmMatch) {
+		const sourcePath = parseSingleAtomPathArgument(rmMatch[1], REMOVE_FILE_OPERATION, firstIdx + 1, cwd);
+		return `${FILE_HEADER_PREFIX}${sourcePath}\n${REMOVE_FILE_OPERATION}`;
+	}
+
+	const mvMatch = /^!mv\s+(\S+)\s+(\S.*)$/.exec(firstLine);
+	if (mvMatch) {
+		const sourcePath = parseSingleAtomPathArgument(mvMatch[1], MOVE_FILE_OPERATION, firstIdx + 1, cwd);
+		const destPath = parseSingleAtomPathArgument(mvMatch[2], MOVE_FILE_OPERATION, firstIdx + 1, cwd);
+		return `${FILE_HEADER_PREFIX}${sourcePath}\n${MOVE_FILE_OPERATION} ${destPath}`;
+	}
+
+	return null;
+}
+
 function normalizeFallbackInput(input: string, options: SplitAtomOptions): string {
-	if (hasAtomHeaderLine(input) || !options.path || !containsRecognizableAtomOperations(input)) {
+	if (hasAtomHeaderLine(input)) return input;
+	const standalone = normalizeStandaloneFileOpInput(input, options.cwd);
+	if (standalone !== null) return standalone;
+	if (!options.path || !containsRecognizableAtomOperations(input)) {
 		return input;
 	}
 	const fallbackPath = normalizeAtomPath(options.path, options.cwd);
@@ -1102,10 +1436,11 @@ export function splitAtomInputs(input: string, options: SplitAtomOptions = {}): 
 	const lines = stripped.split("\n");
 	const firstLine = (lines[0] ?? "").replace(/\r$/, "");
 	if (!firstLine.startsWith(FILE_HEADER_PREFIX)) {
+		const preview = JSON.stringify(firstLine.slice(0, 120));
 		throw new Error(
-			`atom input must begin with "${FILE_HEADER_PREFIX}<path>" on the first non-blank line; got: ${JSON.stringify(
-				firstLine.slice(0, 120),
-			)}`,
+			`input must begin with "${FILE_HEADER_PREFIX}<path>" on the first non-blank line; got: ${preview}.\n` +
+				`Example: "${FILE_HEADER_PREFIX}src/foo.ts" then your edit ops on the following lines. ` +
+				`To delete a file: "${FILE_HEADER_PREFIX}<path>\\n!rm". To rename: "${FILE_HEADER_PREFIX}<src>\\n!mv <dest>".`,
 		);
 	}
 
@@ -1166,7 +1501,13 @@ async function readAtomFile(absolutePath: string): Promise<ReadAtomFileResult> {
 }
 
 function hasAnchorScopedEdit(edits: AtomEdit[]): boolean {
-	return edits.some(edit => edit.kind === "set" || edit.kind === "delete" || edit.cursor.kind === "anchor");
+	return edits.some(
+		edit =>
+			edit.kind === "set" ||
+			edit.kind === "delete" ||
+			edit.cursor.kind === "anchor" ||
+			edit.cursor.kind === "before_anchor",
+	);
 }
 
 function formatNoChangeDiagnostic(path: string, result: AtomApplyResult): string {
@@ -1182,6 +1523,12 @@ function formatNoChangeDiagnostic(path: string, result: AtomApplyResult): string
 			})
 			.join("\n");
 		diagnostic += `\n${details}`;
+		const setNoops = result.noopEdits.filter(e => e.reason.startsWith("replacement is identical"));
+		if (setNoops.length > 0) {
+			diagnostic +=
+				"\n\nHint: each `Lid=TEXT` you emit MUST contain text that differs from the line currently anchored by Lid. " +
+				"Do not echo lines back from `read` output unchanged. If you intended to leave a line as-is, omit it from the patch.";
+		}
 	}
 	return diagnostic;
 }
@@ -1239,6 +1586,60 @@ async function executeAtomWholeFileOperation(
 	};
 }
 
+async function preflightAtomSection(options: ExecuteAtomSingleOptions & AtomInputSection): Promise<void> {
+	const { session, path: sectionPath, diff } = options;
+	if (options.wholeFileOperation) {
+		const { wholeFileOperation } = options;
+		const absolutePath = resolvePlanPath(session, sectionPath);
+		if (sectionPath.endsWith(".ipynb")) {
+			throw new Error("Cannot edit Jupyter notebooks with the Edit tool. Use the NotebookEdit tool instead.");
+		}
+		if (wholeFileOperation.kind === "delete") {
+			enforcePlanModeWrite(session, sectionPath, { op: "delete" });
+			await assertEditableFile(absolutePath, sectionPath);
+			return;
+		}
+
+		const destinationPath = wholeFileOperation.destination;
+		if (destinationPath.endsWith(".ipynb")) {
+			throw new Error("Cannot edit Jupyter notebooks with the Edit tool. Use the NotebookEdit tool instead.");
+		}
+		enforcePlanModeWrite(session, sectionPath, { op: "update", move: destinationPath });
+		const absoluteDestinationPath = resolvePlanPath(session, destinationPath);
+		if (absoluteDestinationPath === absolutePath) {
+			throw new Error("rename path is the same as source path");
+		}
+		await assertEditableFile(absolutePath, sectionPath);
+		return;
+	}
+
+	const { edits } = parseAtomWithWarnings(diff);
+	if (edits.length === 0 && diff.trim().length > 0) {
+		throw new Error(formatNoAtomEditDiagnostic(sectionPath, diff));
+	}
+
+	enforcePlanModeWrite(session, sectionPath, { op: "update" });
+	if (sectionPath.endsWith(".ipynb") && edits.length > 0) {
+		throw new Error("Cannot edit Jupyter notebooks with the Edit tool. Use the NotebookEdit tool instead.");
+	}
+
+	const absolutePath = resolvePlanPath(session, sectionPath);
+	const source = await readAtomFile(absolutePath);
+	if (!source.exists && hasAnchorScopedEdit(edits)) {
+		throw new Error(`File not found: ${sectionPath}`);
+	}
+	if (source.exists) {
+		assertEditableFileContent(source.rawContent, sectionPath);
+	}
+
+	const { text } = stripBom(source.rawContent);
+	const originalNormalized = normalizeToLF(text);
+	const result = applyAtomEdits(originalNormalized, edits);
+	if (originalNormalized === result.lines && (result.noopEdits?.length ?? 0) === 0) {
+		throw new Error(formatNoChangeDiagnostic(sectionPath, result));
+	}
+}
+
 async function executeAtomSection(
 	options: ExecuteAtomSingleOptions & AtomInputSection,
 ): Promise<AgentToolResult<EditToolDetails, typeof atomEditParamsSchema>> {
@@ -1247,7 +1648,7 @@ async function executeAtomSection(
 		return executeAtomWholeFileOperation({ ...options, wholeFileOperation: options.wholeFileOperation });
 	}
 
-	const edits = parseAtom(diff);
+	const { edits, warnings: parseWarnings } = parseAtomWithWarnings(diff);
 	if (edits.length === 0 && diff.trim().length > 0) {
 		throw new Error(formatNoAtomEditDiagnostic(path, diff));
 	}
@@ -1273,7 +1674,18 @@ async function executeAtomSection(
 	const originalNormalized = normalizeToLF(text);
 	const result = applyAtomEdits(originalNormalized, edits);
 	if (originalNormalized === result.lines) {
-		throw new Error(formatNoChangeDiagnostic(path, result));
+		const allNoop = (result.noopEdits?.length ?? 0) > 0;
+		if (!allNoop) {
+			throw new Error(formatNoChangeDiagnostic(path, result));
+		}
+		// Every edit was a no-op (TEXT identical to the anchored line). Returning
+		// success here breaks retry loops where models hammer the same `Lid=TEXT`
+		// when TEXT happens to already match. The response makes the no-op
+		// explicit so the model knows nothing changed and to move on.
+		return {
+			content: [{ type: "text", text: formatNoChangeDiagnostic(path, result) }],
+			details: { diff: "", op: "update", meta: outputMeta().get() },
+		};
 	}
 
 	const finalContent = bom + restoreLineEndings(result.lines, originalEnding);
@@ -1292,7 +1704,8 @@ async function executeAtomSection(
 		.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [])
 		.get();
 	const preview = buildCompactHashlineDiffPreview(diffResult.diff);
-	const warningsBlock = result.warnings?.length ? `\n\nWarnings:\n${result.warnings.join("\n")}` : "";
+	const allWarnings = [...parseWarnings, ...(result.warnings ?? [])];
+	const warningsBlock = allWarnings.length > 0 ? `\n\nWarnings:\n${allWarnings.join("\n")}` : "";
 	const previewBlock = preview.preview ? `\n${preview.preview}` : "";
 	const resultText = preview.preview ? `${path}:` : source.exists ? `Updated ${path}` : `Created ${path}`;
 
@@ -1320,6 +1733,10 @@ export async function executeAtomSingle(
 	if (sections.length === 1) {
 		const [section] = sections;
 		return executeAtomSection({ ...options, ...section });
+	}
+
+	for (const section of sections) {
+		await preflightAtomSection({ ...options, ...section });
 	}
 
 	const results = [];
