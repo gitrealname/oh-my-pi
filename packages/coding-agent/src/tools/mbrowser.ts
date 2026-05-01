@@ -570,6 +570,18 @@ const browserSchema = Type.Object({
 			examples: ["text/Drop zone"],
 		}),
 	),
+	from_point: Type.Optional(
+		Type.Object({
+			x: Type.Number({ description: "x coordinate" }),
+			y: Type.Number({ description: "y coordinate" }),
+		}),
+	),
+	to_point: Type.Optional(
+		Type.Object({
+			x: Type.Number({ description: "x coordinate" }),
+			y: Type.Number({ description: "y coordinate" }),
+		}),
+	),
 	dialogs: Type.Optional(StringEnum(["accept", "dismiss"], {
 		description: "open: auto-handle alert/confirm/beforeunload dialogs (default: leave for caller to handle)",
 	})),
@@ -1459,44 +1471,46 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 					return toolResult(details).text(`Scrolled by ${deltaX}, ${deltaY}`).done();
 				}
 				case "drag": {
-					const fromSelector = ensureParam(params.from_selector, "from_selector", params.action);
-					const toSelector = ensureParam(params.to_selector, "to_selector", params.action);
 					const page = await this.#ensurePage(params);
-					const resolvedFromSelector = normalizeSelector(fromSelector);
-					const resolvedToSelector = normalizeSelector(toSelector);
-					const fromHandle = (await untilAborted(signal, () =>
-						page.$(resolvedFromSelector),
-					)) as ElementHandle | null;
-					const toHandle = (await untilAborted(signal, () => page.$(resolvedToSelector))) as ElementHandle | null;
-					if (!fromHandle || !toHandle) {
-						throw new ToolError("Drag selectors did not resolve to elements");
+					let startX: number;
+					let startY: number;
+					let endX: number;
+					let endY: number;
+					if (params.from_point) {
+						startX = params.from_point.x;
+						startY = params.from_point.y;
+					} else {
+						const fromSelector = ensureParam(params.from_selector, "from_selector", params.action);
+						const fromHandle = (await untilAborted(signal, () =>
+							page.$(normalizeSelector(fromSelector)),
+						)) as ElementHandle | null;
+						if (!fromHandle) throw new ToolError(`Drag from selector did not resolve: ${fromSelector}`);
+						const fromBox = (await untilAborted(signal, () => fromHandle.boundingBox())) as { x: number; y: number; width: number; height: number } | null;
+						await fromHandle.dispose();
+						if (!fromBox) throw new ToolError("Drag from element is not visible");
+						startX = fromBox.x + fromBox.width / 2;
+						startY = fromBox.y + fromBox.height / 2;
 					}
-					const fromBox = (await untilAborted(signal, () => fromHandle.boundingBox())) as {
-						x: number;
-						y: number;
-						width: number;
-						height: number;
-					} | null;
-					const toBox = (await untilAborted(signal, () => toHandle.boundingBox())) as {
-						x: number;
-						y: number;
-						width: number;
-						height: number;
-					} | null;
-					await fromHandle.dispose();
-					await toHandle.dispose();
-					if (!fromBox || !toBox) {
-						throw new ToolError("Drag elements are not visible");
+					if (params.to_point) {
+						endX = params.to_point.x;
+						endY = params.to_point.y;
+					} else {
+						const toSelector = ensureParam(params.to_selector, "to_selector", params.action);
+						const toHandle = (await untilAborted(signal, () =>
+							page.$(normalizeSelector(toSelector)),
+						)) as ElementHandle | null;
+						if (!toHandle) throw new ToolError(`Drag to selector did not resolve: ${toSelector}`);
+						const toBox = (await untilAborted(signal, () => toHandle.boundingBox())) as { x: number; y: number; width: number; height: number } | null;
+						await toHandle.dispose();
+						if (!toBox) throw new ToolError("Drag to element is not visible");
+						endX = toBox.x + toBox.width / 2;
+						endY = toBox.y + toBox.height / 2;
 					}
-					const startX = fromBox.x + fromBox.width / 2;
-					const startY = fromBox.y + fromBox.height / 2;
-					const endX = toBox.x + toBox.width / 2;
-					const endY = toBox.y + toBox.height / 2;
 					await untilAborted(signal, () => page.mouse.move(startX, startY));
 					await untilAborted(signal, () => page.mouse.down());
 					await untilAborted(signal, () => page.mouse.move(endX, endY, { steps: 12 }));
 					await untilAborted(signal, () => page.mouse.up());
-					return toolResult(details).text(`Dragged from ${fromSelector} to ${toSelector}`).done();
+					return toolResult(details).text(`Dragged (${startX},${startY}) → (${endX},${endY})`).done();
 				}
 				case "wait_for_selector": {
 					const selector = ensureParam(params.selector, "selector", params.action);
