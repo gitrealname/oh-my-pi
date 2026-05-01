@@ -708,7 +708,7 @@ export class SelectorController {
 					const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
 					if (result.cancelled) { this.ctx.showStatus("Navigation cancelled"); return; }
 					this.ctx.chatContainer.clear();
-					this.ctx.renderInitialMessages();
+					this.ctx.renderInitialMessages(result.sessionContext);
 					await this.ctx.reloadTodos();
 					if (result.editorText && !this.ctx.editor.getText().trim()) {
 						this.ctx.editor.setText(result.editorText);
