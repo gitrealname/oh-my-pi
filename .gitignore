@@ -59,5 +59,6 @@ packages/coding-agent/src/internal-urls/docs-index.generated.ts
 /runs/
 python/omp-rpc/src/omp_rpc.egg-info/
 # parallel-agent worktrees
+.index.html
 .wt/
 CPU*.md
