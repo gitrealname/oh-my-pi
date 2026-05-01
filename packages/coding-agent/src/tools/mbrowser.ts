@@ -515,6 +515,11 @@ const browserSchema = Type.Object({
 			"extract_readable",
 			"screenshot",
 			"close",
+			"scroll_into_view",
+			"select",
+			"upload_file",
+			"wait_for_url",
+			"wait_for_response",
 		],
 		{ description: "action to perform" },
 	),
@@ -582,6 +587,8 @@ const browserSchema = Type.Object({
 			y: Type.Number({ description: "y coordinate" }),
 		}),
 	),
+	file_paths: Type.Optional(Type.Array(Type.String(), { description: "upload_file: file paths to upload" })),
+	pattern: Type.Optional(Type.String({ description: "wait_for_url/wait_for_response: URL substring or glob pattern to match" })),
 	dialogs: Type.Optional(StringEnum(["accept", "dismiss"], {
 		description: "open: auto-handle alert/confirm/beforeunload dialogs (default: leave for caller to handle)",
 	})),
@@ -1300,6 +1307,59 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 				case "close": {
 					await untilAborted(signal, () => this.#closeBrowser());
 					return toolResult(details).text("Closed headless browser session").done();
+				}
+				case "scroll_into_view": {
+					const selector = ensureParam(params.selector, "selector", params.action);
+					details.selector = selector;
+					const page = await this.#ensurePage(params);
+					const resolvedSelector = normalizeSelector(selector);
+					const handle = (await untilAborted(signal, () => page.$(resolvedSelector))) as ElementHandle | null;
+					if (!handle) throw new ToolError(`Selector not found: ${selector}`);
+					await untilAborted(signal, () => handle.scrollIntoView());
+					await handle.dispose();
+					return toolResult(details).text(`Scrolled into view: ${selector}`).done();
+				}
+				case "select": {
+					const selector = ensureParam(params.selector, "selector", params.action);
+					const value = ensureParam(params.value, "value", params.action);
+					details.selector = selector;
+					const page = await this.#ensurePage(params);
+					const resolvedSelector = normalizeSelector(selector);
+					await untilAborted(signal, () => page.select(resolvedSelector, value));
+					return toolResult(details).text(`Selected '${value}' in ${selector}`).done();
+				}
+				case "upload_file": {
+					const selector = ensureParam(params.selector, "selector", params.action);
+					const filePaths = params.file_paths;
+					if (!filePaths?.length) throw new ToolError(`upload_file requires file_paths`);
+					details.selector = selector;
+					const page = await this.#ensurePage(params);
+					const resolvedSelector = normalizeSelector(selector);
+					const input = (await untilAborted(signal, () => page.$(resolvedSelector))) as ElementHandle | null;
+					if (!input) throw new ToolError(`Selector not found: ${selector}`);
+					await untilAborted(signal, () => (input as any).uploadFile(...filePaths));
+					await input.dispose();
+					return toolResult(details).text(`Uploaded ${filePaths.length} file(s) to ${selector}`).done();
+				}
+				case "wait_for_url": {
+					const pattern = ensureParam(params.pattern, "pattern", params.action);
+					const page = await this.#ensurePage(params);
+					await untilAborted(signal, () =>
+						page.waitForFunction(`window.location.href.includes(${JSON.stringify(pattern)})`, { timeout: timeoutMs }),
+					);
+					const url = page.url();
+					details.url = url;
+					return toolResult(details).text(`URL matched '${pattern}': ${url}`).done();
+				}
+				case "wait_for_response": {
+					const pattern = ensureParam(params.pattern, "pattern", params.action);
+					const page = await this.#ensurePage(params);
+					const response = await untilAborted(signal, () =>
+						page.waitForResponse(r => r.url().includes(pattern), { timeout: timeoutMs }),
+					);
+					const status = (response as any).status() as number;
+					details.result = `${status} ${(response as any).url()}`;
+					return toolResult(details).text(`Response matched '${pattern}': ${status} ${(response as any).url()}`).done();
 				}
 				case "goto": {
 					const url = ensureParam(params.url, "url", params.action);
