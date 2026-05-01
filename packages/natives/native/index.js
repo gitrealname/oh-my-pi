@@ -77,13 +77,21 @@ function detectAvx2Support() {
 	}
 
 	if (process.platform === "win32") {
-		const output = runCommand("powershell.exe", [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			"[System.Runtime.Intrinsics.X86.Avx2]::IsSupported",
-		]);
-		return output && output.toLowerCase() === "true";
+		// Avoid PowerShell — PS5 lacks System.Runtime.Intrinsics and fails silently.
+		// Use os.cpus() model string: all Intel Haswell+ (2013) and AMD Excavator+ (2015) support AVX2.
+		try {
+			const model = os.cpus()[0].model;
+			if (/AVX2/i.test(model)) return true;
+			// Intel: i*-4xxx (Haswell) and above, Xeon E3/E5/E7 v3+
+			const intelGen = model.match(/i[3579]-(\d)/);
+			if (intelGen && parseInt(intelGen[1], 10) >= 4) return true;
+			// AMD: Ryzen (all), EPYC (all) have AVX2
+			if (/\b(Ryzen|EPYC)\b/i.test(model)) return true;
+			// Fallback: default to true on modern x64 Windows
+			return true;
+		} catch {
+			return true;
+		}
 	}
 
 	return false;
