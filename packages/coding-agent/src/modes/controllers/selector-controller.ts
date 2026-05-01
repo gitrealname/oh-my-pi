@@ -568,11 +568,8 @@ export class SelectorController {
 		});
 	}
 
-	showTreeSelectorOriginal(): void {
-		this.showTreeSelector(true);
-	}
 
-	showTreeSelector(useOriginal = false): void {
+	showTreeSelector(): void {
 		const tree = this.ctx.sessionManager.getTree();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
@@ -687,9 +684,42 @@ export class SelectorController {
 				this.ctx.ui.requestRender();
 			};
 			const filterMode = settings.get("treeFilterMode");
-			const selector = useOriginal
-				? new TreeSelectorComponent(tree, realLeafId, this.ctx.ui.terminal.rows, onNavigate, onClose, onLabel as any, filterMode)
-				: new TreePeekComponent(tree, realLeafId, this.ctx.ui.terminal.rows, this.ctx.ui, onNavigate, onClose);
+		const selector = new TreeSelectorComponent(tree, realLeafId, this.ctx.ui.terminal.rows, onNavigate, onClose, onLabel as any, filterMode);
+			return { component: selector, focus: selector };
+		});
+	}
+
+	showMTreeSelector(): void {
+		const tree = this.ctx.sessionManager.getTree();
+		const realLeafId = this.ctx.sessionManager.getLeafId();
+		if (tree.length === 0) {
+			this.ctx.showStatus("No entries in session");
+			return;
+		}
+		this.showSelector(done => {
+			const onNavigate = async (entryId: string) => {
+				if (entryId === realLeafId) {
+					done();
+					this.ctx.showStatus("Already at this point");
+					return;
+				}
+				done();
+				try {
+					const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
+					if (result.cancelled) { this.ctx.showStatus("Navigation cancelled"); return; }
+					this.ctx.chatContainer.clear();
+					this.ctx.renderInitialMessages();
+					await this.ctx.reloadTodos();
+					if (result.editorText && !this.ctx.editor.getText().trim()) {
+						this.ctx.editor.setText(result.editorText);
+					}
+					this.ctx.showStatus("Navigated to selected point");
+				} catch (error) {
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+				}
+			};
+			const onClose = () => { done(); this.ctx.ui.requestRender(); };
+			const selector = new TreePeekComponent(tree, realLeafId, this.ctx.ui.terminal.rows, this.ctx.ui, onNavigate, onClose);
 			return { component: selector, focus: selector };
 		});
 	}

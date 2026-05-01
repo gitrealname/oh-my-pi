@@ -398,17 +398,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 	},
 	{
 		name: "tree",
-		description: "Session tree with preview — Ctrl+↓ to peek",
+		description: "Navigate session tree",
 		handle: (_command, runtime) => {
 			runtime.ctx.showTreeSelector();
 			runtime.ctx.editor.setText("");
 		},
 	},
 	{
-		name: "tree-old",
-		description: "Original session tree (no preview)",
+		name: "mtree",
+		description: "Session tree with Ctrl+↓ peek preview",
 		handle: (_command, runtime) => {
-			runtime.ctx.showTreeSelectorOriginal();
+			(runtime.ctx as unknown as { showMTreeSelector(): void }).showMTreeSelector();
 			runtime.ctx.editor.setText("");
 		},
 	},

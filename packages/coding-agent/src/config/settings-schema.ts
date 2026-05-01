@@ -1883,6 +1883,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"mbrowser.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "MBrowser (CDP attach)",
+			description: "Enable the mbrowser tool — connects to Chrome/Edge via browser.connectUrl instead of launching",
+		},
+	},
+
 	// Tool execution
 	"tools.intentTracing": {
 		type: "boolean",

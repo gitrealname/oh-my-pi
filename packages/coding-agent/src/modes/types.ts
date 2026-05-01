@@ -226,7 +226,6 @@ export interface InteractiveModeContext {
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;
-	showTreeSelectorOriginal(): void;
 	showSessionSelector(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;

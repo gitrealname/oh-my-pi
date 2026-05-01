@@ -187,18 +187,6 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 			launchArgs.push("--ignore-certificate-errors");
 		}
-		const connectUrl = this.session.settings.get("browser.connectUrl") as string | undefined;
-		if (connectUrl) {
-			try {
-				this.#browser = await puppeteer.connect({ browserURL: connectUrl, defaultViewport: null });
-				this.#isConnected = true;
-				const pages = await this.#browser.pages();
-				this.#page = pages[0] ?? await this.#browser.newPage();
-				return this.#page;
-			} catch {
-				logger.debug("Could not connect to browser at", { url: connectUrl }, "— falling back to launch");
-			}
-		}
 		this.#isConnected = false;
 		this.#browser = await puppeteer.launch({
 			headless: this.#currentHeadless,
