@@ -570,6 +570,9 @@ const browserSchema = Type.Object({
 			examples: ["text/Drop zone"],
 		}),
 	),
+	dialogs: Type.Optional(StringEnum(["accept", "dismiss"], {
+		description: "open: auto-handle alert/confirm/beforeunload dialogs (default: leave for caller to handle)",
+	})),
 });
 
 /** Input schema for the Puppeteer tool. */
@@ -738,6 +741,8 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 	#userAgentOverride: UserAgentOverride | null = null;
 	#elementIdCounter = 0;
 	readonly #elementCache = new Map<number, ElementHandle>();
+	#dialogPolicy?: "accept" | "dismiss";
+	#dialogHandler?: (dialog: import("puppeteer-core").Dialog) => Promise<void>;
 	readonly #patchedClients = new WeakSet<object>();
 
 	constructor(private readonly session: ToolSession) {
@@ -749,6 +754,11 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 		if (this.#page && !this.#page.isClosed()) {
 			await this.#page.close();
 		}
+		if (this.#dialogHandler && this.#page) {
+			this.#page.off("dialog", this.#dialogHandler);
+		}
+		this.#dialogHandler = undefined;
+		this.#dialogPolicy = undefined;
 		this.#page = null;
 		if (this.#browser?.connected) {
 			if (this.#isConnected) {
@@ -760,6 +770,7 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 		this.#browser = null;
 		this.#browserSession = null;
 		this.#userAgentOverride = null;
+		this.#isConnected = false;
 		this.#isConnected = false;
 	}
 
@@ -877,6 +888,25 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 				}
 			}),
 		);
+	}
+
+	#applyDialogPolicy(policy: "accept" | "dismiss"): void {
+		const page = this.#page;
+		if (!page) return;
+		// Remove previous handler if any
+		if (this.#dialogHandler) {
+			page.off("dialog", this.#dialogHandler);
+		}
+		this.#dialogPolicy = policy;
+		this.#dialogHandler = async (dialog: import("puppeteer-core").Dialog) => {
+			try {
+				if (policy === "accept") await dialog.accept();
+				else await dialog.dismiss();
+			} catch {
+				// Dialog may have already been handled
+			}
+		};
+		page.on("dialog", this.#dialogHandler);
 	}
 
 	async #resolveCachedHandle(id: number): Promise<ElementHandle> {
@@ -1252,6 +1282,7 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 					const page = await untilAborted(signal, () => this.#resetBrowser(params));
 					const viewport = page.viewport();
 					details.viewport = viewport ?? DEFAULT_VIEWPORT;
+					if (params.dialogs) this.#applyDialogPolicy(params.dialogs);
 					return toolResult(details).text("Opened headless browser session").done();
 				}
 				case "close": {
