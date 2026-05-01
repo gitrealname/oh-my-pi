@@ -231,6 +231,7 @@ function resolveSystemChromium(): string | undefined {
 }
 
 const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
+const MBROWSER_PROTOCOL_TIMEOUT_MS = 60_000;
 const STEALTH_IGNORE_DEFAULT_ARGS = [
 	"--disable-extensions",
 	"--disable-default-apps",
@@ -802,7 +803,7 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 		const connectUrl = this.session.settings.get("browser.connectUrl") as string | undefined;
 		if (connectUrl) {
 			try {
-				this.#browser = await puppeteer.connect({ browserURL: connectUrl, defaultViewport: null });
+				this.#browser = await puppeteer.connect({ browserURL: connectUrl, defaultViewport: null, protocolTimeout: MBROWSER_PROTOCOL_TIMEOUT_MS });
 				this.#isConnected = true;
 				const pages = await this.#browser.pages();
 				this.#page = pages[0] ?? await this.#browser.newPage();
@@ -818,6 +819,7 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 			executablePath: await ensureChromiumExecutable(),
 			args: launchArgs,
 			ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
+			protocolTimeout: MBROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 		this.#page = await this.#browser.newPage();
 		await this.#applyStealthPatches(this.#page);
@@ -1477,15 +1479,27 @@ export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserTool
 				case "evaluate": {
 					const script = ensureParam(params.script, "script", params.action);
 					const page = await this.#ensurePage(params);
-					const value = (await untilAborted(signal, () =>
-						page.evaluate(async (source: string) => {
-							try {
-								return await new Function(`return (async () => (${source}))();`)();
-							} catch {
-								return await new Function(`return (async () => { ${source} })();`)();
-							}
-						}, script),
-					)) as unknown;
+					const timeoutSignal = AbortSignal.timeout(timeoutMs);
+					const evalSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+					const { promise: cancelRejection, reject: rejectCancel } = Promise.withResolvers<never>();
+					const onCancel = (): void => {
+						rejectCancel(timeoutSignal.aborted
+							? new ToolError("Evaluate timed out")
+							: new ToolAbortError("Evaluate cancelled"));
+					};
+					evalSignal.addEventListener("abort", onCancel, { once: true });
+					let value: unknown;
+					try {
+						value = await Promise.race([
+							untilAborted(evalSignal, () => page.evaluate(async (source: string) => {
+								try { return await new Function(`return (async () => (${source}))();`)(); }
+								catch { return await new Function(`return (async () => { ${source} })();`)(); }
+							}, script)),
+							cancelRejection,
+						]);
+					} finally {
+						evalSignal.removeEventListener("abort", onCancel);
+					}
 					const output = formatEvaluateResult(value);
 					details.result = output;
 					return toolResult(details).text(output).done();
