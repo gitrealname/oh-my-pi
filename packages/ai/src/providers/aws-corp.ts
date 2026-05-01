@@ -276,11 +276,9 @@ async function ensureCredentials(): Promise<boolean> {
 			// Resolve account ID for ARN construction
 			if (!_accountId) await getAccountId();
 			if (await tryLoadCredentials()) {
-				log("credentials loaded");
 				return true;
 			}
 			if (await ssoLogin()) {
-				log("credentials loaded after login");
 				return true;
 			}
 			console.error("[aws-corp] Failed to obtain credentials. Ensure SSO is configured for profile: " + getProfile());
