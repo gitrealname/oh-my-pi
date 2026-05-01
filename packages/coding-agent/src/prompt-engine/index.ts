@@ -151,11 +151,18 @@ function resolveSkill(
 	}
 }
 
+import type { CustomMessage } from "../session/messages";
+import type { MessageRenderOptions } from "../extensibility/extensions/types";
+import { Text } from "@oh-my-pi/pi-tui";
 // ── Skill loaded renderer ───────────────────────────────────────────────
 
-function renderSkillLoaded(details: { skillName: string } | undefined): string | undefined {
-	if (!details?.skillName) return undefined;
-	return `📚 Loaded skill: ${details.skillName}`;
+function renderSkillLoaded(
+	message: CustomMessage<{ skillName: string }>,
+	_opts: MessageRenderOptions,
+): ReturnType<import("../extensibility/extensions/types").MessageRenderer> {
+	const skillName = message.details?.skillName;
+	if (!skillName) return undefined;
+	return new Text(`Loaded skill: ${skillName}`);
 }
 
 // ── Command description ─────────────────────────────────────────────────

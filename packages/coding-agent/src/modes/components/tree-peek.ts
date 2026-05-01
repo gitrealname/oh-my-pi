@@ -57,18 +57,17 @@ function buildPreview(
 			const plain = raw.replace(/\t/g, "  ");
 			const wrapped = plain.length > 0 ? wrapTextWithAnsi(plain, avail) : [""];
 			for (const seg of wrapped)
-				lines.push(PAD + (bg ? theme.bg(bg, theme.fg(fg, seg.padEnd(avail))) : theme.fg(fg, seg)));
+				lines.push(PAD + (bg ? theme.bg(bg as any, theme.fg(fg as any, seg.padEnd(avail))) : theme.fg(fg as any, seg)));
 		}
 	};
 
 	const ln = (text: string, fg: string, bg?: string) => {
 		const s = text.slice(0, avail);
-		lines.push(PAD + (bg ? theme.bg(bg, theme.fg(fg, s.padEnd(avail))) : theme.fg(fg, s)));
+		lines.push(PAD + (bg ? theme.bg(bg as any, theme.fg(fg as any, s.padEnd(avail))) : theme.fg(fg as any, s)));
 	};
 
 	const gap = (bg?: string) =>
-		lines.push(bg ? PAD + theme.bg(bg, " ".repeat(avail)) : "");
-
+		lines.push(bg ? PAD + theme.bg(bg as any, " ".repeat(avail)) : "");
 	const textOf = (content: unknown): string => {
 		if (typeof content === "string") return content;
 		if (!Array.isArray(content)) return "";
@@ -182,7 +181,7 @@ export class TreePeekComponent extends Container {
 		super();
 		this.tui = tui;
 		this.treeH = Math.max(TREE_OVERHEAD + 3, termHeight - PREVIEW_ROWS - 1);
-		this.treeComp = new TreeSelectorComponent(tree, leafId, termHeight, onNavigate, onClose, null);
+		this.treeComp = new TreeSelectorComponent(tree, leafId, termHeight, onNavigate, onClose, undefined);
 		this.setListRows(termHeight - TREE_OVERHEAD);
 	}
 
