@@ -3,7 +3,8 @@ import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, isBunTestRuntime, logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async";
 import type { PromptTemplate } from "../config/prompt-templates";
-import type { Settings } from "../config/settings";
+import type { Settings, SettingPath } from "../config/settings";
+import { SETTINGS_SCHEMA } from "../config/settings-schema";
 import { EditTool } from "../edit";
 import type { Skill } from "../extensibility/skills";
 import type { InternalUrlRouter } from "../internal-urls";
@@ -24,6 +25,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
+import { MBrowserTool } from "./mbrowser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
 import { DebugTool } from "./debug";
@@ -220,6 +222,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	read: s => new ReadTool(s),
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
+	mbrowser: s => new MBrowserTool(s),
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	task: TaskTool.create,
@@ -397,6 +400,8 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			const currentDepth = session.taskDepth ?? 0;
 			return maxDepth < 0 || currentDepth < maxDepth;
 		}
+		const enabledSetting = `${name}.enabled` as SettingPath;
+		if (enabledSetting in SETTINGS_SCHEMA) return session.settings.get(enabledSetting) !== false;
 		return true;
 	};
 	if (includeYield && requestedTools && !requestedTools.includes("yield")) {

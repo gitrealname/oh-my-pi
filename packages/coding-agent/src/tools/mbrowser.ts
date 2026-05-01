@@ -723,9 +723,9 @@ function formatEvaluateResult(value: unknown): string {
 /**
  * Puppeteer tool for headless browser automation.
  */
-export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolDetails> {
-	readonly name = "puppeteer";
-	readonly label = "Puppeteer";
+export class MBrowserTool implements AgentTool<typeof browserSchema, BrowserToolDetails> {
+	readonly name = "mbrowser";
+	readonly label = "MBrowser";
 	readonly description: string;
 	readonly parameters = browserSchema;
 	readonly strict = true;
@@ -798,6 +798,18 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		const ignoreCert = process.env.PUPPETEER_PROXY_IGNORE_CERT_ERRORS?.toLowerCase();
 		if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 			launchArgs.push("--ignore-certificate-errors");
+		}
+		const connectUrl = this.session.settings.get("browser.connectUrl") as string | undefined;
+		if (connectUrl) {
+			try {
+				this.#browser = await puppeteer.connect({ browserURL: connectUrl, defaultViewport: null });
+				this.#isConnected = true;
+				const pages = await this.#browser.pages();
+				this.#page = pages[0] ?? await this.#browser.newPage();
+				return this.#page;
+			} catch {
+				logger.debug("Could not connect to browser at — falling back to launch", { url: connectUrl });
+			}
 		}
 		this.#isConnected = false;
 		this.#browser = await puppeteer.launch({
