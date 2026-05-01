@@ -1,33 +1,35 @@
-# aws-corp Branch — Customizations
+# aws-corp Branch -- Customizations
 
 Fork of [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) with
 enterprise and workflow extensions baked into the binary.
 
-Upstream: `origin/main` → periodically merged into `aws-corp`.
+Current base: upstream v14.5.14 (`ae7c4100c`)
+Upstream: `origin/main` -> periodically merged into `aws-corp`.
 See [MERGE-INSTRUCTIONS.md](MERGE-INSTRUCTIONS.md) for merge checklist.
+
+---
 
 ## Extensions (built into binary)
 
 ### 1. AWS Corp Provider
-**Commits:** `c39db5528`, `0cd9b9a84`, `141d913be`, `b13a2a0ec`
 
 Bedrock provider using AWS SSO auth (no API keys, no CLI dependency).
 Translates model IDs to full inference profile ARNs for corp accounting.
-Models externalized to `models-ow.yml` (not hardcoded in binary).
+Models defined in `models-ow.yml` (not hardcoded in binary).
 
-- `packages/ai/src/providers/aws-corp.ts` — provider implementation
-- `packages/ai/src/models.ts` — hardcoded models removed
-- `packages/coding-agent/src/config/model-registry.ts` — `bedrock-converse-stream` API type added
+Files:
+- `packages/ai/src/providers/aws-corp.ts` -- provider implementation
+- `packages/ai/src/providers/amazon-bedrock.ts` -- +2 lines: bedrock-converse-stream type
+- `packages/ai/src/stream.ts` -- streamAwsCorp import + routing + serviceProviderMap entry
+- `packages/coding-agent/src/config/model-registry.ts` -- bedrock-converse-stream API type
 
 ### 2. Prompt Engine
-**Commit:** `0221de9f0`
-**Inspired by:** [nicobailon/pi-prompt-template-model](https://github.com/nicobailon/pi-prompt-template-model)
 
 Registers slash commands from `.md` files in agent `commands/` dirs. Supports:
-- `role` field → resolves via `modelRoles` config (single source of truth)
-- `model` field → direct model spec (fallback)
-- `skill` field → auto-injects SKILL.md content
-- `thinking` field → sets thinking level for the command
+- `role` field -> resolves via `modelRoles` config (single source of truth)
+- `model` field -> direct model spec (fallback)
+- `skill` field -> auto-injects SKILL.md content
+- `thinking` field -> sets thinking level for the command
 - Dot-prefix skill activation (`.pi describe this`) with auto model switch
 - Auto-restore of model + thinking after command completes
 
@@ -35,23 +37,15 @@ Files:
 - `packages/coding-agent/src/prompt-engine/index.ts`
 - `packages/coding-agent/src/prompt-engine/prompt-loader.ts`
 - `packages/coding-agent/src/prompt-engine/model-selection.ts`
+- `packages/coding-agent/src/prompt-engine/session-state.ts` (session continuity)
 
 Wired in `packages/coding-agent/src/sdk.ts` as inline extension.
 
 ### 3. Session Continuity
-**Commit:** `d7c960079`
-**Inspired by:** [middlendian/omp-context-mode-extension](https://github.com/middlendian/omp-context-mode-extension)
 
-Tracks files modified/read and commands executed during a session. On
-compaction, injects structured context into the summarization prompt via
-`session.compacting` hook. Uses `preserveData` for lossless file list
-survival across multiple compactions.
-
-No MCP, no SQLite — pure in-memory accumulation with OMP hooks.
-
-Files:
-- `packages/coding-agent/src/prompt-engine/session-state.ts`
-- Event handlers in `packages/coding-agent/src/prompt-engine/index.ts`
+Tracks files modified/read and commands executed. On compaction, injects
+structured context into the summarization prompt via `session.compacting` hook.
+Uses `preserveData` for lossless file list survival across multiple compactions.
 
 Config:
 ```yaml
@@ -61,56 +55,112 @@ sessionContinuity:
   maxContextLines: 30     # max lines injected into compaction prompt
 ```
 
-## Other Changes
+### 4. MBrowser Tool (CDP-attach browser)
 
-### Browser ConnectUrl
-**Commit:** `d5153405a`
+`mbrowser` is a variant of the upstream `browser` tool that auto-attaches to a
+running Chrome/Edge instance via `browser.connectUrl` on every `open` action.
+No `app.cdp_url` argument needed -- set the URL once in config.
 
-`browser.connectUrl` config — attach to running Chrome/Edge via CDP instead
-of launching a new browser instance.
+Structurally mirrors the upstream `browser.ts` (same 3 actions: open/close/run),
+delegates to the shared `browser/*` infrastructure. The only difference is in
+`resolveMBrowserKind()` which reads `browser.connectUrl` from settings.
 
-### Disabled Commands
-**Commit:** `0cae93323`
+Files:
+- `packages/coding-agent/src/tools/mbrowser.ts` -- MBrowserTool class
+- `packages/coding-agent/src/tools/index.ts` -- registration + SETTINGS_SCHEMA fallback
+- `packages/coding-agent/src/config/settings-schema.ts` -- mbrowser.enabled
 
-`disabledCommands` config — hide unwanted slash commands from autocomplete.
-Credential isolation for multi-profile setups.
+Start Chrome with: `--remote-debugging-port=9222`
+Or via helper: `py D:/.ai/scripts/chrome.py open`
 
-### Enhanced /tree
-**Commit:** `e77cf7b94`
+### 5. /mtree Command (tree with peek preview)
 
-Preview pane in tree selector + aws-corp environment fixes.
+`/mtree` opens the session tree with a Ctrl+down peek pane that shows a preview
+of the selected branch without navigating to it. The upstream `/tree` is
+unchanged (no-peek).
 
-### Line Ending Detection
-**Commit:** `8bda73516`
+Files:
+- `packages/coding-agent/src/modes/components/tree-peek.ts` -- TreePeekComponent
+- `packages/coding-agent/src/modes/components/tree-selector.ts` -- getTreeList() exposed
+- `packages/coding-agent/src/modes/controllers/selector-controller.ts` -- showMTreeSelector()
+- `packages/coding-agent/src/modes/interactive-mode.ts` -- showMTreeSelector() delegation
+- `packages/coding-agent/src/slash-commands/builtin-registry.ts` -- /mtree entry
 
-Count-based heuristic for mixed-ending files instead of first-line detection.
+### 6. disabledCommands
 
-### Native Addon Embedding
-**Commit:** `c056769da`
+`disabledCommands: []` config -- hide slash commands from autocomplete and block
+execution. Used to suppress commands not relevant to this profile (loop, fast,
+share, login, logout, ssh, marketplace).
 
-Embeds `pi_natives.win32-x64-baseline.node` path for compiled binary on Windows.
+Files:
+- `packages/coding-agent/src/config/settings-schema.ts` -- disabledCommands setting
+- `packages/coding-agent/src/extensibility/slash-commands.ts` -- isCommandEnabled() filter
+- `packages/coding-agent/src/slash-commands/builtin-registry.ts` -- execution guard
+
+### 7. Local Fixes
+
+| File | Fix |
+|---|---|
+| `packages/coding-agent/src/edit/normalize.ts` | Count-based majority-wins CRLF detection (vs first-occurrence) |
+| `packages/coding-agent/src/modes/components/tree-peek.ts` | ThemeBg/ThemeColor as-any casts; null->undefined for onLabel |
+| `packages/coding-agent/src/prompt-engine/index.ts` | renderSkillLoaded updated to new MessageRenderer<T> signature |
+| `packages/natives/native/index.js` | detectAvx2Support: os.cpus() fallback for Windows PowerShell 5 |
+
+---
 
 ## Config Surface
 
-All features are controlled via `config.yml` — no magic, no hidden defaults:
+All features are controlled via `config.yml`:
 
 | Feature | Config Key | Default |
 |---------|-----------|---------|
 | Model roles | `modelRoles.*` | (required) |
 | Session continuity | `sessionContinuity.enabled` | `false` |
 | Session continuity limits | `sessionContinuity.maxEvents/maxContextLines` | `200/30` |
-| Browser attach | `browser.connectUrl` | (none) |
+| CDP-attach browser | `browser.connectUrl` | `~` (nil) |
+| MBrowser tool | `mbrowser.enabled` | `true` |
 | Disabled commands | `disabledCommands[]` | `[]` |
 | Disabled providers | `disabledProviders[]` | `[]` |
-| Memories | `memories.enabled` | `true` |
+| Memories | `memories.enabled` | `false` |
+
+See `research/omp/dist-templates/config-ow.yml` for the fully annotated config
+with all 182 settings, descriptions, defaults, and option enumerations.
+
+---
 
 ## Build
 
 ```bash
-cd /path/to/oh-my-pi
-bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv \
-  --define PI_COMPILED=true --root . --external mupdf \
-  --target bun-windows-x64-modern \
-  ./packages/coding-agent/src/cli.ts \
-  --outfile packages/coding-agent/binaries/omp-aws-corp.exe
+cd D:\.ai\research\omp\.oh-my-pi
+
+# Native addon (required once per machine, or after upstream native changes)
+# Stop omp first -- baseline.node is locked while running
+TARGET_VARIANT=baseline bun run packages/natives/scripts/build-native.ts
+TARGET_VARIANT=modern   bun run packages/natives/scripts/build-native.ts
+
+# Binary
+bun.exe build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv ^
+  --define PI_COMPILED=true --root . --external mupdf --target bun-windows-x64-modern ^
+  ./packages/coding-agent/src/cli.ts --outfile packages/coding-agent/binaries/omp-aws-corp.exe
+
+# Deploy (stop omp first)
+copy packages\coding-agent\binaries\omp-aws-corp.exe %LOCALAPPDATA%\omp\omp.exe
+
+# Bundle for distribution
+cd D:\.ai\research\omp
+py bundle.py --skip-build       # or: bundle.cmd --skip-build
 ```
+
+Bundle output: `D:\.ai\research\omp\dist\omp-dist.zip`
+
+---
+
+## Notes
+
+- The `aws-corp` branch is periodically rebased onto upstream releases.
+  Use `MERGE-INSTRUCTIONS.md` for the checklist.
+- Config templates live in `research/omp/dist-templates/` (tracked separately).
+- Native `.node` binaries are gitignored -- must be built per machine.
+- The `detectAvx2Support()` fix in `index.js` ensures the modern binary
+  (with full API including the `Process` class) is loaded on Windows machines
+  where PowerShell 5 cannot evaluate `[System.Runtime.Intrinsics.X86.Avx2]`.
