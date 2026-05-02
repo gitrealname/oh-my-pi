@@ -60,12 +60,13 @@ export interface AIEndpointDeps {
   registry: ProviderRegistry;
   sessionManager: SessionManager;
   getCwd?: () => string;
+  conversationContext?: string;
 }
 
 export type NodeHttpHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 
 export function createAIEndpoints(deps: AIEndpointDeps): Record<string, NodeHttpHandler> {
-  const { registry, sessionManager, getCwd } = deps;
+  const { registry, sessionManager, getCwd, conversationContext } = deps;
 
   return {
     "/api/ai/capabilities": async (_req, res) => {
@@ -97,6 +98,10 @@ export function createAIEndpoints(deps: AIEndpointDeps): Record<string, NodeHttp
       }
 
       try {
+        // Inject conversation context from the main omp session
+        if (conversationContext && context.annotate) {
+          context.annotate.content = (context.annotate.content || "") + "\n\n" + conversationContext;
+        }
         const options: CreateSessionOptions = { context, cwd: getCwd?.(), model, maxTurns, maxBudgetUsd, reasoningEffort };
         const shouldFork = context.parent && provider.capabilities.fork;
         const session = shouldFork ? await provider.forkSession(options) : await provider.createSession(options);

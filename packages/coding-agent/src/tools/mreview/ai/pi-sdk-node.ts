@@ -159,7 +159,7 @@ export class PiSDKNodeProvider implements AIProvider {
 		streaming: true,
 		tools: true,
 	};
-	models?: Array<{ id: string; label: string; default?: boolean }>;
+	models: Array<{ id: string; label: string; default?: boolean }> = [{ id: "default", label: "Default Model", default: true }];
 
 	private config: PiSDKConfig;
 	private sessions = new Map<string, PiSDKNodeSession>();

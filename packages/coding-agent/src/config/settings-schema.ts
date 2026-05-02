@@ -1914,39 +1914,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"mreview.ompExecutable": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "tools",
-			label: "MReview: omp executable path",
-			description: "Path to the omp binary spawned for AI chat sessions in mreview. Auto-detected if blank.",
-			submenu: true,
-		},
-	},
-
-	"mreview.aiModel": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "tools",
-			label: "MReview: AI model",
-			description: "Model string for the mreview AI chat sidebar (e.g. anthropic/claude-opus-4-5). Blank = provider default.",
-			submenu: true,
-		},
-	},
-
-	"mreview.aiMaxTurns": {
-		type: "number",
-		default: 10,
-		ui: {
-			tab: "tools",
-			label: "MReview: AI max turns",
-			description: "Maximum agentic turns per AI chat session in mreview (limits cost). Default: 10.",
-			submenu: true,
-		},
-	},
-
 	// Tool execution
 	"tools.intentTracing": {
 		type: "boolean",
