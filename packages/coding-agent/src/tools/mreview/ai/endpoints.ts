@@ -98,10 +98,6 @@ export function createAIEndpoints(deps: AIEndpointDeps): Record<string, NodeHttp
       }
 
       try {
-        // Inject conversation context from the main omp session
-        if (conversationContext && context.annotate) {
-          context.annotate.content = (context.annotate.content || "") + "\n\n" + conversationContext;
-        }
         const options: CreateSessionOptions = { context, cwd: getCwd?.(), model, maxTurns, maxBudgetUsd, reasoningEffort };
         const shouldFork = context.parent && provider.capabilities.fork;
         const session = shouldFork ? await provider.forkSession(options) : await provider.createSession(options);
