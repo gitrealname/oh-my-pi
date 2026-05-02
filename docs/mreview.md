@@ -77,4 +77,3 @@ Copies both `omp-aws-corp.exe` and `mreview-ui.html` to `%LOCALAPPDATA%\omp\`.
 | `packages/coding-agent/src/tools/mreview/index.ts` | Orchestration, path resolution |
 | `packages/coding-agent/src/tools/mreview/server.ts` | HTTP server, AI routing, endpoints |
 | `packages/coding-agent/src/slash-commands/builtin-registry.ts` | `/mreview` command handler |
-| `docs/skills/mreview/SKILL.md` | Optional companion skill |
