@@ -37,11 +37,25 @@ import { startMReviewServer } from "./server";
 
 export type { MReviewDecision } from "./server";
 
-const MREVIEW_HTML_PATH = fileURLToPath(new URL("./review-editor.html", import.meta.url));
+const MREVIEW_UI_PATH = (() => {
+  const exeDir = resolvePath(process.execPath, "..");
+  const exeCandidate = resolvePath(exeDir, "mreview-ui.html");
+  if (existsSync(exeCandidate)) return exeCandidate;
+  return fileURLToPath(new URL("./mreview-ui.html", import.meta.url));
+})();
+
+const MREVIEW_HTML_PATH = (() => {
+  // In compiled binaries, import.meta.url points to $bunfs — resolve next to the exe instead
+  const exeDir = resolvePath(process.execPath, "..");
+  const exeCandidate = resolvePath(exeDir, "review-editor.html");
+  if (existsSync(exeCandidate)) return exeCandidate;
+  // Dev mode: resolve relative to source
+  return fileURLToPath(new URL("./review-editor.html", import.meta.url));
+})();
 
 /** Returns true if the review-editor.html asset is present. */
 export function hasMReviewHtml(): boolean {
-  return existsSync(MREVIEW_HTML_PATH);
+  return existsSync(MREVIEW_UI_PATH) || existsSync(MREVIEW_HTML_PATH);
 }
 
 /**
@@ -67,12 +81,8 @@ export function detectOmpBinary(ompExecutable?: string): string {
 export interface MReviewConfig {
   /** Custom browser path for opening the UI (platform-specific). Blank = system default. */
   browserPath?: string;
-  /** Path to the omp binary for AI subprocess. Auto-detected if blank. */
-  ompExecutable?: string;
-  /** Model override for the AI chat session (e.g. "anthropic/claude-opus-4-5"). */
-  aiModel?: string;
-  /** Max agentic turns per AI chat session. Default 10. */
-  aiMaxTurns?: number;
+  /** Agent instance from the main omp session for direct AI routing. */
+  agent?: any;
 }
 
 export interface MReviewCtx {
@@ -92,15 +102,14 @@ export async function openMReviewSession(
   markdown: string,
   config: MReviewConfig = {},
 ): Promise<import("./server").MReviewDecision> {
-  const htmlContent = readFileSync(MREVIEW_HTML_PATH, "utf-8");
-  const piExecutablePath = detectOmpBinary(config.ompExecutable);
-
+  const uiPath = existsSync(MREVIEW_UI_PATH) ? MREVIEW_UI_PATH : MREVIEW_HTML_PATH;
+  const htmlContent = readFileSync(uiPath, "utf-8");
   const server = await startMReviewServer({
     markdown,
     filePath,
     htmlContent,
-    piExecutablePath,
     cwd: ctx.cwd,
+    agent: config.agent,
   });
 
   ctx.openInBrowser(server.url);

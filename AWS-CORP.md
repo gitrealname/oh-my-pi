@@ -108,6 +108,28 @@ Files:
 
 ---
 
+### 8. /mreview Command (browser markdown review + AI chat)
+
+`/mreview <file.md>` opens any markdown file in a browser review UI with two panels:
+- **Left**: rendered markdown with inline annotation tools
+- **Right**: AI chat sidebar routed directly through the active omp agent session
+
+The user can annotate visually, discuss with the LLM, and hit **Submit Comments** to
+inject structured feedback back into the terminal. No subprocess or external AI — the
+browser talks to the same agent session already running.
+
+Files:
+- `packages/coding-agent/src/tools/mreview/mreview-ui.html` -- custom review SPA (sidecar next to omp.exe)
+- `packages/coding-agent/src/tools/mreview/index.ts` -- orchestration, path resolution
+- `packages/coding-agent/src/tools/mreview/server.ts` -- node:http server, AI routing, endpoints
+- `packages/coding-agent/src/slash-commands/builtin-registry.ts` -- /mreview entry + agent context injection
+- `packages/coding-agent/src/config/settings-schema.ts` -- mreview.enabled, mreview.browser
+- `packages/coding-agent/src/prompt-engine/prompt-loader.ts` -- mreview/review/discuss in RESERVED_NAMES
+- `docs/skills/mreview/SKILL.md` -- optional companion skill (copy to ~/.omp/agent/skills/mreview/)
+
+Deploy note: `mreview-ui.html` must be placed next to `omp.exe` (not embedded in the binary).
+Bundle script handles this automatically.
+
 ## Config Surface
 
 All features are controlled via `config.yml`:
@@ -122,6 +144,8 @@ All features are controlled via `config.yml`:
 | Disabled commands | `disabledCommands[]` | `[]` |
 | Disabled providers | `disabledProviders[]` | `[]` |
 | Memories | `memories.enabled` | `false` |
+| MReview command | `mreview.enabled` | `true` |
+| MReview browser | `mreview.browser` | blank (system default) |
 
 See `research/omp/dist-templates/config-ow.yml` for the fully annotated config
 with all 182 settings, descriptions, defaults, and option enumerations.
@@ -143,8 +167,8 @@ bun.exe build --compile --no-compile-autoload-bunfig --no-compile-autoload-doten
   --define PI_COMPILED=true --root . --external mupdf --target bun-windows-x64-modern ^
   ./packages/coding-agent/src/cli.ts --outfile packages/coding-agent/binaries/omp-aws-corp.exe
 
-# Deploy (stop omp first)
-copy packages\coding-agent\binaries\omp-aws-corp.exe %LOCALAPPDATA%\omp\omp.exe
+# Deploy (stop omp first) -- copies binary + mreview-ui.html sidecar
+deploy.cmd
 
 # Bundle for distribution
 cd D:\.ai\research\omp

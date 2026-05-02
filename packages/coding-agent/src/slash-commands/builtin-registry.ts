@@ -114,13 +114,13 @@ const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 		return;
 	}
 	if (!hasMReviewHtml()) {
-		runtime.ctx.showWarning("mreview: review-editor.html asset missing. Run bun run build:pi in the plannotator repo.");
+		runtime.ctx.showWarning("mreview: UI asset (mreview-ui.html) missing — ensure it is placed next to the omp binary.");
 		runtime.ctx.editor.setText("");
 		return;
 	}
 	const filePath = resolvePath(runtime.ctx.sessionManager.getCwd(), args);
 	if (!existsSync(filePath)) {
-		runtime.ctx.showWarning(`mreview: file not found: ${args}`);
+		runtime.ctx.showWarning(`mreview: file not found: ${filePath}`);
 		runtime.ctx.editor.setText("");
 		return;
 	}
@@ -128,14 +128,12 @@ const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 	try {
 		markdown = readFileSync(filePath, "utf-8");
 	} catch {
-		runtime.ctx.showWarning(`mreview: cannot read file: ${args}`);
+		runtime.ctx.showWarning(`mreview: cannot read file: ${filePath}`);
 		runtime.ctx.editor.setText("");
 		return;
 	}
-	const ompExecutable = settings.get("mreview.ompExecutable" as SettingPath) as string | undefined;
 	const browserPath = settings.get("mreview.browser" as SettingPath) as string | undefined;
-	const aiModel = settings.get("mreview.aiModel" as SettingPath) as string | undefined;
-	const aiMaxTurns = settings.get("mreview.aiMaxTurns" as SettingPath) as number | undefined;
+
 	const openInBrowser = (url: string) => {
 		if (browserPath) {
 			try {
@@ -147,6 +145,21 @@ const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.openInBrowser(url);
 		}
 	};
+	// Inject file content into the agent's context before opening the browser
+	const agent = runtime.ctx.session.agent;
+	agent.state.messages.push({
+		role: "user",
+		content: [{ type: "text", text: `Opening ${filePath} for review. File content:\n\n${markdown}` }],
+		timestamp: Date.now(),
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	} as any);
+	agent.state.messages.push({
+		role: "assistant",
+		content: [{ type: "text", text: `I've read ${filePath} (${markdown.split("\n").length} lines). Opening the review UI — I'll respond to any questions or annotations in the browser.` }],
+		timestamp: Date.now(),
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	} as any);
+
 	const result = await openMReviewSession(
 		{
 			cwd: runtime.ctx.sessionManager.getCwd(),
@@ -156,7 +169,7 @@ const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 		},
 		filePath,
 		markdown,
-		{ ompExecutable, browserPath, aiModel, aiMaxTurns },
+		{ browserPath, agent: runtime.ctx.session.agent },
 	);
 	if (result.exit) {
 		runtime.ctx.showStatus("mreview: closed.");
@@ -1071,20 +1084,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 		allowArgs: true,
 		handle: mreviewHandler,
 	},
-	{
-		name: "review",
-		description: "Open a markdown file in the browser review UI with AI chat (alias for /mreview)",
-		inlineHint: "<file.md>",
-		allowArgs: true,
-		handle: mreviewHandler,
-	},
-	{
-		name: "discuss",
-		description: "Open a markdown file for browser-based AI discussion (alias for /mreview)",
-		inlineHint: "<file.md>",
-		allowArgs: true,
-		handle: mreviewHandler,
-	},
+
 ];
 
 function isCommandEnabled(name: string): boolean {
