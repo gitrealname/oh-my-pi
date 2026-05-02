@@ -176,7 +176,9 @@ const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 	} else if (result.approved) {
 		runtime.ctx.showStatus("mreview: approved.");
 	} else if (result.feedback?.trim()) {
-		runtime.ctx.editor.setText(result.feedback.trim());
+		// Auto-send feedback to the agent so the user gets an immediate response
+		runtime.ctx.showStatus("mreview: processing review comments...");
+		await runtime.ctx.session.agent.prompt(result.feedback.trim());
 	}
 };
 
