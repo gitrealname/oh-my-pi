@@ -83,7 +83,7 @@ export async function startMReviewServer(
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       if (decisionResolve) decisionResolve({ feedback: "", annotations: [], exit: true });
-    }, 60000);
+    }, 600000);
   }
 
   // Inject CSS to hide plannotator UI elements that don't apply to mreview

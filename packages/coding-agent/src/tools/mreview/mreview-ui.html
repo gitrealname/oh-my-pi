@@ -159,11 +159,18 @@ document.getElementById('doc-panel').addEventListener('mouseup', e => {
 function openCommentBox() {
   if (!pendingRange) return;
   const selectedText = pendingRange.toString();
+  const id = 'ann-' + (++annCounter);
+  // Wrap selection — surroundContents fails on multi-element ranges, use extractContents fallback
   const wrapper = document.createElement('span');
   wrapper.className = 'annotated';
-  const id = 'ann-' + (++annCounter);
   wrapper.dataset.annId = id;
-  try { pendingRange.surroundContents(wrapper); } catch { wrapper.textContent = selectedText; }
+  try {
+    pendingRange.surroundContents(wrapper);
+  } catch {
+    const frag = pendingRange.extractContents();
+    wrapper.appendChild(frag);
+    pendingRange.insertNode(wrapper);
+  }
 
   const noteBox = document.createElement('div');
   noteBox.id = 'ann-input-box';
@@ -179,14 +186,13 @@ function openCommentBox() {
   const ta = noteBox.querySelector('textarea');
   setTimeout(() => ta.focus(), 50);
 
-  noteBox.querySelector('#ann-cancel').addEventListener('click', () => {
-    noteBox.remove();
-    wrapper.replaceWith(...wrapper.childNodes); // remove highlight
-  });
+  const removeHighlight = () => { noteBox.remove(); wrapper.replaceWith(...wrapper.childNodes); };
+
+  noteBox.querySelector('#ann-cancel').addEventListener('click', removeHighlight);
 
   noteBox.querySelector('#ann-save').addEventListener('click', () => {
     const comment = ta.value.trim();
-    if (!comment) { noteBox.remove(); return; }
+    if (!comment) { removeHighlight(); return; }
     annotations.push({ id, selectedText, comment });
     noteBox.outerHTML = `<div class="annotation-note" data-ann-id="${id}">
       <span class="ann-del" onclick="deleteAnnotation('${id}')">✕</span>
@@ -340,6 +346,9 @@ themeBtn.addEventListener('click', () => {
   themeBtn.textContent = isLight ? '🌙' : '☀️';
   localStorage.setItem('mreview-theme', isLight ? 'light' : 'dark');
 });
+
+// Heartbeat — keep server alive while user works on annotations
+setInterval(() => { fetch('/api/ai/capabilities').catch(() => {}); }, 30000);
 
 // Tab close
 window.addEventListener('beforeunload', () => { navigator.sendBeacon('/api/exit', '{}'); });
