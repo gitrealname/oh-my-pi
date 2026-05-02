@@ -21,8 +21,8 @@ const RESERVED_NAMES = new Set([
 	"marketplace", "plugins", "reload-plugins", "force", "exit", "quit",
 	// Extension's own meta-commands
 	"chain-prompts", "prompt-tool", "scoped-models",
-	// mreview commands
-	"mreview", "review", "discuss",
+	// mreview slash command (prevent user prompt templates from shadowing)
+	"mreview",
 ]);
 
 export type PromptSource = "user" | "project";
