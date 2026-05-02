@@ -1,3 +1,9 @@
+import * as os from "node:os";
+import * as path from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+import { hasMReviewHtml, openMReviewSession } from "../tools/mreview/index";
+
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
@@ -94,6 +100,68 @@ function parseBuiltinSlashCommand(text: string): ParsedBuiltinSlashCommand | nul
 const shutdownHandler = (_command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): void => {
 	runtime.ctx.editor.setText("");
 	void runtime.ctx.shutdown();
+};
+
+
+const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<void> => {
+	const args = command.args.trim().replace(/^@/, ""); // strip leading @ from @file mentions
+	if (!args) {
+		runtime.ctx.showStatus(`Usage: /${command.name} <file.md>`);
+		runtime.ctx.editor.setText("");
+		return;
+	}
+	if (!hasMReviewHtml()) {
+		runtime.ctx.showWarning("mreview: review-editor.html asset missing. Run bun run build:pi in the plannotator repo.");
+		runtime.ctx.editor.setText("");
+		return;
+	}
+	const filePath = resolvePath(runtime.ctx.sessionManager.getCwd(), args);
+	if (!existsSync(filePath)) {
+		runtime.ctx.showWarning(`mreview: file not found: ${args}`);
+		runtime.ctx.editor.setText("");
+		return;
+	}
+	let markdown: string;
+	try {
+		markdown = readFileSync(filePath, "utf-8");
+	} catch {
+		runtime.ctx.showWarning(`mreview: cannot read file: ${args}`);
+		runtime.ctx.editor.setText("");
+		return;
+	}
+	const ompExecutable = settings.get("mreview.ompExecutable" as SettingPath) as string | undefined;
+	const browserPath = settings.get("mreview.browser" as SettingPath) as string | undefined;
+	const aiModel = settings.get("mreview.aiModel" as SettingPath) as string | undefined;
+	const aiMaxTurns = settings.get("mreview.aiMaxTurns" as SettingPath) as number | undefined;
+	const openInBrowser = (url: string) => {
+		if (browserPath) {
+			try {
+				Bun.spawn(["cmd.exe", "/c", "start", "", browserPath, url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+			} catch {
+				runtime.ctx.openInBrowser(url);
+			}
+		} else {
+			runtime.ctx.openInBrowser(url);
+		}
+	};
+	const result = await openMReviewSession(
+		{
+			cwd: runtime.ctx.sessionManager.getCwd(),
+			openInBrowser,
+			showStatus: (msg) => runtime.ctx.showStatus(msg),
+			showWarning: (msg) => runtime.ctx.showWarning(msg),
+		},
+		filePath,
+		markdown,
+		{ ompExecutable, browserPath, aiModel, aiMaxTurns },
+	);
+	if (result.exit) {
+		runtime.ctx.showStatus("mreview: closed.");
+	} else if (result.approved) {
+		runtime.ctx.showStatus("mreview: approved.");
+	} else if (result.feedback?.trim()) {
+		runtime.ctx.editor.setText(result.feedback.trim());
+	}
 };
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
@@ -1011,6 +1079,27 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 		name: "quit",
 		description: "Quit the application",
 		handle: shutdownHandler,
+	},
+	{
+		name: "mreview",
+		description: "Open a markdown file in the browser review UI with AI chat",
+		inlineHint: "<file.md>",
+		allowArgs: true,
+		handle: mreviewHandler,
+	},
+	{
+		name: "review",
+		description: "Open a markdown file in the browser review UI with AI chat (alias for /mreview)",
+		inlineHint: "<file.md>",
+		allowArgs: true,
+		handle: mreviewHandler,
+	},
+	{
+		name: "discuss",
+		description: "Open a markdown file for browser-based AI discussion (alias for /mreview)",
+		inlineHint: "<file.md>",
+		allowArgs: true,
+		handle: mreviewHandler,
 	},
 ];
 
