@@ -1094,6 +1094,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			"Plan mode - next step",
 			["Approve and execute", "Refine plan", "Stay in plan mode"],
 			{
+				initialIndex: 2,
 				helpText: this.#getPlanReviewHelpText(),
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
 			},
