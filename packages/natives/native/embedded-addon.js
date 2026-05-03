@@ -23,7 +23,7 @@ import addonPath1 from "../native/pi_natives.win32-x64-baseline.node" with { typ
 
 export const embeddedAddon = {
 	platformTag: "win32-x64",
-	version: "14.5.14",
+	version: "14.6.3",
 	files: [
 		{ variant: "modern", filename: "pi_natives.win32-x64-modern.node", filePath: addonPath0 },
 		{ variant: "baseline", filename: "pi_natives.win32-x64-baseline.node", filePath: addonPath1 },
