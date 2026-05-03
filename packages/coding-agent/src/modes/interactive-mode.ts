@@ -28,7 +28,7 @@ import {
 import { APP_NAME, getProjectDir, hsvToRgb, isEnoent, logger, postmortem, prompt } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { KeybindingsManager } from "../config/keybindings";
-import { type Settings, settings } from "../config/settings";
+import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -51,7 +51,7 @@ import { normalizeLocalScheme } from "../tools/path-utils";
 import { formatPhaseDisplayName } from "../tools/todo-write";
 import { type EventBus, SCHEDULE_SLASH_CHANNEL } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
-import { getSessionAccentAnsi, getSessionAccentHexForTitle } from "../utils/session-color";
+import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
@@ -279,6 +279,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncEditorMaxHeight();
 		this.#resizeHandler = () => {
 			this.#syncEditorMaxHeight();
+			this.updateEditorTopBorder();
 		};
 		process.stdout.on("resize", this.#resizeHandler);
 		try {
@@ -436,11 +437,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Start the UI
 		this.ui.start();
 		pushTerminalTitle();
-		setSessionTerminalTitle(
-			this.sessionManager.getSessionName(),
-			this.sessionManager.getCwd(),
-			this.sessionManager.titleSource,
-		);
+		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.updateEditorBorderColor();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
@@ -652,7 +649,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		} else if (this.isPythonMode) {
 			this.editor.borderColor = theme.getPythonModeBorderColor();
 		} else {
-			const hex = getSessionAccentHexForTitle(this.sessionManager.getSessionName(), this.sessionManager.titleSource);
+			const accentEnabled = !isSettingsInitialized() || settings.get("statusLine.sessionAccent") !== false;
+			const sessionName = accentEnabled ? this.sessionManager.getSessionName() : undefined;
+			const hex = sessionName ? getSessionAccentHex(sessionName) : undefined;
 			const ansi = getSessionAccentAnsi(hex);
 			if (ansi) {
 				this.editor.borderColor = (str: string) => `${ansi}${str}\x1b[39m`;

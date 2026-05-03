@@ -305,6 +305,16 @@ export const SETTINGS_SCHEMA = {
 			submenu: true,
 		},
 	},
+
+	"statusLine.sessionAccent": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Session Accent",
+			description: "Use the session name color for the editor border and status line gap",
+		},
+	},
 	"tools.artifactSpillThreshold": {
 		type: "number",
 		default: 50,
@@ -974,7 +984,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "editing",
 			label: "Edit Mode",
-			description: "Select the edit tool variant (replace, patch, hashline, atom, vim, or apply_patch)",
+			description: "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
 		},
 	},
 

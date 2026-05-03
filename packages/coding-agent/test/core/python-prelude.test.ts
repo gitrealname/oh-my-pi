@@ -39,22 +39,7 @@ const shouldRun = Boolean(pythonPath) && hasKernelDeps;
 
 describe.skipIf(!shouldRun)("PYTHON_PRELUDE integration", () => {
 	it("exposes prelude helpers via eval python backend", async () => {
-		const helpers = [
-			"env",
-			"read",
-			"write",
-			"append",
-			"find",
-			"glob",
-			"grep",
-			"rgrep",
-			"sed",
-			"tree",
-			"stat",
-			"diff",
-			"run",
-			"output",
-		];
+		const helpers = ["env", "read", "write", "append", "tree", "diff", "run", "output"];
 
 		const session = {
 			cwd: getProjectDir(),
@@ -69,19 +54,16 @@ describe.skipIf(!shouldRun)("PYTHON_PRELUDE integration", () => {
 			}),
 		};
 		const tool = new EvalTool(session);
-		const code = `
-	helpers = ${JSON.stringify(helpers)}
-	missing = [name for name in helpers if name not in globals() or not callable(globals()[name])]
-	print("HELPERS_OK=" + ("1" if not missing else "0"))
-	if missing:
-		print("MISSING=" + ",".join(missing))
-	`;
+		const code = [
+			`helpers = ${JSON.stringify(helpers)}`,
+			"missing = [name for name in helpers if name not in globals() or not callable(globals()[name])]",
+			'print("HELPERS_OK=" + ("1" if not missing else "0"))',
+			"if missing:",
+			'    print("MISSING=" + ",".join(missing))',
+		].join("\n");
 
 		const result = await tool.execute("tool-call-1", {
-			input: `\`\`\`py prelude helpers
-${code}
-\`\`\`
-`,
+			input: `===== py:"prelude helpers" =====\n${code}\n`,
 		});
 		const output = result.content.find(item => item.type === "text")?.text ?? "";
 		expect(output).toContain("HELPERS_OK=1");

@@ -1,5 +1,6 @@
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { type AstReplaceChange, astEdit } from "@oh-my-pi/pi-natives";
+import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
@@ -19,7 +20,7 @@ import {
 	hasGlobPathChars,
 	normalizePathLikeInput,
 	parseSearchPath,
-	resolveMultiSearchPath,
+	resolveExplicitSearchPaths,
 	resolveToCwd,
 } from "./path-utils";
 import {
@@ -46,11 +47,105 @@ const astEditSchema = Type.Object({
 		minItems: 1,
 		description: "rewrite ops",
 	}),
-	path: Type.String({
-		description: "file, directory, glob, or comma-separated paths to rewrite",
-		examples: ["src/", "src/foo.ts", "src/**/*.ts"],
+	paths: Type.Array(Type.String({ description: "file, directory, glob, or internal URL to rewrite" }), {
+		minItems: 1,
+		description: "files, directories, globs, or internal URLs to rewrite",
+		examples: [["src/"], ["src/foo.ts"], ["src/**/*.ts"], ["src/", "packages/"]],
 	}),
 });
+
+interface AstEditCallOptions {
+	rewrites: Record<string, string>;
+	dryRun: boolean;
+	maxFiles: number;
+	failOnParseError: boolean;
+	signal?: AbortSignal;
+}
+
+interface AstEditAggregatedResult {
+	changes: AstReplaceChange[];
+	fileChanges: AstReplaceFileChange[];
+	totalReplacements: number;
+	filesTouched: number;
+	filesSearched: number;
+	applied: boolean;
+	limitReached: boolean;
+	parseErrors?: string[];
+}
+
+async function runAstEditTargets(
+	targets: Array<{ basePath: string; glob?: string }>,
+	commonBasePath: string,
+	options: AstEditCallOptions,
+): Promise<AstEditAggregatedResult> {
+	const aggregatedChanges: AstReplaceChange[] = [];
+	const fileCounts = new Map<string, number>();
+	const parseErrors: string[] = [];
+	let totalReplacements = 0;
+	let filesSearched = 0;
+	let limitReached = false;
+	let applied = !options.dryRun;
+	for (const target of targets) {
+		const targetResult = await astEdit({
+			rewrites: options.rewrites,
+			path: target.basePath,
+			glob: target.glob,
+			dryRun: options.dryRun,
+			maxFiles: options.maxFiles,
+			failOnParseError: options.failOnParseError,
+			signal: options.signal,
+		});
+		totalReplacements += targetResult.totalReplacements;
+		filesSearched += targetResult.filesSearched;
+		limitReached = limitReached || targetResult.limitReached;
+		applied = applied && targetResult.applied;
+		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
+		for (const change of targetResult.changes) {
+			const absolute = path.resolve(target.basePath, change.path);
+			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
+			aggregatedChanges.push({ ...change, path: rebased });
+		}
+		for (const fileChange of targetResult.fileChanges) {
+			const absolute = path.resolve(target.basePath, fileChange.path);
+			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
+			fileCounts.set(rebased, (fileCounts.get(rebased) ?? 0) + fileChange.count);
+		}
+	}
+	const fileChanges: AstReplaceFileChange[] = Array.from(fileCounts, ([changePath, count]) => ({
+		path: changePath,
+		count,
+	}));
+	return {
+		changes: aggregatedChanges,
+		fileChanges,
+		totalReplacements,
+		filesTouched: fileChanges.length,
+		filesSearched,
+		applied,
+		limitReached,
+		parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+	};
+}
+
+function runAstEditOnce(
+	targets: Array<{ basePath: string; glob?: string }> | undefined,
+	resolvedSearchPath: string,
+	globFilter: string | undefined,
+	options: AstEditCallOptions,
+): Promise<AstEditAggregatedResult> {
+	if (targets) {
+		return runAstEditTargets(targets, resolvedSearchPath, options);
+	}
+	return astEdit({
+		rewrites: options.rewrites,
+		path: resolvedSearchPath,
+		glob: globFilter,
+		dryRun: options.dryRun,
+		maxFiles: options.maxFiles,
+		failOnParseError: options.failOnParseError,
+		signal: options.signal,
+	});
+}
 
 export interface AstEditToolDetails {
 	totalReplacements: number;
@@ -107,40 +202,46 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
 
 			const formatScopePath = (targetPath: string): string => formatPathRelativeToCwd(targetPath, this.session.cwd);
-			let searchPath: string | undefined;
-			let scopePath: string | undefined;
+			let searchPath: string;
+			let scopePath: string;
 			let globFilter: string | undefined;
-			const rawPath = normalizePathLikeInput(params.path);
-			if (rawPath.length === 0) {
-				throw new ToolError("`path` must be a non-empty path or glob");
+			let multiTargets: Array<{ basePath: string; glob?: string }> | undefined;
+			const rawPaths = params.paths.map(normalizePathLikeInput);
+			if (rawPaths.some(rawPath => rawPath.length === 0)) {
+				throw new ToolError("`paths` must contain non-empty paths or globs");
 			}
-			if (rawPath) {
-				const internalRouter = this.session.internalRouter;
-				if (internalRouter?.canHandle(rawPath)) {
-					if (hasGlobPathChars(rawPath)) {
-						throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
-					}
-					const resource = await internalRouter.resolve(rawPath);
-					if (!resource.sourcePath) {
-						throw new ToolError(`Cannot rewrite internal URL without backing file: ${rawPath}`);
-					}
-					searchPath = resource.sourcePath;
-					scopePath = formatScopePath(searchPath);
-				} else {
-					const multiSearchPath = await resolveMultiSearchPath(rawPath, this.session.cwd, globFilter);
-					if (multiSearchPath) {
-						searchPath = multiSearchPath.basePath;
-						globFilter = multiSearchPath.glob;
-						scopePath = multiSearchPath.scopePath;
-					} else {
-						const parsedPath = parseSearchPath(rawPath);
-						searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
-						globFilter = parsedPath.glob;
-						scopePath = formatScopePath(searchPath);
-					}
+			const internalRouter = this.session.internalRouter;
+			const resolvedPathInputs: string[] = [];
+			for (const rawPath of rawPaths) {
+				if (!internalRouter?.canHandle(rawPath)) {
+					resolvedPathInputs.push(rawPath);
+					continue;
 				}
+				if (hasGlobPathChars(rawPath)) {
+					throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
+				}
+				const resource = await internalRouter.resolve(rawPath);
+				if (!resource.sourcePath) {
+					throw new ToolError(`Cannot rewrite internal URL without backing file: ${rawPath}`);
+				}
+				resolvedPathInputs.push(resource.sourcePath);
 			}
-			const resolvedSearchPath = searchPath ?? resolveToCwd(".", this.session.cwd);
+			if (resolvedPathInputs.length === 1) {
+				const parsedPath = parseSearchPath(resolvedPathInputs[0] ?? ".");
+				searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
+				globFilter = parsedPath.glob;
+				scopePath = formatScopePath(searchPath);
+			} else {
+				const multiSearchPath = await resolveExplicitSearchPaths(resolvedPathInputs, this.session.cwd, globFilter);
+				if (!multiSearchPath) {
+					throw new ToolError("`paths` must contain at least one path or glob");
+				}
+				searchPath = multiSearchPath.basePath;
+				globFilter = multiSearchPath.targets ? undefined : multiSearchPath.glob;
+				multiTargets = multiSearchPath.targets;
+				scopePath = multiSearchPath.scopePath;
+			}
+			const resolvedSearchPath = searchPath;
 			scopePath = scopePath ?? formatScopePath(resolvedSearchPath);
 			let isDirectory: boolean;
 			try {
@@ -150,10 +251,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				throw new ToolError(`Path not found: ${scopePath}`);
 			}
 
-			const result = await astEdit({
+			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
-				path: resolvedSearchPath,
-				glob: globFilter,
 				dryRun: true,
 				maxFiles,
 				failOnParseError: false,
@@ -256,7 +355,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				count: fileReplacementCounts.get(filePath) ?? 0,
 			}));
 			if (result.limitReached) {
-				outputLines.push("", "Limit reached; narrow path.");
+				outputLines.push("", "Limit reached; narrow paths.");
 			}
 			if (dedupedParseErrors.length) {
 				outputLines.push("", ...formatParseErrors(dedupedParseErrors));
@@ -270,10 +369,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
-						const applyResult = await astEdit({
+						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
-							path: resolvedSearchPath,
-							glob: globFilter,
 							dryRun: false,
 							maxFiles,
 							failOnParseError: false,
@@ -349,7 +446,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 
 interface AstEditRenderArgs {
 	ops?: Array<{ pat?: string; out?: string }>;
-	path?: string;
+	paths?: string[];
 }
 
 const COLLAPSED_CHANGE_LIMIT = PREVIEW_LIMITS.COLLAPSED_LINES * 2;
@@ -358,7 +455,7 @@ export const astEditToolRenderer = {
 	inline: true,
 	renderCall(args: AstEditRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
 		const meta: string[] = [];
-		if (args.path) meta.push(`in ${args.path}`);
+		if (args.paths?.length) meta.push(`in ${args.paths.join(", ")}`);
 		const rewriteCount = args.ops?.length ?? 0;
 		if (rewriteCount > 1) meta.push(`${rewriteCount} rewrites`);
 

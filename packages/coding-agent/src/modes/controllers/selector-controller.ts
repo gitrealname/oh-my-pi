@@ -119,6 +119,7 @@ export class SelectorController {
 								rightSegments: settings.get("statusLine.rightSegments"),
 								separator: settings.get("statusLine.separator"),
 								showHookStatus: settings.get("statusLine.showHookStatus"),
+								sessionAccent: settings.get("statusLine.sessionAccent"),
 								...previewSettings,
 							});
 							this.ctx.updateEditorTopBorder();
@@ -141,6 +142,7 @@ export class SelectorController {
 								rightSegments: settings.get("statusLine.rightSegments"),
 								separator: settings.get("statusLine.separator"),
 								showHookStatus: settings.get("statusLine.showHookStatus"),
+								sessionAccent: settings.get("statusLine.sessionAccent"),
 							});
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
@@ -333,8 +335,12 @@ export class SelectorController {
 				break;
 			}
 			case "statusLinePreset":
+			case "statusLine.preset":
 			case "statusLineSeparator":
+			case "statusLine.separator":
 			case "statusLineShowHooks":
+			case "statusLine.showHookStatus":
+			case "statusLine.sessionAccent":
 			case "statusLineSegments":
 			case "statusLineModelThinking":
 			case "statusLinePathAbbreviate":
@@ -352,6 +358,7 @@ export class SelectorController {
 					rightSegments: settings.get("statusLine.rightSegments"),
 					separator: settings.get("statusLine.separator"),
 					showHookStatus: settings.get("statusLine.showHookStatus"),
+					sessionAccent: settings.get("statusLine.sessionAccent"),
 					segmentOptions: settings.get("statusLine.segmentOptions"),
 				};
 				this.ctx.statusLine.updateSettings(statusLineSettings);
@@ -780,7 +787,7 @@ export class SelectorController {
 			getCwd: () => string;
 			titleSource?: "auto" | "user" | undefined;
 		};
-		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd(), sessionManager.titleSource);
+		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
 	}
 
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {

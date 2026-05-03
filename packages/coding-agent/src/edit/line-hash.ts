@@ -668,66 +668,93 @@ export const HASHLINE_BIGRAMS = [
 export const HASHLINE_BIGRAMS_COUNT = HASHLINE_BIGRAMS.length;
 
 /**
- * Regex source matching exactly one bigram from {@link HASHLINE_BIGRAMS}.
- * Used by hashline parsers — keep in sync with the alphabet array above.
+ * Decoration prefix that may precede a `LINE+HASH` anchor in tool output:
+ * `>` (context line in grep), `+` (added line in diff), `-` (removed line),
+ * `*` (match line). Any combination, in any order, surrounded by optional
+ * whitespace. Output formatters emit at most one decoration per anchor; the
+ * regex stays liberal because anchor-ref parsers accept whatever the model
+ * echoes back.
  */
-export const HASHLINE_BIGRAM_RE_SRC = `(?:${HASHLINE_BIGRAMS.join("|")})`;
+export const HASHLINE_ANCHOR_DECORATION_RE_SRC = `\\s*[>+\\-*]*\\s*`;
+
+/**
+ * Capture-group regex source for a decorated `LINE+HASH` anchor. Group 1
+ * captures the line number (digits only); group 2 captures the hash. The
+ * source is intentionally unanchored — anchoring with `^` (or composing into a
+ * larger pattern) is the caller's responsibility.
+ */
+export const HASHLINE_ANCHOR_RE_SRC = `${HASHLINE_ANCHOR_DECORATION_RE_SRC}(\\d+)([a-z]{2})`;
+
+/**
+ * Bare `LINE+HASH` Lid (no decorations, no captures, no anchors). Use for
+ * embedding inside larger patterns where the line+hash unit appears as a
+ * literal (e.g. range bounds, alternation arms, op-line heuristics).
+ */
+export const HASHLINE_LID_RE_SRC = `[1-9]\\d*[a-z]{2}`;
+
+/**
+ * Capture-group form of {@link HASHLINE_LID_RE_SRC}: group 1 captures the
+ * line number, group 2 captures the hash.
+ */
+export const HASHLINE_LID_CAPTURE_RE_SRC = `([1-9]\\d*)([a-z]{2})`;
+
+/** Width of a hash in display characters. */
+export const HASHLINE_HASH_WIDTH = 2;
+
+/**
+ * Representative hash suffixes for use in user-facing error messages and
+ * prompt examples.
+ */
+export const HASHLINE_HASH_EXAMPLES = ["sr", "ab", "th"] as const;
+
+/**
+ * Format a comma-separated list of example anchors with an optional line-number
+ * prefix, quoted for inclusion in error messages: `"160sr", "160ab", "160th"`.
+ */
+export function describeAnchorExamples(linePrefix = ""): string {
+	return HASHLINE_HASH_EXAMPLES.map(e => `"${linePrefix}${e}"`).join(", ");
+}
+
+/**
+ * Sentinel token that the hashline Lark grammar uses for the hash
+ * regex source. Replaced at module-load time by {@link resolveLarkLidPlaceholders}
+ * so the grammar is re-derived from a single source of truth alongside its
+ * TypeScript consumers. Update the placeholder name here and in the grammar together.
+ */
+export const LARK_LID_HASH_PLACEHOLDER = "$HASHFMT$";
+
+/**
+ * Substitute the LID hash placeholder in a Lark grammar text with the
+ * `[a-z]{2}` hash regex source. Grammars that don't reference Lids pass
+ * through unchanged.
+ */
+export function resolveLarkLidPlaceholders(grammar: string): string {
+	return grammar.replaceAll(LARK_LID_HASH_PLACEHOLDER, "[a-z]{2}");
+}
 
 export const HASHLINE_CONTENT_SEPARATOR = "|";
 
 const RE_SIGNIFICANT = /[\p{L}\p{N}]/u;
-const RE_STRUCTURAL_STRIP = /[\s{}]/g;
 
 /**
- * Bigram returned for lines that contain only whitespace and `{`/`}`.
- * Picks the English ordinal suffix for the line number (`1` → `st`,
- * `2` → `nd`, `3` → `rd`, `11`/`12`/`13` → `th`, else `th`) so the
- * line digits + bigram BPE-merge into a single ordinal token (`1st`, `42nd`,
- * `100th`, …). Brace-only lines therefore cost one token for the whole
- * `LINE+ID` anchor instead of two.
- */
-function structuralBigram(line: number): string {
-	const mod100 = line % 100;
-	if (mod100 >= 11 && mod100 <= 13) return "th";
-	switch (line % 10) {
-		case 1:
-			return "st";
-		case 2:
-			return "nd";
-		case 3:
-			return "rd";
-		default:
-			return "th";
-	}
-}
-
-/**
- * Compute a short BPE-bigram hash of a single line.
+ * Compute a 2-character hash of a single line via xxHash32 mod 647 over
+ * {@link HASHLINE_BIGRAMS}. Lines with no letter or digit (e.g. bare `}`,
+ * bare `{`) mix the line number into the seed so adjacent identical
+ * brace-only lines get distinct hashes; lines with significant content stay
+ * line-number-independent so a line is identifiable across small shifts.
  *
- * Uses xxHash32 on a trailing-whitespace-trimmed, CR-stripped line, mapped into
- * {@link HASHLINE_BIGRAMS} via modulo. Lines that contain only whitespace and
- * `{`/`}` collapse to an ordinal-suffix bigram (see {@link structuralBigram})
- * so brace-only structure shares one merged ordinal token. For other lines
- * containing no alphanumeric characters, the line number is mixed in to reduce hash collisions.
  * The line input should not include a trailing newline.
  */
 export function computeLineHash(idx: number, line: string): string {
 	line = line.replace(/\r/g, "").trimEnd();
-
-	if (line.replace(RE_STRUCTURAL_STRIP, "").length === 0) {
-		return structuralBigram(idx);
-	}
-
-	let seed = 0;
-	if (!RE_SIGNIFICANT.test(line)) {
-		seed = idx;
-	}
+	const seed = RE_SIGNIFICANT.test(line) ? 0 : idx;
 	return HASHLINE_BIGRAMS[Bun.hash.xxHash32(line, seed) % HASHLINE_BIGRAMS_COUNT];
 }
 
 /**
  * Formats an anchor reference given a line number and its text.
- * Returns `LINE+ID` (e.g., `42nd`) — no separator between number and bigram.
+ * Returns `LINE+ID` (e.g., `42sr`) — no separator between
+ * number and hash.
  */
 export function formatLineHash(line: number, lines: string): string {
 	return `${line}${computeLineHash(line, lines)}`;
@@ -735,7 +762,7 @@ export function formatLineHash(line: number, lines: string): string {
 
 /**
  * Formats a single line with a hashline anchor.
- * Returns `LINE+ID|TEXT` (e.g., `42nd|function hi() {\n2er|  return;\n3in|}`)
+ * Returns `LINE+ID|TEXT` (e.g., `42sr|function hi() {`, `3ab|}`).
  */
 export function formatHashLine(lineNumber: number, line: string): string {
 	return `${lineNumber}${computeLineHash(lineNumber, line)}${HASHLINE_CONTENT_SEPARATOR}${line}`;
@@ -754,7 +781,7 @@ export function formatHashLine(lineNumber: number, line: string): string {
  * @example
  * ```
  * formatHashLines("function hi() {\n  return;\n}")
- * // "1th|function hi() {\n2er|  return;\n3in|}"
+ * // "1bm|function hi() {\n2er|  return;\n3ab|}"
  * ```
  */
 export function formatHashLines(text: string, startLine = 1): string {
