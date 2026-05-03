@@ -11,8 +11,5 @@ architecture decisions, and attribution.
 ## Commands
 
 - `/mreview <file.md>` — open markdown file in browser review UI with AI chat
-- `/review <file.md>` — alias
-- `/discuss <file.md>` — alias
 
-The `ai/` subdirectory will contain code vendored from Plannotator's `packages/ai/` layer.
-See `ai/ATTRIBUTION.md` once vendored.
+Borrows rendering patterns and CSS from Plannotator's `packages/review-editor/`.

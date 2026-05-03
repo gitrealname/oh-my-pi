@@ -130,6 +130,11 @@ body.light .ann-label.issue      { background: #ffe3e3; color: #c92a2a; }
 body.light #resize-handle { background: #ddd; }
 body.light #resize-handle:hover { background: #1971c2; }
 
+/* Font size control */
+#font-size-ctrl { display: flex; align-items: center; gap: 3px; }
+#font-size-ctrl button { background: none; border: 1px solid #45475a; color: #6c7086; width: 20px; height: 20px; border-radius: 3px; font-size: 11px; font-weight: 700; cursor: pointer; line-height: 1; padding: 0; display: flex; align-items: center; justify-content: center; }
+#font-size-ctrl button:hover { border-color: #89b4fa; color: #89b4fa; }
+#font-size-val { font-size: 10px; color: #6c7086; min-width: 18px; text-align: center; font-family: ui-monospace, monospace; }
 /* Theme toggle */
 #theme-toggle { background: none; border: 1px solid #45475a; color: #6c7086; padding: 3px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; }
 #theme-toggle:hover { border-color: #89b4fa; color: #89b4fa; }
@@ -141,11 +146,14 @@ body.light #resize-handle:hover { background: #1971c2; }
 <div id="resize-handle"></div>
 <div id="chat-panel">
   <div id="chat-header">
-    <span class="title">AI Chat</span>
+    <div id="font-size-ctrl">
+      <button id="font-dec" title="Decrease font size">A-</button>
+      <span id="font-size-val">13</span>
+      <button id="font-inc" title="Increase font size">A+</button>
+    </div>
     <button id="theme-toggle" title="Toggle light/dark document view">&#x2600;&#xFE0F;</button>
     <span class="ann-count" id="ann-count"></span>
     <span class="spacer"></span>
-    <span class="status" id="chat-status">ready</span>
     <button class="header-btn" id="submit-btn">Submit Comments</button>
     <button class="header-btn" id="close-btn">Close</button>
   </div>
@@ -243,8 +251,8 @@ function openCommentBox() {
   if (meta.lineStart !== null) {
     locationText = meta.lineStart === meta.lineEnd
       ? `Line ${meta.lineStart}`
-      : `Lines ${meta.lineStart}\u2013${meta.lineEnd}`;
-    if (meta.charStart !== null) locationText += ` (chars ${meta.charStart}\u2013${meta.charEnd})`;
+      : `Lines ${meta.lineStart}-${meta.lineEnd}`;
+    if (meta.charStart !== null) locationText += ` (chars ${meta.charStart}-${meta.charEnd})`;
   }
   const previewText = selectedText.slice(0, 80) + (selectedText.length > 80 ? '\u2026' : '');
 
@@ -253,6 +261,7 @@ function openCommentBox() {
   const noteBox = document.createElement('div');
   noteBox.id = 'ann-input-box';
   noteBox.style.display = 'block';
+  noteBox.style.fontSize = fontSize + 'px';
   noteBox.innerHTML = `
     <div class="ann-location">${locationText ? locationText + ' - ' : ''}"${previewText}"</div>
     <div class="label-row">
@@ -314,7 +323,7 @@ function openCommentBox() {
     noteBox.outerHTML = `<div class="annotation-note" data-ann-id="${id}">
       <span class="ann-del" onclick="deleteAnnotation('${id}')">&#x2715;</span>
       <span class="ann-ask" onclick="askAboutAnnotation('${id}')">Send</span>
-      ${locHtml}${labelHtml}<span class="ann-text">&#x1F4AC; ${comment}</span>
+      ${locHtml}${labelHtml}<span class="ann-text">&#x1F4AC; ${marked.parseInline(comment)}</span>
     </div>`;
     updateAnnCount();
   });
@@ -373,7 +382,7 @@ let streaming = false;
 function addMsg(role, text) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
-  if (role === 'assistant') { div.innerHTML = marked.parse(text); } else { div.textContent = text; }
+  if (role === 'assistant') { div.innerHTML = marked.parse(text); } else { div.innerHTML = marked.parseInline(text); }
   msgs.appendChild(div);
   msgs.scrollTop = msgs.scrollHeight;
   return div;
@@ -385,7 +394,7 @@ async function sendQuery() {
   input.value = '';
   input.style.height = 'auto';
   addMsg('user', prompt);
-  streaming = true; sendBtn.disabled = true; status.textContent = 'thinking...';
+  streaming = true; sendBtn.disabled = true; if (status) status.textContent = 'thinking...';
   const assistantDiv = addMsg('assistant', '');
   let fullText = '';
   try {
@@ -418,7 +427,7 @@ async function sendQuery() {
       if (data.error) assistantDiv.className = 'msg error';
     }
   } catch (err) { assistantDiv.className = 'msg error'; assistantDiv.textContent = 'Error: ' + err.message; }
-  streaming = false; sendBtn.disabled = false; status.textContent = 'ready';
+  streaming = false; sendBtn.disabled = false; if (status) status.textContent = 'ready';
   if (!fullText && assistantDiv.textContent === '') assistantDiv.remove();
 }
 window.sendQuery = sendQuery;
@@ -430,18 +439,18 @@ input.addEventListener('input', () => { input.style.height = 'auto'; input.style
 // --- Build structured feedback ---
 function buildFeedback() {
   const fileName = filePath.split(/[/\\]/).pop() || filePath;
-  let fb = `## Review: ${fileName}\n\n`;
+  let fb = `# Review: ${fileName}\n\n`;
   const sorted = [...annotations].sort((a, b) => (a.lineStart || 0) - (b.lineStart || 0));
   for (const a of sorted) {
     // Heading: line range + token snippet
     const loc = a.lineStart !== null
-      ? (a.lineStart === a.lineEnd ? `Line ${a.lineStart}` : `Lines ${a.lineStart}\u2013${a.lineEnd}`)
+      ? (a.lineStart === a.lineEnd ? `Line ${a.lineStart}` : `Lines ${a.lineStart}-${a.lineEnd}`)
       : null;
     const token = a.selectedText.length <= 60
       ? a.selectedText.replace(/\n/g, ' ')
       : a.selectedText.slice(0, 57).replace(/\n/g, ' ') + '\u2026';
     const charInfo = (a.charStart !== null && a.lineStart !== null)
-      ? ` (chars ${a.charStart}\u2013${a.charEnd})`
+      ? ` (chars ${a.charStart}-${a.charEnd})`
       : '';
     fb += loc
       ? `### ${loc}${charInfo} - "${token}"\n`
@@ -459,20 +468,33 @@ document.getElementById('submit-btn').addEventListener('click', async () => {
     if (!confirm('No comments to submit. Close anyway?')) return;
     await fetch('/api/exit', { method: 'POST' });
     document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6c7086;font-size:18px">Session closed.</div>';
-    setTimeout(() => { try { window.close(); } catch {} }, 1000);
+    tryClose();
     return;
   }
   const fb = buildFeedback();
   await fetch('/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ feedback: fb, annotations }) });
   document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#a6e3a1;font-size:18px">\u2713 Comments submitted. Return to terminal.</div>';
-  setTimeout(() => { try { window.close(); } catch {} }, 1500);
+  tryClose();
 });
 
 // --- Close ---
+function tryClose() {
+  // window.close() only works if the tab was opened via window.open().
+  // Try multiple approaches; fall through to showing the message.
+  setTimeout(() => {
+    try { window.close(); } catch {}               // standard
+    setTimeout(() => {
+      try { window.open('', '_self', '').close(); } catch {}  // chromium workaround
+      setTimeout(() => { window.location.replace('about:blank'); }, 300);
+    }, 300);
+  }, 400);
+}
+
 document.getElementById('close-btn').addEventListener('click', async () => {
   await fetch('/api/exit', { method: 'POST' });
   document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6c7086;font-size:18px">Session closed.</div>';
+  tryClose();
 });
 
 // Resize
@@ -495,6 +517,22 @@ themeBtn.addEventListener('click', () => {
   localStorage.setItem('mreview-theme', isLight ? 'light' : 'dark');
 });
 
+// Font size control — use a dynamic <style> tag so !important overrides
+// explicit px values on child elements
+const FONT_MIN = 8, FONT_MAX = 48, FONT_DEFAULT = 13;
+let fontSize = parseInt(localStorage.getItem('mreview-font') || FONT_DEFAULT);
+const fontStyle = document.createElement('style');
+fontStyle.id = 'mreview-font-style';
+document.head.appendChild(fontStyle);
+function applyFontSize(n) {
+  fontSize = Math.max(FONT_MIN, Math.min(FONT_MAX, n));
+  document.getElementById('font-size-val').textContent = fontSize;
+  fontStyle.textContent = '#chat-panel, #chat-panel *, #ann-input-box, #ann-input-box * { font-size: ' + fontSize + 'px !important; }';
+  localStorage.setItem('mreview-font', fontSize);
+}
+applyFontSize(fontSize);
+document.getElementById('font-dec').addEventListener('click', () => applyFontSize(fontSize - 1));
+document.getElementById('font-inc').addEventListener('click', () => applyFontSize(fontSize + 1));
 // Heartbeat
 setInterval(() => { fetch('/api/ai/capabilities').catch(() => {}); }, 30000);
 
