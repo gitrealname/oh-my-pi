@@ -119,6 +119,7 @@ export async function getSearchProvider(id: SearchProviderId): Promise<SearchPro
 
 export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"tavily",
+	"exa",
 	"perplexity",
 	"brave",
 	"jina",
@@ -127,7 +128,6 @@ export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"gemini",
 	"codex",
 	"zai",
-	"exa",
 	"parallel",
 	"kagi",
 	"synthetic",
