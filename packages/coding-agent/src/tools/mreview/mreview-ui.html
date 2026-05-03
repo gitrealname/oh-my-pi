@@ -37,9 +37,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; d
 .annotation-note .ann-ask { float: right; cursor: pointer; color: #89b4fa; font-size: 11px; margin-left: 8px; }
 .annotation-note .ann-ask:hover { color: #74c7ec; }
 
-
+/* Label badge in annotation note */
+.ann-label { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+.ann-label.suggestion { background: #1e3a5f; color: #89b4fa; }
+.ann-label.nit       { background: #2a2a3e; color: #a6adc8; }
+.ann-label.question  { background: #1e3a5f; color: #89b4fa; }
+.ann-label.issue     { background: #3d1f2a; color: #f38ba8; }
 
 #ann-input-box { display: none; background: #313244; border: 1px solid #f9e2af; border-radius: 8px; padding: 8px; margin: 8px 0; }
+#ann-input-box .ann-location { font-size: 10px; color: #6c7086; margin-bottom: 6px; }
+#ann-input-box .label-row { display: flex; gap: 4px; margin-bottom: 6px; flex-wrap: wrap; }
+#ann-input-box .lbl { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid transparent; background: #1e1e2e; color: #6c7086; transition: all 0.1s; }
+#ann-input-box .lbl:hover { color: #cdd6f4; border-color: #45475a; }
+#ann-input-box .lbl.active.suggestion { background: #1e3a5f; color: #89b4fa; border-color: #89b4fa; }
+#ann-input-box .lbl.active.nit       { background: #2a2a3e; color: #a6adc8; border-color: #a6adc8; }
+#ann-input-box .lbl.active.question  { background: #1e3a5f; color: #89b4fa; border-color: #89b4fa; }
+#ann-input-box .lbl.active.issue     { background: #3d1f2a; color: #f38ba8; border-color: #f38ba8; }
 #ann-input-box textarea { width: 100%; background: #1e1e2e; border: 1px solid #45475a; color: #cdd6f4; padding: 8px; border-radius: 4px; font-size: 13px; font-family: inherit; resize: none; outline: none; }
 #ann-input-box textarea:focus { border-color: #f9e2af; }
 #ann-input-box .ann-actions { display: flex; gap: 6px; margin-top: 6px; justify-content: flex-end; }
@@ -103,6 +116,17 @@ body.light .annotated { background: rgba(255,200,50,0.2); border-bottom-color: #
 body.light .annotation-note { background: #fff8e1; border-color: #e67700; color: #795548; }
 body.light #ann-input-box { background: #fff; border-color: #e67700; }
 body.light #ann-input-box textarea { background: #fafafa; border-color: #ddd; color: #333; }
+body.light #ann-input-box .ann-location { color: #999; }
+body.light #ann-input-box .lbl { background: #f0f0f0; color: #666; border-color: #ddd; }
+body.light #ann-input-box .lbl:hover { background: #e0e0e0; color: #333; border-color: #999; }
+body.light #ann-input-box .lbl.active.suggestion { background: #e3efff; color: #1971c2; border-color: #1971c2; }
+body.light #ann-input-box .lbl.active.nit       { background: #f5f5f5; color: #555;    border-color: #999; }
+body.light #ann-input-box .lbl.active.question  { background: #e3efff; color: #1971c2; border-color: #1971c2; }
+body.light #ann-input-box .lbl.active.issue     { background: #ffe3e3; color: #c92a2a; border-color: #c92a2a; }
+body.light .ann-label.suggestion { background: #e3efff; color: #1971c2; }
+body.light .ann-label.nit        { background: #f0f0f0; color: #555; }
+body.light .ann-label.question   { background: #e3efff; color: #1971c2; }
+body.light .ann-label.issue      { background: #ffe3e3; color: #c92a2a; }
 body.light #resize-handle { background: #ddd; }
 body.light #resize-handle:hover { background: #1971c2; }
 
@@ -118,7 +142,7 @@ body.light #resize-handle:hover { background: #1971c2; }
 <div id="chat-panel">
   <div id="chat-header">
     <span class="title">AI Chat</span>
-    <button id="theme-toggle" title="Toggle light/dark document view">☀️</button>
+    <button id="theme-toggle" title="Toggle light/dark document view">&#x2600;&#xFE0F;</button>
     <span class="ann-count" id="ann-count"></span>
     <span class="spacer"></span>
     <span class="status" id="chat-status">ready</span>
@@ -135,13 +159,54 @@ body.light #resize-handle:hover { background: #1971c2; }
 <script>
 const annotations = [];
 let annCounter = 0;
+let filePath = '';
+
+// --- Render markdown with data-start-line / data-end-line on each block ---
+function renderWithLineNumbers(markdown) {
+  const tokens = marked.lexer(markdown);
+  let line = 1;
+  let html = '';
+  for (const token of tokens) {
+    const startLine = line;
+    const newlines = (token.raw.match(/\n/g) || []).length;
+    line += newlines;
+    const endLine = Math.max(startLine, line - 1);
+    let rendered = marked.parser([token]);
+    // Inject data attributes into the first opening tag of the rendered block
+    rendered = rendered.replace(/^(<[a-zA-Z][^>]*)>/, `$1 data-start-line="${startLine}" data-end-line="${endLine}">`);
+    html += rendered;
+  }
+  return html;
+}
 
 fetch('/api/doc-content').then(r => r.json()).then(data => {
-  document.title = 'mreview — ' + data.filePath.split(/[/\\]/).pop();
-  document.getElementById('doc-content').innerHTML = marked.parse(data.markdown);
+  filePath = data.filePath;
+  document.title = 'mreview - ' + filePath.split(/[\/\\]/).pop();
+  document.getElementById('doc-content').innerHTML = renderWithLineNumbers(data.markdown);
 }).catch(() => {
   document.getElementById('doc-content').innerHTML = '<p style="color:#f38ba8">Failed to load document.</p>';
 });
+
+// --- Extract line/char info from a DOM Range ---
+function getSelectionMeta(range) {
+  // Walk up from start container to find nearest block with data-start-line
+  let node = range.startContainer.nodeType === 3
+    ? range.startContainer.parentElement
+    : range.startContainer;
+  let lineStart = null, lineEnd = null;
+  while (node && node.id !== 'doc-content') {
+    if (node.dataset && node.dataset.startLine) {
+      lineStart = parseInt(node.dataset.startLine);
+      lineEnd   = parseInt(node.dataset.endLine);
+      break;
+    }
+    node = node.parentElement;
+  }
+  // Char offsets: offset within the text content of the start/end containers
+  const charStart = range.startOffset;
+  const charEnd   = range.endOffset;
+  return { lineStart, lineEnd, charStart, charEnd };
+}
 
 // --- Annotations ---
 let pendingRange = null;
@@ -150,8 +215,7 @@ document.getElementById('doc-panel').addEventListener('mouseup', e => {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !sel.toString().trim()) return;
   const range = sel.getRangeAt(0);
-  // Skip if clicking inside an annotation input
-  if (range.startContainer.closest?.('.annotation-note,[id=ann-input-box]')) return;
+  if (range.startContainer.closest && range.startContainer.closest('.annotation-note,[id=ann-input-box]')) return;
   pendingRange = range.cloneRange();
   openCommentBox();
 });
@@ -160,7 +224,9 @@ function openCommentBox() {
   if (!pendingRange) return;
   const selectedText = pendingRange.toString();
   const id = 'ann-' + (++annCounter);
-  // Wrap selection — surroundContents fails on multi-element ranges, use extractContents fallback
+  const meta = getSelectionMeta(pendingRange);
+
+  // Wrap selection
   const wrapper = document.createElement('span');
   wrapper.className = 'annotated';
   wrapper.dataset.annId = id;
@@ -172,17 +238,53 @@ function openCommentBox() {
     pendingRange.insertNode(wrapper);
   }
 
+  // Build location label
+  let locationText = '';
+  if (meta.lineStart !== null) {
+    locationText = meta.lineStart === meta.lineEnd
+      ? `Line ${meta.lineStart}`
+      : `Lines ${meta.lineStart}\u2013${meta.lineEnd}`;
+    if (meta.charStart !== null) locationText += ` (chars ${meta.charStart}\u2013${meta.charEnd})`;
+  }
+  const previewText = selectedText.slice(0, 80) + (selectedText.length > 80 ? '\u2026' : '');
+
+  let selectedLabel = 'nit';
+
   const noteBox = document.createElement('div');
   noteBox.id = 'ann-input-box';
   noteBox.style.display = 'block';
   noteBox.innerHTML = `
-    <div style="font-size:11px;color:#6c7086;margin-bottom:4px">Comment on: "${selectedText.slice(0,80)}${selectedText.length>80?'...':''}"</div>
+    <div class="ann-location">${locationText ? locationText + ' - ' : ''}"${previewText}"</div>
+    <div class="label-row">
+      <button class="lbl suggestion" data-label="suggestion" title="Proposes an improvement">suggestion</button>
+      <button class="lbl nit"        data-label="nit"        title="Trivial, preference-based">nit</button>
+      <button class="lbl question"   data-label="question"   title="Seeking clarification">question</button>
+      <button class="lbl issue"      data-label="issue"      title="A problem that needs addressing">issue</button>
+    </div>
     <textarea rows="2" placeholder="Your comment..." autofocus></textarea>
     <div class="ann-actions">
       <button id="ann-cancel">Cancel</button>
       <button id="ann-save">Save</button>
     </div>`;
   wrapper.after(noteBox);
+  // Pre-activate default label
+  noteBox.querySelector('.lbl.nit').classList.add('active');
+
+  // Label pill toggle
+  noteBox.querySelectorAll('.lbl').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const lbl = btn.dataset.label;
+      if (selectedLabel === lbl) {
+        selectedLabel = null;
+        noteBox.querySelectorAll('.lbl').forEach(b => b.classList.remove('active'));
+      } else {
+        selectedLabel = lbl;
+        noteBox.querySelectorAll('.lbl').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      }
+    });
+  });
+
   const ta = noteBox.querySelector('textarea');
   setTimeout(() => ta.focus(), 50);
 
@@ -193,25 +295,42 @@ function openCommentBox() {
   noteBox.querySelector('#ann-save').addEventListener('click', () => {
     const comment = ta.value.trim();
     if (!comment) { removeHighlight(); return; }
-    annotations.push({ id, selectedText, comment });
+    annotations.push({
+      id,
+      selectedText,
+      comment,
+      label: selectedLabel,
+      lineStart: meta.lineStart,
+      lineEnd:   meta.lineEnd,
+      charStart: meta.charStart,
+      charEnd:   meta.charEnd,
+    });
+    const labelHtml = selectedLabel
+      ? `<span class="ann-label ${selectedLabel}">${selectedLabel}</span>`
+      : '';
+    const locHtml = locationText
+      ? `<span style="font-size:10px;color:#6c7086;margin-right:6px">${locationText}</span>`
+      : '';
     noteBox.outerHTML = `<div class="annotation-note" data-ann-id="${id}">
-      <span class="ann-del" onclick="deleteAnnotation('${id}')">✕</span>
-      <span class="ann-ask" onclick="askAboutAnnotation('${id}')">Ask AI</span>
-      <span class="ann-text">💬 ${comment}</span>
+      <span class="ann-del" onclick="deleteAnnotation('${id}')">&#x2715;</span>
+      <span class="ann-ask" onclick="askAboutAnnotation('${id}')">Send</span>
+      ${locHtml}${labelHtml}<span class="ann-text">&#x1F4AC; ${comment}</span>
     </div>`;
     updateAnnCount();
   });
 
   ta.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); noteBox.querySelector('#ann-save').click(); }
-    if (e.key === 'Escape') { noteBox.remove(); wrapper.replaceWith(...wrapper.childNodes); }
+    if (e.key === 'Escape') { removeHighlight(); }
   });
   window.getSelection().removeAllRanges();
   pendingRange = null;
 }
 
 // Esc closes any open annotation input
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { document.querySelectorAll('[id=ann-input-box]').forEach(b => b.remove()); } });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { document.querySelectorAll('[id=ann-input-box]').forEach(b => b.remove()); }
+});
 
 function deleteAnnotation(id) {
   const idx = annotations.findIndex(a => a.id === id);
@@ -226,16 +345,22 @@ window.deleteAnnotation = deleteAnnotation;
 function askAboutAnnotation(id) {
   const ann = annotations.find(a => a.id === id);
   if (!ann) return;
+  const loc = ann.lineStart !== null ? (ann.lineStart === ann.lineEnd ? `Line ${ann.lineStart}` : `Lines ${ann.lineStart}-${ann.lineEnd}`) : null;
+  const prefix = ann.label ? `**${ann.label}:** ` : '';
+  const token = ann.selectedText.replace(/\n/g, ' ').slice(0, 80);
+  const text = loc ? `${loc} - "${token}"\n${prefix}${ann.comment}` : `"${token}"\n${prefix}${ann.comment}`;
   const input = document.getElementById('chat-input');
-  input.value = `Regarding "${ann.selectedText.slice(0,100)}": ${ann.comment}`;
+  input.value = text;
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
   input.focus();
-  // Auto-send
   sendQuery();
 }
 window.askAboutAnnotation = askAboutAnnotation;
 
 function updateAnnCount() {
-  document.getElementById('ann-count').textContent = annotations.length ? `${annotations.length} comment${annotations.length>1?'s':''}` : '';
+  document.getElementById('ann-count').textContent =
+    annotations.length ? `${annotations.length} comment${annotations.length > 1 ? 's' : ''}` : '';
 }
 
 // --- Chat ---
@@ -293,9 +418,7 @@ async function sendQuery() {
       if (data.error) assistantDiv.className = 'msg error';
     }
   } catch (err) { assistantDiv.className = 'msg error'; assistantDiv.textContent = 'Error: ' + err.message; }
-  // Always reset streaming state
   streaming = false; sendBtn.disabled = false; status.textContent = 'ready';
-  // Remove empty assistant messages
   if (!fullText && assistantDiv.textContent === '') assistantDiv.remove();
 }
 window.sendQuery = sendQuery;
@@ -304,24 +427,49 @@ sendBtn.addEventListener('click', sendQuery);
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuery(); } });
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; });
 
-// --- Submit Comments: send annotations to agent, then close ---
+// --- Build structured feedback ---
+function buildFeedback() {
+  const fileName = filePath.split(/[/\\]/).pop() || filePath;
+  let fb = `## Review: ${fileName}\n\n`;
+  const sorted = [...annotations].sort((a, b) => (a.lineStart || 0) - (b.lineStart || 0));
+  for (const a of sorted) {
+    // Heading: line range + token snippet
+    const loc = a.lineStart !== null
+      ? (a.lineStart === a.lineEnd ? `Line ${a.lineStart}` : `Lines ${a.lineStart}\u2013${a.lineEnd}`)
+      : null;
+    const token = a.selectedText.length <= 60
+      ? a.selectedText.replace(/\n/g, ' ')
+      : a.selectedText.slice(0, 57).replace(/\n/g, ' ') + '\u2026';
+    const charInfo = (a.charStart !== null && a.lineStart !== null)
+      ? ` (chars ${a.charStart}\u2013${a.charEnd})`
+      : '';
+    fb += loc
+      ? `### ${loc}${charInfo} - "${token}"\n`
+      : `### "${token}"\n`;
+    // Label prefix
+    const prefix = a.label ? `**${a.label}:** ` : '';
+    fb += `${prefix}${a.comment}\n\n`;
+  }
+  return fb.trim();
+}
+
+// --- Submit Comments ---
 document.getElementById('submit-btn').addEventListener('click', async () => {
   if (annotations.length === 0) {
     if (!confirm('No comments to submit. Close anyway?')) return;
     await fetch('/api/exit', { method: 'POST' });
     document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6c7086;font-size:18px">Session closed.</div>';
-  setTimeout(() => { try { window.close(); } catch {} }, 1000);
+    setTimeout(() => { try { window.close(); } catch {} }, 1000);
     return;
   }
-  let fb = 'Review comments on this document:\n\n';
-  annotations.forEach((a, i) => { fb += `${i+1}. **"${a.selectedText.slice(0,100)}"** — ${a.comment}\n`; });
+  const fb = buildFeedback();
   await fetch('/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ feedback: fb, annotations }) });
-  document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#a6e3a1;font-size:18px">✓ Comments submitted. Return to terminal.</div>';
+  document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#a6e3a1;font-size:18px">\u2713 Comments submitted. Return to terminal.</div>';
   setTimeout(() => { try { window.close(); } catch {} }, 1500);
 });
 
-// --- Close: exit without sending ---
+// --- Close ---
 document.getElementById('close-btn').addEventListener('click', async () => {
   await fetch('/api/exit', { method: 'POST' });
   document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6c7086;font-size:18px">Session closed.</div>';
@@ -339,15 +487,15 @@ document.addEventListener('mouseup', () => { dragging = false; document.body.sty
 const themeBtn = document.getElementById('theme-toggle');
 const savedTheme = localStorage.getItem('mreview-theme');
 if (savedTheme !== 'dark') document.body.classList.add('light');
-themeBtn.textContent = document.body.classList.contains('light') ? '🌙' : '☀️';
+themeBtn.textContent = document.body.classList.contains('light') ? '\uD83C\uDF19' : '\u2600\uFE0F';
 themeBtn.addEventListener('click', () => {
   document.body.classList.toggle('light');
   const isLight = document.body.classList.contains('light');
-  themeBtn.textContent = isLight ? '🌙' : '☀️';
+  themeBtn.textContent = isLight ? '\uD83C\uDF19' : '\u2600\uFE0F';
   localStorage.setItem('mreview-theme', isLight ? 'light' : 'dark');
 });
 
-// Heartbeat — keep server alive while user works on annotations
+// Heartbeat
 setInterval(() => { fetch('/api/ai/capabilities').catch(() => {}); }, 30000);
 
 // Tab close

@@ -49,7 +49,7 @@ import { STTController, type SttState } from "../stt";
 import type { ExitPlanModeDetails, LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { formatPhaseDisplayName } from "../tools/todo-write";
-import type { EventBus } from "../utils/event-bus";
+import { type EventBus, SCHEDULE_SLASH_CHANNEL } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHexForTitle } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
@@ -252,6 +252,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
 					this.#handleLspStartupEvent(data as LspStartupEvent);
+				}),
+				eventBus.on(SCHEDULE_SLASH_CHANNEL, data => {
+					const command = typeof data === "string" ? data : null;
+					if (command) void this.session.waitForIdle().then(() => this.editor.onSubmit?.(command));
 				}),
 			);
 		}

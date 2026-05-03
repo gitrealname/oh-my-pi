@@ -36,6 +36,7 @@ import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
 import { NotebookTool } from "./notebook";
+import { MReviewTool } from "./mreview/tool";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import { RecipeTool } from "./recipe";
@@ -224,6 +225,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
 	mbrowser: s => new MBrowserTool(s),
+	mreview: MReviewTool.createIf,
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	task: TaskTool.create,

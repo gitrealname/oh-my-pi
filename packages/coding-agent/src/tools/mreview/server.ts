@@ -343,6 +343,7 @@ export async function startMReviewServer(
     waitForDecision: () => decisionPromise,
     stop: () => {
       server.close();
+      decisionResolve?.({ feedback: "", annotations: [], exit: true });
     },
   };
 }
