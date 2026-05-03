@@ -62,6 +62,7 @@ import {
 } from "./extensibility/extensions";
 import { loadSkills as loadSkillsInternal, type Skill, type SkillWarning } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
+import type { HindsightSessionState } from "./hindsight/state";
 import {
 	AgentProtocolHandler,
 	ArtifactProtocolHandler,
@@ -83,7 +84,8 @@ import {
 	selectDiscoverableMCPToolNamesByServer,
 	summarizeDiscoverableMCPTools,
 } from "./mcp/discoverable-tool-metadata";
-import { buildMemoryToolDeveloperInstructions, getMemoryRoot, startMemoryStartupTask } from "./memories";
+import { getMemoryRoot } from "./memories";
+import { resolveMemoryBackend } from "./memory-backend";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
@@ -216,6 +218,8 @@ export interface CreateAgentSessionOptions {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
+	/** Parent Hindsight state to alias for subagent memory tools. */
+	parentHindsightSessionState?: HindsightSessionState;
 	/** Pre-allocated agent identity for IRC routing. Default: "0-Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
@@ -969,6 +973,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
@@ -1339,7 +1344,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const promptTools = buildSystemPromptToolMetadata(tools, {
 				search_tool_bm25: { description: renderSearchToolBm25Description(discoverableMCPTools) },
 			});
-			const memoryInstructions = await buildMemoryToolDeveloperInstructions(agentDir, settings);
+			const memoryInstructions = await resolveMemoryBackend(settings).buildDeveloperInstructions(
+				agentDir,
+				settings,
+				session,
+			);
 
 			// Build combined append prompt: memory instructions + MCP server instructions
 			const serverInstructions = mcpManager?.getServerInstructions();
@@ -1752,13 +1761,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		logger.time("startMemoryStartupTask", () =>
-			startMemoryStartupTask({
-				session,
-				settings,
-				modelRegistry,
-				agentDir,
-				taskDepth,
-			}),
+			Promise.resolve(
+				resolveMemoryBackend(settings).start({
+					session,
+					settings,
+					modelRegistry,
+					agentDir,
+					taskDepth,
+					parentHindsightSessionState: options.parentHindsightSessionState,
+				}),
+			),
 		);
 
 		// Wire MCP manager callbacks to session for reactive tool updates.

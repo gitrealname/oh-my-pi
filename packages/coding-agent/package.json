@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@oh-my-pi/pi-coding-agent",
-	"version": "14.6.2",
+	"version": "14.6.3",
 	"description": "Coding agent CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://github.com/can1357/oh-my-pi",
 	"author": "Can Boluk",
@@ -370,6 +370,22 @@
 		"./memories/*": {
 			"types": "./src/memories/*.ts",
 			"import": "./src/memories/*.ts"
+		},
+		"./memory-backend": {
+			"types": "./src/memory-backend/index.ts",
+			"import": "./src/memory-backend/index.ts"
+		},
+		"./memory-backend/*": {
+			"types": "./src/memory-backend/*.ts",
+			"import": "./src/memory-backend/*.ts"
+		},
+		"./hindsight": {
+			"types": "./src/hindsight/index.ts",
+			"import": "./src/hindsight/index.ts"
+		},
+		"./hindsight/*": {
+			"types": "./src/hindsight/*.ts",
+			"import": "./src/hindsight/*.ts"
 		},
 		"./modes": {
 			"types": "./src/modes/index.ts",

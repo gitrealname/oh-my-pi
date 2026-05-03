@@ -5,7 +5,7 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
-import { computeLineHash, HASHLINE_CONTENT_SEPARATOR } from "../edit/line-hash";
+import { computeLineHash, HL_BODY_SEP } from "../edit/line-hash";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
@@ -20,6 +20,7 @@ import {
 	hasGlobPathChars,
 	normalizePathLikeInput,
 	parseSearchPath,
+	partitionExistingPaths,
 	resolveExplicitSearchPaths,
 	resolveToCwd,
 } from "./path-utils";
@@ -226,13 +227,21 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				}
 				resolvedPathInputs.push(resource.sourcePath);
 			}
-			if (resolvedPathInputs.length === 1) {
-				const parsedPath = parseSearchPath(resolvedPathInputs[0] ?? ".");
+			let effectivePathInputs = resolvedPathInputs;
+			if (resolvedPathInputs.length > 1) {
+				const partition = await partitionExistingPaths(resolvedPathInputs, this.session.cwd, parseSearchPath);
+				if (partition.valid.length === 0) {
+					throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
+				}
+				effectivePathInputs = partition.valid;
+			}
+			if (effectivePathInputs.length === 1) {
+				const parsedPath = parseSearchPath(effectivePathInputs[0] ?? ".");
 				searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
 				globFilter = parsedPath.glob;
 				scopePath = formatScopePath(searchPath);
 			} else {
-				const multiSearchPath = await resolveExplicitSearchPaths(resolvedPathInputs, this.session.cwd, globFilter);
+				const multiSearchPath = await resolveExplicitSearchPaths(effectivePathInputs, this.session.cwd, globFilter);
 				if (!multiSearchPath) {
 					throw new ToolError("`paths` must contain at least one path or glob");
 				}
@@ -321,7 +330,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					const afterRef = useHashLines
 						? `${change.startLine}${computeLineHash(change.startLine, afterFirstLine)}`
 						: `${change.startLine}:${change.startColumn}`;
-					const lineSeparator = useHashLines ? HASHLINE_CONTENT_SEPARATOR : " ";
+					const lineSeparator = useHashLines ? HL_BODY_SEP : " ";
 					modelOut.push(`-${beforeRef}${lineSeparator}${beforeLine}`);
 					modelOut.push(`+${afterRef}${lineSeparator}${afterLine}`);
 					displayOut.push(formatCodeFrameLine("-", change.startLine, beforeLine, lineNumberWidth));

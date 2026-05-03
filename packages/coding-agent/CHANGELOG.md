@@ -1,8 +1,81 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `hindsight.mentalModelsEnabled`, `hindsight.mentalModelAutoSeed`, `hindsight.mentalModelRefreshIntervalMs`, and `hindsight.mentalModelMaxRenderChars` settings to control curated Hindsight mental-model activation, seeding, refresh cadence, and prompt render budget
+- Added `<mental_models>` injection to developer instructions, loading bank-level curated summaries as stable background context
+- Added built-in `/memory mm` commands (`list`, `show`, `refresh`, `history`, `seed`, `reload`, `delete`) to inspect and manage mental models on the active bank
+- Added scope-aware mental-model seeding for `global`, `per-project`, and `per-project-tagged` banks, including built-in seed models like user preferences, project conventions, and project decisions
+- Added warning output when hashline block replacements auto-absorbed duplicate boundary lines
+
+### Changed
+
+- Changed `/memory clear` and `/memory enqueue` to apply only to the current agent session’s Hindsight cache instead of all live Hindsight sessions
+- Changed the prompt assembly order so `<mental_models>` blocks are appended before `<memories>` recall blocks in developer instructions
+
+### Fixed
+
+- Fixed Hindsight memory prompt injection and recall/retain tool execution to resolve against the active session state, preventing context from an unrelated session from being used
+- Fixed subagent `/task` sessions to persist memories into the parent agent’s Hindsight bank by explicit parent state wiring
+- Fixed per-session memory retention behavior when switching or resuming sessions by rekeying Hindsight state and resetting conversation-tracking counters so first-turn recall and nth-turn retain cadence no longer leak across conversations
+- Fixed the first-turn startup race so `<mental_models>` appears in the opening system prompt when mental-model loading is enabled
+- Fixed retention hygiene by stripping `<mental_models>` blocks from retained content to prevent curated summaries from feeding back into future memory writes
+- Fixed `<mental_models>` rendering to honor the configured character budget and truncate with an explicit truncation marker when the snapshot exceeds limits
+- Fixed hashline replacements so duplicated payload boundary lines adjacent to a replaced block are absorbed into the replacement range instead of being duplicated
+
+## [14.6.3] - 2026-05-03
+
+### Breaking Changes
+
+- Renamed hashline separator configuration from `PI_HASHLINE_SEP` to `PI_HL_SEP` and changed the default payload separator from `\\` to `>`
+
+### Added
+
+- Added inline hashline edit syntax so `< ANCHOR${sep}TEXT` prepended text to an anchored line and `+ ANCHOR${sep}TEXT` appended text to it without requiring a multi-line payload block
+- Added a `memory.backend` setting (off, local, hindsight) under a new Memory settings tab to control which memory subsystem is active
+- Added Hindsight memory settings (`hindsight.*`) for API connection, bank identification, and recall/retain policy
+- Added `retain`, `recall`, and `reflect` tools for direct long-term memory search, retention, and reflection when using the Hindsight backend
+- Added `hindsight.scoping` setting (`global`, `per-project`, `per-project-tagged`) that controls whether memories are shared across projects, isolated per cwd, or tagged so global + project memories merge on recall (default: `per-project-tagged`)
+- Added `search_code`, `search_commits`, and `search_repos` ops to the `github` tool so the search surface mirrors `gh search`'s subcommands
+
+### Changed
+
+- Changed `hindsight` tool retains to enqueue memory writes and return `Memory queued.` immediately instead of waiting on a network request
+- Changed `hindsight` tool memory writes to use automatic background batching (up to 16 items or 5 seconds) so tool calls do not block
+- Changed failed `hindsight` queue flushes to be surfaced as UI warning notices rather than failing the foreground `hindsight` tool call
+- Changed hashline read/search previews and diff output to keep `|` as the anchor-to-text separator while using the separate configured edit payload separator
+- Mapped invalid `hindsight.scoping` settings back to the default `per-project-tagged` behavior with a warning
+- Changed `/memory view`, `/memory clear`, and `/memory enqueue` to route through the selected memory backend instead of being hardcoded to local memories
+- Changed compaction context assembly to include backend-provided recall context when available
+- Updated multi-path `search`, `find`, `ast-edit`, and `ast-grep` calls to skip missing base paths, returning matches from remaining paths and reporting skipped paths in output
+- Replaced `hindsight.dynamicBankId` (boolean) with the explicit `hindsight.scoping` enum; legacy values are migrated automatically (`dynamicBankId=true` → `scoping="per-project"`)
+- Changed `search_repos` to run as a global repository search using query qualifiers without applying the `repo` filter
+
+### Deprecated
+
+- Set explicit `hindsight.scoping` now takes precedence over legacy `hindsight.dynamicBankId` when migrating old settings
+
+### Removed
+
+- Removed legacy `hindsight.dynamicBankId` and `hindsight.agentName` fields from the active settings model
+- Removed `hindsight.agentName` and the `HINDSIGHT_AGENT_NAME` / `HINDSIGHT_CHANNEL_ID` / `HINDSIGHT_USER_ID` env vars; the legacy `agent::project::channel::user` bank tuple is gone. A user-set `agentName` is migrated onto `hindsight.bankId`.
+
+### Fixed
+
+- Fixed pending `hindsight` queued memory writes to flush on agent end, clear, and enqueue operations so tool-invoked facts are not dropped when sessions transition
+- Fixed retained memory writes from the `hindsight` tool to include session context and tags consistently in background batches
+- Fixed inline hashline modify operations to fail fast when combined with a delete or replace on the same target line
+- Fixed hashline parsing of payload blocks to handle a shared extra leading symbol prefix (such as markdown `>>`) on all payload lines by stripping it as an auto-correction instead of rejecting the edit
+- Forwarded project scoping tags to `hindsight` retain, recall, and reflect operations so manual memory commands honor the active tagging mode
+- Fixed legacy migrations by mapping existing `memories.enabled` values to `memory.backend` on load to preserve prior enable/disable behavior
+- Fixed memory retention so recalled `<memories>` blocks and legacy `<hindsight_memories>` / `<relevant_memories>` blocks are stripped before storing transcripts and do not feed back as new memory
+- Fixed `search_code` output to include each match path, repository, shortened SHA, and a one-line matching fragment
+- Fixed `search_commits` output to show shortened SHAs with commit message first lines
+- Fixed `search_repos` output formatting to return repository summaries including language, stars, forks, issues, visibility, and key status fields
 
 ## [14.6.2] - 2026-05-03
+
 ### Added
 
 - Added `statusLine.sessionAccent` to disable session-name accent coloring for the editor border and status line gap ([#918](https://github.com/can1357/oh-my-pi/issues/918))
@@ -13,8 +86,8 @@
 
 - Fixed SSH ControlMaster socket paths to use OpenSSH's connection hash (`%C`) so connections to the same host with different users, ports, or jump hosts do not share a master session.
 
-
 ## [14.6.1] - 2026-05-02
+
 ### Changed
 
 - Updated GitHub call headers to display operation-specific titles and contextual metadata such as repository, branch, issue/PR IDs, and search query snippets for supported operations
@@ -25,6 +98,7 @@
 - Fixed GitHub tool output fallbacks that previously always showed a GitHub Run Watch heading so they now show the actual operation and clear `no output`/`request failed` status messaging
 
 ## [14.6.0] - 2026-05-02
+
 ### Breaking Changes
 
 - Reworked autoresearch storage and protocol. State now lives in `~/.omp/autoresearch/<project>.db` (SQLite) and per-run logs in `~/.omp/autoresearch/<project>/runs/<id>/benchmark.log`. The repo-side artifacts `autoresearch.md`, `autoresearch.sh`, `autoresearch.checks.sh`, `autoresearch.program.md`, `autoresearch.ideas.md`, `autoresearch.jsonl`, `.autoresearch/`, and `autoresearch.config.json` are no longer read or written; they are deleted by `/autoresearch clear`. Any existing data is not migrated.
@@ -64,6 +138,7 @@
 - Fixed `log_experiment keep` silently dropping the iteration's diff on an autoresearch branch. The previous logic filtered out every path that was already dirty when `run_experiment` ran — but in the iteration cycle the agent's edits always land before `run_experiment`, so the entire iteration was filtered away and nothing was committed. On an autoresearch branch, `keep` now treats every currently-dirty path as the iteration's change and commits it.
 
 ## [14.5.14] - 2026-05-01
+
 ### Changed
 
 - Changed markdown conversion and archive tooling to defer loading heavy dependencies (Turndown, fflate, and browser agent content) until first use, reducing startup overhead for CLI startup and command initialization
@@ -105,6 +180,7 @@
 - Fixed eval startup messaging to report `eval` as unavailable when Python is unreachable and JavaScript backend is disabled
 
 ### Fixed
+
 - Stabilized MCP tool ordering so reconnects and refreshes no longer reorder the tools array sent to the model. Anthropic prompt caching is keyed on byte-identical tool definitions; previously, the order depended on connection sequence and a single MCP server reconnect could shuffle tools across servers and invalidate the tools cache breakpoint.
 - Skipped redundant system-prompt rebuilds in `AgentSession.refreshMCPTools` when the active tool set is unchanged. MCP transport flapping (e.g. routine 5-minute SSE reconnects) used to call `rebuildSystemPrompt` on every reconnect even though the resulting prompt was byte-identical, eating CPU and risking cache misses if the rebuild ever became non-deterministic. The applied-tool signature also covers `customWireName` so a wire-name flip with the rest of the tool metadata constant still forces a rebuild.
 
@@ -135,6 +211,7 @@
 - Fixed plan mode to auto-redirect `write` and `edit` calls targeting a bare `PLAN.md` (or any same-basename cwd-relative path) to the canonical `local://PLAN.md` plan artifact instead of rejecting them
 
 ## [14.5.11] - 2026-04-30
+
 ### Breaking Changes
 
 - `todo_write`: renamed `replace` op to `init` and reshaped its input to `list: [{phase: string, items: string[]}]`. Tasks no longer accept a `status` field; all start `pending` and the first auto-promotes to `in_progress`. The `append` op's `items` is now `string[]` (was `{id, label}[]`)
@@ -206,6 +283,7 @@
 - Fixed hash mismatch errors to include likely-shifted anchor hints when a unique matching line is found elsewhere in the file
 
 ## [14.5.8] - 2026-04-29
+
 ### Breaking Changes
 
 - Changed the task runner toggle from `just.enabled` to `runCommand.enabled`, so existing configurations using `just.enabled` must be migrated
@@ -231,12 +309,15 @@
 ### Fixed
 
 - Fixed hook editors to recognize Ctrl+Enter when terminals include NumLock or keypad Enter metadata.
+
 ## [14.5.6] - 2026-04-29
+
 ### Changed
 
 - Removed the atom edit mode's multi-anchor auto-rebase rejection so stale-but-uniquely-rebasable block edits apply with warnings instead of failing.
 
 ## [14.5.5] - 2026-04-29
+
 ### Breaking Changes
 
 - Rejected atom diffs with unrecognized operations (including lone '-' lines) by throwing parse errors instead of treating them as inserts
@@ -255,6 +336,7 @@
 - Fixed bracket-corruption caused by botched block rewrites by automatically removing a newly introduced duplicate adjacent line when removing it restores the original `{}`, `()`, and `[]` balance and by warning when automatic removal is unsafe
 
 ## [14.5.4] - 2026-04-28
+
 ### Breaking Changes
 
 - Changed the `atom` edit mode from JSON `{ path, edits }` calls to the compact file-oriented `input` patch language that was previously exposed as `atomd`; `atomd` is no longer a separate edit variant
@@ -308,6 +390,7 @@
 - Fixed `splice_block` for same-line `(` bodies so inline call sites like `int(port)` can be replaced correctly
 
 ## [14.5.2] - 2026-04-26
+
 ### Breaking Changes
 
 - Removed support for sed-style string expressions and required `sed` to be specified as an object with `pat` and `rep` (and optional `g`, `F`, `i` flags)
@@ -332,6 +415,7 @@
 - Removed the hand-rolled JSON unescape fallback in the streaming edit-arg renderer; partial fragments that fail `JSON.parse` are now surfaced raw rather than partially decoded with a non-spec-compliant unescaper that mishandled lone surrogates
 
 ## [14.4.3] - 2026-04-26
+
 ### Added
 
 - Added `irc` tool for agent-to-agent messaging with `list` and `send` operations, including optional broadcast to `all` and optional suppression of reply waits
@@ -351,6 +435,7 @@
 - Fixed `/btw` request replacement so issuing a new query cleanly aborts the previous active request
 
 ## [14.4.2] - 2026-04-26
+
 ### Breaking Changes
 
 - Changed `/todo append` from JSON payload input to `/todo append [<phase>] <task...>` with optional quoted tokens and automatic phase creation
@@ -388,6 +473,7 @@
 - Fixed `poll` wait duration parsing to fall back to `30s` when the provided value is an empty string
 
 ## [14.4.1] - 2026-04-26
+
 ### Breaking Changes
 
 - Replaced the legacy `gh_repo_view`, `gh_issue_view`, `gh_pr_view`, `gh_pr_diff`, `gh_pr_checkout`, `gh_pr_push`, `gh_run_watch`, `gh_search_issues`, and `gh_search_prs` tool names with only `github`, which requires updating existing callers that invoked the old `gh_*` tools
@@ -589,6 +675,7 @@
 
 - Fixed task calls in `schema-free` and `independent` modes to return clear mode-specific errors when disallowed `context` or `schema` inputs are provided
 - Fixed newly generated session IDs to use UUIDv7 for new, forked, and branched sessions while preserving resumed session IDs
+
 ## [14.1.1] - 2026-04-14
 
 ### Breaking Changes
@@ -630,7 +717,7 @@
 - Changed Vim page-scroll commands `C-f`, `C-b`, `C-u`, and `C-d` to move in viewport-height based increments instead of fixed constants
 - Changed `z` command behavior so `zt`, `zb`, and `z.` now align cursor movement to first non-blank in the line
 - Changed `:g`/`:v` global command handling to process matching lines safely by working in reverse order and preserving file structure
-- Changed vim tab breadcrumb rendering from ` → ` to `→` in the editor view
+- Changed vim tab breadcrumb rendering from `→` to `→` in the editor view
 - Changed custom tool and task execution contexts to no longer expose a shared `searchDb` accessor, removing direct access to native grep/glob/fuzzyFind search backends from extension callbacks
 - Changed the `task` tool `schema` field to require JSON-encoded JTD schema text instead of a schema object, matching prompt guidance and task-subagent invocation
 - Changed chunk edit payloads to encode selectors as `path: "file:selector"` and updated chunk tool guidance and examples to match
@@ -664,6 +751,7 @@
 - Fixed retained Python kernel ownership so `AgentSession.dispose()` only shuts down kernels owned by that session, including warmup-created kernels
 
 ## [14.1.0] - 2026-04-11
+
 ### Added
 
 - Added richer tool rendering details in session export HTML, including metadata badges, argument formatting, and todo task tree styling for exported tool and workflow messages
@@ -705,6 +793,7 @@
 - Blocked destructive SQL execution in read-mode SQLite access by using read-only connections and rejecting bound-parameter raw SQL
 
 ## [14.0.5] - 2026-04-11
+
 ### Added
 
 - Added `designer` model role for UI/UX design tasks with Gemini 3.1 Pro as default model
@@ -751,6 +840,7 @@
 - Fixed MCP config docs and schema to use `~/.omp/agent/mcp.json` for user-scoped OMP-native MCP config while keeping project config at `<cwd>/.omp/mcp.json`
 
 ## [14.0.4] - 2026-04-10
+
 ### Added
 
 - Added `PI_CHUNK_AUTOINDENT` environment variable to control whether chunk read/edit tools normalize indentation to canonical tabs or preserve literal file whitespace
@@ -777,6 +867,7 @@
 - Fixed cached Ollama discovery rows so upgraded installs switch to the OpenAI Responses transport instead of staying on the old completions transport
 
 ## [14.0.2] - 2026-04-09
+
 ### Added
 
 - Added `/force` slash command to force the next agent turn to use a specific tool

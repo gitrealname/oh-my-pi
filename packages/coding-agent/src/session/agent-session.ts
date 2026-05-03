@@ -102,6 +102,7 @@ import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import {
 	buildDiscoverableMCPSearchIndex,
@@ -111,6 +112,7 @@ import {
 	isMCPToolName,
 	selectDiscoverableMCPToolNamesByServer,
 } from "../mcp/discoverable-tool-metadata";
+import { resolveMemoryBackend } from "../memory-backend";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
@@ -192,7 +194,8 @@ export type AgentSessionEvent =
 	| { type: "ttsr_triggered"; rules: Rule[] }
 	| { type: "todo_reminder"; todos: TodoItem[]; attempt: number; maxAttempts: number }
 	| { type: "todo_auto_clear" }
-	| { type: "irc_message"; message: CustomMessage };
+	| { type: "irc_message"; message: CustomMessage }
+	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -561,6 +564,7 @@ export class AgentSession {
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 
 	#startPowerAssertion(): void {
 		if (process.platform !== "darwin") {
@@ -700,6 +704,16 @@ export class AgentSession {
 		return this.#providerSessionState;
 	}
 
+	getHindsightSessionState(): HindsightSessionState | undefined {
+		return this.#hindsightSessionState;
+	}
+
+	setHindsightSessionState(state: HindsightSessionState | undefined): HindsightSessionState | undefined {
+		const previous = this.#hindsightSessionState;
+		this.#hindsightSessionState = state;
+		return previous;
+	}
+
 	/** TTSR manager for time-traveling stream rules */
 	get ttsrManager(): TtsrManager | undefined {
 		return this.#ttsrManager;
@@ -740,6 +754,19 @@ export class AgentSession {
 		for (const l of listeners) {
 			l(event);
 		}
+	}
+
+	/**
+	 * Emit a UI-only notice to the session. Surfaces in interactive mode as a
+	 * `showWarning` / `showError` / `showStatus` line; non-interactive modes
+	 * receive the event through the normal subscribe stream.
+	 *
+	 * Notices are NOT added to agent state and never reach the LLM — use this
+	 * for out-of-band conditions the user should see but the model shouldn't
+	 * react to (e.g. background queue flush failures).
+	 */
+	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void {
+		this.#emit({ type: "notice", level, message, source });
 	}
 
 	#queuedExtensionEvents: Promise<void> = Promise.resolve();
@@ -1949,6 +1976,22 @@ export class AgentSession {
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 	}
 
+	/** Keep Hindsight metadata aligned when the underlying agent session id changes. */
+	#rekeyHindsightMemoryForCurrentSessionId(): void {
+		if (resolveMemoryBackend(this.settings).id !== "hindsight") return;
+		const sid = this.agent.sessionId;
+		if (!sid) return;
+		this.getHindsightSessionState()?.setSessionId(sid);
+	}
+
+	/** New session file: reset auto-recall / retain-threshold counters for the new transcript. */
+	#resetHindsightConversationTrackingIfHindsight(): void {
+		if (resolveMemoryBackend(this.settings).id !== "hindsight") return;
+		const state = this.getHindsightSessionState();
+		if (!state || state.aliasOf) return;
+		state.resetConversationTracking();
+	}
+
 	/**
 	 * Remove all listeners, flush pending writes, and disconnect from agent.
 	 * Call this when completely done with the session.
@@ -1979,6 +2022,9 @@ export class AgentSession {
 		this.#stopPowerAssertion();
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
+		const hindsightState = this.setHindsightSessionState(undefined);
+		await hindsightState?.flushRetainQueue();
+		hindsightState?.dispose();
 		this.#disconnectFromAgent();
 		this.#eventListeners = [];
 	}
@@ -2287,6 +2333,23 @@ export class AgentSession {
 			.map(name => this.#toolRegistry.get(name))
 			.filter((tool): tool is AgentTool => tool != null);
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
+	}
+
+	async #buildSystemPromptForAgentStart(promptText: string): Promise<string> {
+		const backend = resolveMemoryBackend(this.settings);
+		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
+
+		try {
+			const injected = await backend.beforeAgentStartPrompt(this, promptText);
+			if (!injected) return this.#baseSystemPrompt;
+			return `${this.#baseSystemPrompt}\n\n${injected}`;
+		} catch (err) {
+			logger.debug("Memory backend beforeAgentStartPrompt failed", {
+				backend: backend.id,
+				error: String(err),
+			});
+			return this.#baseSystemPrompt;
+		}
 	}
 
 	/**
@@ -2908,12 +2971,14 @@ export class AgentSession {
 				messages.push(...fileMentionMessages);
 			}
 
+			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
+
 			// Emit before_agent_start extension event
 			if (this.#extensionRunner) {
 				const result = await this.#extensionRunner.emitBeforeAgentStart(
 					expandedText,
 					options?.images,
-					this.#baseSystemPrompt,
+					beforeAgentStartSystemPrompt,
 				);
 				if (result?.messages) {
 					const promptAttribution: "user" | "agent" | undefined =
@@ -2934,8 +2999,10 @@ export class AgentSession {
 				if (result?.systemPrompt !== undefined) {
 					this.agent.setSystemPrompt(result.systemPrompt);
 				} else {
-					this.agent.setSystemPrompt(this.#baseSystemPrompt);
+					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
 				}
+			} else {
+				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
 			}
 
 			// Bail out if a newer abort/prompt cycle has started since we began setup
@@ -3590,6 +3657,8 @@ export class AgentSession {
 		await this.sessionManager.newSession(options);
 		this.setTodoPhases([]);
 		this.agent.sessionId = this.sessionManager.getSessionId();
+		this.#rekeyHindsightMemoryForCurrentSessionId();
+		this.#resetHindsightConversationTrackingIfHindsight();
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.#pendingNextTurnMessages = [];
@@ -3683,6 +3752,7 @@ export class AgentSession {
 
 		// Update agent session ID
 		this.agent.sessionId = this.sessionManager.getSessionId();
+		this.#rekeyHindsightMemoryForCurrentSessionId();
 
 		// Emit session_switch event with reason "fork" to hooks
 		if (this.#extensionRunner) {
@@ -4118,6 +4188,11 @@ export class AgentSession {
 				preserveData = result?.preserveData;
 			}
 
+			const memoryBackendContext = await this.#collectMemoryBackendContext(preparation);
+			if (memoryBackendContext) {
+				hookContext = hookContext ? [...hookContext, memoryBackendContext] : [memoryBackendContext];
+			}
+
 			let summary: string;
 			let shortSummary: string | undefined;
 			let firstKeptEntryId: string;
@@ -4201,6 +4276,32 @@ export class AgentSession {
 				this.#compactionAbortController = undefined;
 			}
 			this.#reconnectToAgent();
+		}
+	}
+
+	/**
+	 * Ask the active memory backend for an extra-context block to splice into
+	 * the compaction summary prompt. Both the manual and auto compaction paths
+	 * funnel through this helper so the behaviour stays identical.
+	 *
+	 * Failures are swallowed: a memory backend going sideways MUST NOT block
+	 * compaction (which is itself the recovery path for context overflow).
+	 */
+	async #collectMemoryBackendContext(preparation: {
+		messagesToSummarize: AgentMessage[];
+		turnPrefixMessages: AgentMessage[];
+	}): Promise<string | undefined> {
+		const backend = resolveMemoryBackend(this.settings);
+		if (!backend.preCompactionContext) return undefined;
+		const messages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
+		try {
+			return await backend.preCompactionContext(messages, this.settings, this);
+		} catch (err) {
+			logger.debug("Memory backend preCompactionContext failed", {
+				backend: backend.id,
+				error: String(err),
+			});
+			return undefined;
 		}
 	}
 
@@ -4358,6 +4459,8 @@ export class AgentSession {
 			await this.sessionManager.newSession(previousSessionFile ? { parentSession: previousSessionFile } : undefined);
 			this.agent.reset();
 			this.agent.sessionId = this.sessionManager.getSessionId();
+			this.#rekeyHindsightMemoryForCurrentSessionId();
+			this.#resetHindsightConversationTrackingIfHindsight();
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
@@ -5188,6 +5291,11 @@ export class AgentSession {
 				hookContext = result?.context;
 				hookPrompt = result?.prompt;
 				preserveData = result?.preserveData;
+			}
+
+			const memoryBackendContext = await this.#collectMemoryBackendContext(preparation);
+			if (memoryBackendContext) {
+				hookContext = hookContext ? [...hookContext, memoryBackendContext] : [memoryBackendContext];
 			}
 
 			let summary: string;
@@ -6499,6 +6607,7 @@ export class AgentSession {
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.agent.sessionId = this.sessionManager.getSessionId();
+			this.#rekeyHindsightMemoryForCurrentSessionId();
 
 			const sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
@@ -6568,11 +6677,15 @@ export class AgentSession {
 					? undefined
 					: configuredServiceTier;
 
+			if (switchingToDifferentSession) {
+				this.#resetHindsightConversationTrackingIfHindsight();
+			}
 			this.#reconnectToAgent();
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
 			this.agent.sessionId = previousSessionState.sessionId;
+			this.#rekeyHindsightMemoryForCurrentSessionId();
 			let restoreMcpError: unknown;
 			try {
 				await this.#restoreMCPSelectionsForSessionContext(previousSessionContext, {
@@ -6664,6 +6777,8 @@ export class AgentSession {
 		}
 		this.#syncTodoPhasesFromBranch();
 		this.agent.sessionId = this.sessionManager.getSessionId();
+		this.#rekeyHindsightMemoryForCurrentSessionId();
+		this.#resetHindsightConversationTrackingIfHindsight();
 
 		// Reload messages from entries (works for both file and in-memory mode)
 		const sessionContext = this.buildDisplaySessionContext();

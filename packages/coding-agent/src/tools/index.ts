@@ -3,11 +3,11 @@ import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async";
 import type { PromptTemplate } from "../config/prompt-templates";
-import type { Settings, SettingPath } from "../config/settings";
-import { SETTINGS_SCHEMA } from "../config/settings-schema";
+import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
+import type { HindsightSessionState } from "../hindsight/state";
 import type { InternalUrlRouter } from "../internal-urls";
 import { LspTool } from "../lsp";
 import type { DiscoverableMCPSearchIndex, DiscoverableMCPTool } from "../mcp/discoverable-tool-metadata";
@@ -32,6 +32,9 @@ import { EvalTool } from "./eval";
 import { ExitPlanModeTool } from "./exit-plan-mode";
 import { FindTool } from "./find";
 import { GithubTool } from "./gh";
+import { HindsightRecallTool } from "./hindsight-recall";
+import { HindsightReflectTool } from "./hindsight-reflect";
+import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
@@ -72,6 +75,9 @@ export * from "./eval";
 export * from "./exit-plan-mode";
 export * from "./find";
 export * from "./gh";
+export * from "./hindsight-recall";
+export * from "./hindsight-reflect";
+export * from "./hindsight-retain";
 export * from "./image-gen";
 export * from "./inspect-image";
 export * from "./irc";
@@ -138,6 +144,8 @@ export interface ToolSession {
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Get Hindsight runtime state for this agent session. */
+	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
@@ -236,6 +244,9 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	web_search: s => new WebSearchTool(s),
 	search_tool_bm25: SearchToolBm25Tool.createIf,
 	write: s => new WriteTool(s),
+	retain: HindsightRetainTool.createIf,
+	recall: HindsightRecallTool.createIf,
+	reflect: HindsightReflectTool.createIf,
 };
 
 export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
@@ -347,6 +358,11 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		) {
 			requestedTools.push("recipe");
 		}
+		if (session.settings.get("memory.backend") === "hindsight") {
+			for (const name of ["recall", "retain", "reflect"]) {
+				if (!requestedTools.includes(name)) requestedTools.push(name);
+			}
+		}
 	}
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
@@ -370,13 +386,16 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
 		if (name === "irc") return session.settings.get("irc.enabled");
 		if (name === "recipe") return session.settings.get("recipe.enabled");
+		if (name === "retain" || name === "recall" || name === "reflect") {
+			return session.settings.get("memory.backend") === "hindsight";
+		}
 		if (name === "task") {
 			const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;
 			const currentDepth = session.taskDepth ?? 0;
 			return maxDepth < 0 || currentDepth < maxDepth;
 		}
-		const enabledSetting = `${name}.enabled` as SettingPath;
-		if (enabledSetting in SETTINGS_SCHEMA) return session.settings.get(enabledSetting) !== false;
+		if (name === "mbrowser") return session.settings.get("mbrowser.enabled");
+		if (name === "mreview") return session.settings.get("mreview.enabled");
 		return true;
 	};
 	if (includeYield && requestedTools && !requestedTools.includes("yield")) {
