@@ -122,13 +122,35 @@ Files:
 - `packages/coding-agent/src/tools/mreview/mreview-ui.html` -- custom review SPA (sidecar next to omp.exe)
 - `packages/coding-agent/src/tools/mreview/index.ts` -- orchestration, path resolution
 - `packages/coding-agent/src/tools/mreview/server.ts` -- node:http server, AI routing, endpoints
+- `packages/coding-agent/src/tools/mreview/tool.ts` -- MReviewTool: emits SCHEDULE_SLASH_CHANNEL and returns immediately
 - `packages/coding-agent/src/slash-commands/builtin-registry.ts` -- /mreview entry + agent context injection
 - `packages/coding-agent/src/config/settings-schema.ts` -- mreview.enabled, mreview.browser
-- `packages/coding-agent/src/prompt-engine/prompt-loader.ts` -- mreview/review/discuss in RESERVED_NAMES
-- `docs/skills/mreview/SKILL.md` -- optional companion skill (copy to ~/.omp/agent/skills/mreview/)
+- `packages/coding-agent/src/prompt-engine/prompt-loader.ts` -- mreview in RESERVED_NAMES
+- `packages/coding-agent/src/utils/event-bus.ts` -- SCHEDULE_SLASH_CHANNEL generic mechanism
+- `packages/coding-agent/src/modes/interactive-mode.ts` -- SCHEDULE_SLASH_CHANNEL subscriber
 
 Deploy note: `mreview-ui.html` must be placed next to `omp.exe` (not embedded in the binary).
 Bundle script handles this automatically.
+
+### 9. SCHEDULE_SLASH_CHANNEL (generic tool-to-TUI slash scheduling)
+
+Any tool can schedule a slash command to run after its turn completes by emitting on
+`SCHEDULE_SLASH_CHANNEL` via `this.#session.eventBus`. The TUI subscriber in
+`interactive-mode.ts` calls `session.waitForIdle()` before firing `editor.onSubmit(command)`,
+ensuring the slash command only executes after the agent is fully silent -- all post-turn
+work drained (auto-compaction, TTSR restarts, retry) -- not just after `agent_end`.
+
+This solves the AgentBusyError that occurs when a tool tries to open an interactive
+UI (browser, etc.) and simultaneously handle AI chat: tool returns immediately,
+agent goes idle, then the slash command runs with full session availability.
+
+Idle signal: `AgentSession.waitForIdle()` awaits `agent.waitForIdle()` (resolves after
+`agent_end`) then drains `#waitForPostPromptRecovery()` (retries, TTSR, compaction tasks).
+If the event arrives when the agent is already idle, `waitForIdle()` resolves immediately.
+
+Files:
+- `packages/coding-agent/src/utils/event-bus.ts` -- SCHEDULE_SLASH_CHANNEL constant + docs
+- `packages/coding-agent/src/modes/interactive-mode.ts` -- subscriber: waitForIdle then onSubmit
 
 ## Config Surface
 

@@ -1,14 +1,20 @@
-import { existsSync, readFileSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, resolve as resolvePath } from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 import type { ToolSession } from "..";
-import { openMReviewSession } from "./index";
+import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { toolResult } from "../tool-result";
 
 const schema = Type.Object({
 	file_path: Type.String({ description: "Absolute path to the markdown file to review" }),
 });
+
+// Debounce guard: prevents re-entry if the same file was scheduled within the last 10 seconds.
+// This breaks the potential infinite loop where the slash command's synthetic context injection
+// causes the agent to call this tool again for the same file.
+const DEBOUNCE_MS = 10_000;
+const recentCalls = new Map<string, number>();
 
 export class MReviewTool implements AgentTool<typeof schema> {
 	name = "mreview" as const;
@@ -20,8 +26,10 @@ export class MReviewTool implements AgentTool<typeof schema> {
 		"- User types .review\n" +
 		"</conditions>\n\n" +
 		"<critical>\n" +
-		"- file_path is **required** \u2014 **MUST NOT** call with an empty argument object {}\n" +
+		"- file_path is **required** - **MUST NOT** call with an empty argument object {}\n" +
 		"- file_path **MUST** be an absolute path\n" +
+		"- After this tool returns, **do NOT generate any response** - stay completely silent.\n" +
+		"  The TUI handles opening the review UI internally after the turn completes.\n" +
 		"</critical>";
 	parameters = schema;
 	#session: ToolSession;
@@ -45,41 +53,15 @@ export class MReviewTool implements AgentTool<typeof schema> {
 		if (!existsSync(filePath)) {
 			return toolResult().text(`File not found: ${filePath}`).done();
 		}
-
-		let markdown: string;
-		try {
-			markdown = readFileSync(filePath, "utf-8");
-		} catch {
-			return toolResult().text(`Cannot read file: ${filePath}`).done();
+		// Debounce: if same file was scheduled within 10s, this is a re-entry from the
+		// slash command's synthetic context injection — return silently to break the loop.
+		const lastCall = recentCalls.get(filePath);
+		if (lastCall !== undefined && Date.now() - lastCall < DEBOUNCE_MS) {
+			return toolResult().text("").done();
 		}
-
-		const openInBrowser = (url: string) => {
-			try {
-				Bun.spawn(["cmd.exe", "/c", "start", "", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-			} catch {}
-		};
-
-		const result = await openMReviewSession(
-			{
-				cwd: this.#session.cwd,
-				openInBrowser,
-				showStatus: () => {},
-				showWarning: () => {},
-			},
-			filePath,
-			markdown,
-			{}, // no agent — AI chat disabled in tool mode
-		);
-
-		if (result.exit) {
-			return toolResult().text("User closed the review without submitting comments.").done();
-		}
-		if (result.approved) {
-			return toolResult().text("User approved the document without comments.").done();
-		}
-		if (result.feedback?.trim()) {
-			return toolResult().text(result.feedback.trim()).done();
-		}
-		return toolResult().text("Review completed with no comments.").done();
+		recentCalls.set(filePath, Date.now());
+		// Schedule /mreview to run after this turn ends (agent idle = AI chat works).
+		this.#session.eventBus?.emit(SCHEDULE_SLASH_CHANNEL, `/mreview ${filePath}`);
+		return toolResult().text(`Opening ${basename(filePath)} for review...`).done();
 	}
 }

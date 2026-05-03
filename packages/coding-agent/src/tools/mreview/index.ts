@@ -38,24 +38,15 @@ import { startMReviewServer } from "./server";
 export type { MReviewDecision } from "./server";
 
 const MREVIEW_UI_PATH = (() => {
-  const exeDir = resolvePath(process.execPath, "..");
-  const exeCandidate = resolvePath(exeDir, "mreview-ui.html");
-  if (existsSync(exeCandidate)) return exeCandidate;
-  return fileURLToPath(new URL("./mreview-ui.html", import.meta.url));
+	const exeDir = resolvePath(process.execPath, "..");
+	const exeCandidate = resolvePath(exeDir, "mreview-ui.html");
+	if (existsSync(exeCandidate)) return exeCandidate;
+	return fileURLToPath(new URL("./mreview-ui.html", import.meta.url));
 })();
 
-const MREVIEW_HTML_PATH = (() => {
-  // In compiled binaries, import.meta.url points to $bunfs — resolve next to the exe instead
-  const exeDir = resolvePath(process.execPath, "..");
-  const exeCandidate = resolvePath(exeDir, "review-editor.html");
-  if (existsSync(exeCandidate)) return exeCandidate;
-  // Dev mode: resolve relative to source
-  return fileURLToPath(new URL("./review-editor.html", import.meta.url));
-})();
-
-/** Returns true if the review-editor.html asset is present. */
+/** Returns true if the mreview-ui.html sidecar is present. */
 export function hasMReviewHtml(): boolean {
-  return existsSync(MREVIEW_UI_PATH) || existsSync(MREVIEW_HTML_PATH);
+	return existsSync(MREVIEW_UI_PATH);
 }
 
 /**
@@ -101,9 +92,10 @@ export async function openMReviewSession(
   filePath: string,
   markdown: string,
   config: MReviewConfig = {},
+  signal?: AbortSignal,
 ): Promise<import("./server").MReviewDecision> {
-  const uiPath = existsSync(MREVIEW_UI_PATH) ? MREVIEW_UI_PATH : MREVIEW_HTML_PATH;
-  const htmlContent = readFileSync(uiPath, "utf-8");
+	const uiPath = MREVIEW_UI_PATH;
+	const htmlContent = readFileSync(uiPath, "utf-8");
   const server = await startMReviewServer({
     markdown,
     filePath,
@@ -112,8 +104,11 @@ export async function openMReviewSession(
     agent: config.agent,
   });
 
+  // Stop server immediately if the tool is aborted
+  signal?.addEventListener("abort", () => server.stop(), { once: true });
+
   ctx.openInBrowser(server.url);
-  ctx.showStatus(`mreview: opened ${server.url} — waiting for feedback (close browser tab or hit Exit to cancel)...`);
+  ctx.showStatus(`mreview: opened ${server.url} - waiting for feedback (close browser tab or hit Exit to cancel)...`);
 
   const decision = await server.waitForDecision();
 
