@@ -52,16 +52,38 @@ const HARD_TIMEOUT_GRACE_MS = 5_000;
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
 
+const IS_WINDOWS = process.platform === "win32";
+
 async function resolveShellCwd(cwd: string | undefined): Promise<string | undefined> {
 	if (!cwd) return undefined;
 
 	try {
 		// Brush preserves the working directory string verbatim, so resolve symlinks
 		// up front to keep `pwd` aligned with tools like `git worktree list`.
-		return await fs.realpath(cwd);
+		const real = await fs.realpath(cwd);
+		return IS_WINDOWS ? normalizeCwdForWindows(real) : real;
 	} catch {
-		return cwd;
+		return IS_WINDOWS ? normalizeCwdForWindows(cwd) : cwd;
 	}
+}
+
+/**
+ * On Windows, Git Bash maps `/dev/null` to `<drive>:/dev/null` when the
+ * redirect is processed by the Bun/brush runtime layer rather than the shell
+ * itself. Rewrite shell-style null-device references to the Windows `NUL`
+ * device so the redirect is always handled correctly.
+ *
+ * Also normalises backslashes in the cwd to forward slashes so Git Bash
+ * receives a POSIX-style path rather than a Windows path.
+ */
+function normalizeCommandForWindows(command: string): string {
+	// Replace > /dev/null and 2>/dev/null (and variants with spaces) with NUL
+	return command.replace(/\b(2\s*>|>\s*)\/dev\/null\b/g, (_, prefix) => `${prefix}NUL`);
+}
+
+function normalizeCwdForWindows(cwd: string): string {
+	// Convert backslashes to forward slashes for Git Bash
+	return cwd.replace(/\\/g, "/");
 }
 
 function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerOptions | undefined {
@@ -85,9 +107,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const commandCwd = await resolveShellCwd(options?.cwd);
 	const commandEnv = options?.env ? { ...NON_INTERACTIVE_ENV, ...options.env } : NON_INTERACTIVE_ENV;
 
-	// Apply command prefix if configured
+	// Apply command prefix if configured; on Windows normalise /dev/null → NUL
 	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
-	const finalCommand = prefixedCommand;
+	const finalCommand = IS_WINDOWS ? normalizeCommandForWindows(prefixedCommand) : prefixedCommand;
 
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({
