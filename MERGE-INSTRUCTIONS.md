@@ -2,7 +2,7 @@
 
 When merging upstream `main` into `aws-corp`, follow this checklist.
 
-Current merge base: `ae7c4100c` (v14.5.14)
+Current merge base: `c533b1820` (v14.6.2)
 
 ---
 
