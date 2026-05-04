@@ -154,6 +154,213 @@ waiting for context to accumulate.
 
 ---
 
+
+## Query Examples and Processing Paths
+
+Each scenario below shows what triggers the memory system, what query is built,
+and how the result flows back into the session.
+
+---
+
+### 1. Session starts — auto-recall
+
+**Trigger:** `before_agent_start` fires on the first agent turn.
+
+**What happens:**
+```
+User types: "Continue the refactor from yesterday."
+
+Extension reads last 3 turns of prior context (retainContextTurns=3)
+  → composeRecallQuery("Continue the refactor from yesterday.", messages, 3)
+  → builds: "Prior context:\nassistant: ...\nuser: ...\n\nContinue the refactor from yesterday."
+  → truncateRecallQuery(..., 2000) — trims oldest context lines if over 2000 chars
+  → query sent to Python server
+
+Python server:
+  1. Embeds query with BAAI/bge-small-en-v1.5
+  2. Parallel: cosine similarity against vectors.safetensors
+                BM25 keyword search against chunks.json
+  3. RRF merge → recency decay → facts.json keyword overlap (1.2×)
+                              → observations.json keyword overlap (1.5×)
+  4. Returns top-10 chunks/facts/observations sorted by score
+
+Extension injects into system prompt:
+  <memories>
+  Found 5 relevant memories:
+  • User: What's the status of the auth refactor? Assistant: ... (score: 0.821)
+  • ...
+  </memories>
+```
+
+**Slash equivalent:** `/mmemory recall Continue the refactor from yesterday.`
+Difference: slash command prompts the agent with the result as a user message
+(visible in conversation). Auto-recall injects silently into the system prompt.
+
+---
+
+### 2. `.memory` shortcut — direct memory steering
+
+**User types:** `.memory what error patterns did we hit with the DB connection pool?`
+
+**What happens:**
+```
+Extension intercepts in before_agent_start (prefix check before turnCount++)
+Injects into system prompt:
+  <memory_mode>
+  Direct memory request. Use mmemory_recall, mmemory_retain, or mmemory_reflect
+  immediately based on the user's intent.
+  Query: what error patterns did we hit with the DB connection pool?
+  </memory_mode>
+
+Agent reads the directive, immediately calls mmemory_recall tool with that query.
+Tool response surfaces in the conversation as a tool result (visible).
+```
+
+**Slash equivalent:** `/mmemory recall what error patterns did we hit with the DB connection pool?`
+Difference: `.memory` steers the agent to use the tool in the same turn as the query.
+`/mmemory recall` injects the result as a user message before any agent turn starts.
+
+---
+
+### 3. `mmemory_recall` tool — agent-initiated recall
+
+**Agent calls:** `mmemory_recall(query="retry policy for outbound HTTP calls")`
+
+**What happens:**
+```
+Tool calls executeMemoryRecall("retry policy for outbound HTTP calls", undefined, config)
+  → same Python server pipeline as auto-recall (embed → BM25+semantic → RRF → facts → observations)
+  → no deadline timeout (tool call blocks until result)
+  → result returned as tool output text (visible in conversation)
+  → agent can reason over the returned chunks and cite them
+```
+
+**Slash equivalent:** `/mmemory recall retry policy for outbound HTTP calls`
+Difference: tool call happens mid-conversation when agent decides it needs memory.
+Slash command is a user-initiated inject at conversation start.
+
+---
+
+### 4. `mmemory_reflect` tool — synthesis over a topic
+
+**Agent calls:** `mmemory_reflect(query="authentication architecture decisions")`
+
+**What happens:**
+```
+executeMemoryReflect fetches 2× recallLimit chunks (broader sweep than recall)
+Returns to agent as a synthesis prompt:
+  Project memory synthesis for: "authentication architecture decisions"
+  Mission context: Focus on technical decisions...
+
+  Found 12 relevant memories:
+  • ...
+
+  Based on the above project memories, synthesize a concise answer to:
+  authentication architecture decisions
+
+Agent receives this as the tool result and synthesizes its response from the
+provided chunks — the agent's LLM does the synthesis work, not a separate model call.
+```
+
+**Slash equivalent:** `/mmemory reflect authentication architecture decisions`
+Difference: same processing path, but slash command injects into a new agent turn.
+
+---
+
+### 5. `mmemory_retain` tool — explicit memory note
+
+**Agent calls:** `mmemory_retain(content="Decided to use exponential backoff with jitter for all outbound retry logic. Max 3 retries, base 2s, cap 30s. Rationale: avoids thundering-herd on downstream failure.")`
+
+**What happens:**
+```
+executeMemoryRetain:
+  1. Strips <memories>/<mental_models> tags from content (anti-feedback)
+  2. Writes YYYYMMDD-HHMMSS-note-<id>.md to queue/
+  3. Fires executeMemoryBuild (background, fire-and-forget)
+
+Python server (background):
+  1. Reads queue/*.md, chunks at turn boundaries
+  2. Hashes each chunk; skips if already in chunks.json
+  3. Embeds new chunks, appends to chunks.json, extends vectors.safetensors
+  4. Deletes processed .md files
+
+If extractionMode=structured, extractFromTranscript also fires:
+  5. LLM (modelRole) extracts {fact, entities[], date} JSON from content
+  6. Deduplicates against facts.json, writes atomically
+```
+
+Note: tool-initiated retains write unique filenames (timestamp-note-id).
+Auto-retain from agent_end uses a fixed filename per session (overwrites on repeat).
+
+---
+
+### 6. Auto-retain on agent_end
+
+**Trigger:** Every `retainEveryNTurns` (default 3) agent turns, `agent_end` fires.
+
+**What happens:**
+```
+state.turnCount - state.lastRetainedTurn >= 3
+  → buildTranscript(messages, retainContextTurns=3, maxTranscriptChars=0)
+    → strips <memories>/<mental_models> from every message
+    → formats as **User:** / **Assistant:** pairs separated by ---
+    → if maxTranscriptChars > 0: drops oldest turns until fits
+  → writes YYYYMMDD-HHMMSS-<sessionId>.md to queue/  (overwrites prior retain file)
+  → triggers background build
+  → if extractionMode=structured: fires extractFromTranscript (background LLM call)
+```
+
+No slash equivalent — this is fully automatic.
+To force: `/mmemory enqueue` (currently just shows a status message;
+a future implementation would call retainSession immediately).
+
+---
+
+### 7. Compaction — memory context injection
+
+**Trigger:** `session.compacting` fires when the context window fills.
+
+**What happens:**
+```
+session.compacting handler (NOT a retain — does not write to queue/):
+  1. Finds first user message in compaction window
+  2. composeRecallQuery + truncateRecallQuery from those messages
+  3. executeMemoryRecall → same server pipeline
+  4. Returns { context: ["<memories>..."] } injected into compaction summary prompt
+
+The compaction model (not the agent) receives project memories as context.
+This means the summarised context carries forward memory-relevant framing.
+No retain happens here — the session is mid-flight.
+Auto-retain at agent_end will capture the full session when it completes.
+```
+
+**There is no slash equivalent** — compaction is automatic.
+If you want to checkpoint memory before a long session, call
+`mmemory_retain` explicitly or use `.memory retain <key decision>`.
+
+---
+
+### 8. `/mmemory consolidate` — facts → observations
+
+**User types:** `/mmemory consolidate`
+
+**What happens:**
+```
+mmemoryHandler reads config.maxRawFacts (default 100)
+  → loadFacts: reads facts.json → count
+  → if count < threshold: status "only N facts, run more sessions first"
+  → if count >= threshold:
+      builds consolidation prompt with all facts as JSON
+      runtime.ctx.session.agent.prompt(consolidationTask)
+      agent replies with JSON array of {observation, entities[], date}
+      executeMemoryConsolidate writes observations.json atomically
+
+On next recall: observations rank above facts (1.5×) and above raw chunks.
+```
+
+**Variant:** `/mmemory consolidate --max-facts 20` — lower threshold for testing.
+After consolidation, run `/mmemory mm regenerate` to refresh mental model files.
+
 ## Subagent Behaviour
 
 Subagents (`task` tool calls) have `taskDepth > 0`. The mmemory extension returns
@@ -188,18 +395,34 @@ Phase 2 was completed 2026-05-03 against the `aws-corp` branch.
 
 ---
 
-## Phase 3 — Roadmap
+## Phase 3 — Implemented
 
-See `.mmemory-phase3-todo.md` (repo root) for the full checklist. Summary:
+Phase 3 was completed 2026-05-03 against the `aws-corp` branch.
 
-| Item | Trigger |
+| Item | Detail |
 |---|---|
-| LLM extraction (`{fact, entities[], date}`) | >30 sessions, quality degrading |
-| Consolidation + mental models | After extraction; `/mmemory consolidate` |
-| Recall query composition | Port Hindsight's multi-turn query builder |
-| Assistant truncation removal | Remove 1000-char cap in `buildTranscript()` |
-| Dual-system unification | Extension owns all state; tools are thin wrappers |
+| LLM extraction | `executeMemoryExtract` + `loadFacts`; `extractionMode: structured` active; facts merged into recall with 1.2× score |
+| Consolidation | `executeMemoryConsolidate` + `loadObservations`; `/mmemory consolidate [--max-facts N]`; observations merged with 1.5× score |
+| Mental models | `executeMemoryMentalModelSeed`; `/mmemory mm list` / `/mmemory mm regenerate`; `<mental_models>` block injected at session start |
+| Recall query composition | `composeRecallQuery` + `truncateRecallQuery` ported from Hindsight; `retainContextTurns` default 3 |
+| Assistant truncation removal | `maxTranscriptChars: 0` (unlimited); config key drops oldest turns first when > 0 |
+| Dual-system unification | `getMmemorySessionConfig(ctx)` exported; full tool wiring deferred (ToolSession has no `ctx` field) |
 
+**New config keys (Phase 3):**
+
+| Key | Default | Description |
+|---|---|---|
+| `maxRawFacts` | `100` | Facts threshold before `/mmemory consolidate` offers to run |
+| `recallMaxQueryChars` | `2000` | Max chars in composed recall query; oldest context dropped first |
+| `maxTranscriptChars` | `0` | Max chars in retained transcript; `0` = unlimited |
+
+**New slash commands:**
+
+| Command | Description |
+|---|---|
+| `/mmemory consolidate [--max-facts N]` | Consolidate `facts.json` → `observations.json` via LLM |
+| `/mmemory mm list` | List `mental_models/*.md` files with last-modified times |
+| `/mmemory mm regenerate` | Re-run all three seed passes (user-preferences, project-conventions, project-decisions) |
 ---
 
 ## Troubleshooting

@@ -39,6 +39,9 @@ export class MmemoryRecallTool implements AgentTool<typeof schema> {
 		signal?: AbortSignal,
 	): Promise<AgentToolResult> {
 		return untilAborted(signal, async () => {
+			// TODO(wiring): use getMmemorySessionConfig(this.session.ctx) here once ToolSession
+			// exposes a `ctx: ExtensionContext` field — avoids re-reading settings on every call.
+			// See mmemory-extension.ts getMmemorySessionConfig for the ready-made accessor.
 			const config = loadMmemoryConfig(this.session.settings, this.session.cwd);
 			if (!config) {
 				return toolResult().text("Memory system is not enabled.").done();

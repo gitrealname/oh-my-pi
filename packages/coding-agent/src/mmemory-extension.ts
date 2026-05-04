@@ -13,32 +13,28 @@
  *   - session.compacting → inject recall snippet into compaction context
  *   - Server lifecycle (shared via getOrCreateServerClient in tools/mmemory/index.ts)
  */
+import { logger } from "@oh-my-pi/pi-utils";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { settings } from "./config/settings";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "./extensibility/extensions";
+import { completeSimple } from "@oh-my-pi/pi-ai";
+import { resolveModelRoleValue } from "./config/model-resolver";
 import {
+	STRIP_TAGS_REGEX,
+	composeRecallQuery,
 	disposeServerClient,
 	executeMemoryBuild,
+	executeMemoryExtract,
 	executeMemoryRecall,
 	formatRecallForSystemPrompt,
+	loadMentalModels,
 	loadMmemoryConfig,
 	resolvePaths,
 	sessionFilename,
+	truncateRecallQuery,
 } from "./tools/mmemory/index";
-
-// ── Tag stripping (anti-feedback loop prevention) ─────────────────────────────
-//
-// Recalled <memories> are injected into the system prompt. If they leak into the
-// retained transcript, they get re-embedded in the next session's recall — a
-// positive feedback loop that degrades quality silently. Strip before writing.
-
-const STRIP_TAGS = /<memories>[\s\S]*?<\/memories>|<mental_models>[\s\S]*?<\/mental_models>/g;
-
-function stripMemoryInjections(text: string): string {
-	return text.replace(STRIP_TAGS, "").trim();
-}
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -48,6 +44,7 @@ interface MmemorySessionState {
 	readonly sessionId: string;
 	readonly sessionStartTime: Date;
 	lastRecallSnippet: string | undefined;
+	mentalModelsSnippet: string | undefined;
 	hasRecalledForFirstTurn: boolean;
 	lastRetainedTurn: number;
 	turnCount: number;
@@ -121,6 +118,7 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 		sessionId,
 		sessionStartTime,
 		lastRecallSnippet: undefined,
+		mentalModelsSnippet: undefined,
 		hasRecalledForFirstTurn: false,
 		lastRetainedTurn: 0,
 		turnCount: 0,
@@ -133,7 +131,7 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 // chunk_by_turns() parses **User:** / **Assistant:** markers to reconstruct pairs.
 // Memory injection tags are stripped before writing (anti-feedback loop).
 
-function buildTranscript(messages: { role: string; content: unknown }[], contextTurns: number): string {
+function buildTranscript(messages: { role: string; content: unknown }[], contextTurns: number, maxTranscriptChars = 0): string {
 	const relevant = contextTurns > 0 ? messages.slice(-contextTurns * 2) : messages;
 	const parts: string[] = [];
 
@@ -147,7 +145,7 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 				.map(c => c.text ?? "")
 				.join(" ")
 			: String(m.content ?? "");
-		const userText = stripMemoryInjections(rawUser).trim();
+		const userText = rawUser.replace(STRIP_TAGS_REGEX, "").trim();
 		if (!userText) continue;
 
 		const next = relevant[i + 1];
@@ -159,7 +157,7 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 					.map(c => c.text ?? "")
 					.join(" ")
 				: String(next.content ?? "");
-			assistantText = stripMemoryInjections(rawAsst).trim();
+			assistantText = rawAsst.replace(STRIP_TAGS_REGEX, "").trim();
 		}
 
 		if (!userText && !assistantText) continue;
@@ -170,11 +168,75 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 		parts.push(turnParts.join("\n\n"));
 	}
 
-	return parts.join("\n\n---\n\n");
+	const SEP = "\n\n---\n\n";
+	let result = parts.join(SEP);
+
+	// Trim from the start (oldest turns first) until the transcript fits.
+	if (maxTranscriptChars > 0 && result.length > maxTranscriptChars) {
+		let start = 0;
+		while (result.length - start > maxTranscriptChars) {
+			const nextSep = result.indexOf(SEP, start);
+			if (nextSep === -1) break; // single oversized turn — keep it whole
+			start = nextSep + SEP.length;
+		}
+		result = result.slice(start);
+	}
+
+	return result;
 }
 
-async function retainSession(state: MmemorySessionState, messages: { role: string; content: unknown }[]): Promise<void> {
-	const transcript = buildTranscript(messages, state.config.retainContextTurns);
+async function extractFromTranscript(
+	transcript: string,
+	config: import("./tools/mmemory/index").MmemoryConfig,
+	ctx: ExtensionContext,
+): Promise<void> {
+	// Resolve the model for the configured role
+	const resolved = resolveModelRoleValue(
+		config.modelRole,
+		ctx.modelRegistry.getAll(),
+		{ modelRegistry: ctx.modelRegistry },
+	);
+	const model = resolved.model ?? ctx.model;
+	if (!model) return;
+
+	const sessionId = ctx.sessionManager.getSessionId();
+	const apiKey = await ctx.modelRegistry.getApiKey(model, sessionId);
+	if (!apiKey) return;
+
+	const systemPrompt =
+		`You are a precise knowledge extractor. Extract durable facts from the conversation transcript below. ` +
+		`Return ONLY a JSON array (no markdown fences, no prose) of objects with exactly these fields: ` +
+		`{"fact": string (one concise sentence), "entities": string[] (key names/paths/concepts mentioned), ` +
+		`"date": string (YYYY-MM-DD, today if unknown)}. ` +
+		`Omit transient details, errors already resolved, and anything not useful across sessions.`;
+	// Extraction LLM context budget — independent of maxTranscriptChars
+	const userPrompt = transcript.length > 8000 ? transcript.slice(0, 8000) : transcript;
+
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt,
+			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+		},
+		{ apiKey },
+	);
+
+	if (response.stopReason === "error" || !response.content) return;
+	const textContent = response.content
+		.filter((c: { type: string; text?: string }) => c.type === "text")
+		.map((c: { type: string; text?: string }) => c.text ?? "")
+		.join("");
+	if (!textContent.trim()) return;
+
+	await executeMemoryExtract(config, async () => textContent);
+}
+
+async function retainSession(
+	state: MmemorySessionState,
+	messages: { role: string; content: unknown }[],
+	ctx: ExtensionContext | null,
+): Promise<void> {
+	const transcript = buildTranscript(messages, state.config.retainContextTurns, state.config.maxTranscriptChars);
 	if (!transcript) return;
 
 	const today = new Date().toISOString().slice(0, 10);
@@ -188,13 +250,49 @@ async function retainSession(state: MmemorySessionState, messages: { role: strin
 		"utf-8",
 	);
 
+	if (state.config.extractionMode === "structured" && ctx) {
+		void extractFromTranscript(transcript, state.config, ctx).catch(e => logger.debug(`[mmemory] extraction failed: ${e}`, { source: 'mmemory' }));
+	}
+
 	// Server reads queue/*.md, embeds new chunks, deletes processed .md files
-	void executeMemoryBuild(state.config).catch(() => {});
+	void executeMemoryBuild(state.config).catch(e => logger.debug(`[mmemory] build failed: ${e}`, { source: 'mmemory' }));
 }
 
 // ── Extension factory ─────────────────────────────────────────────────────────
 
 const sessionMap = new WeakMap<ExtensionContext, MmemorySessionState>();
+
+/**
+ * Returns the live MmemoryConfig for the given extension context, or null if the
+ * extension is not running for that context (e.g. subagent, mmemory disabled).
+ *
+ * Tools should prefer this over calling loadMmemoryConfig() directly so they use
+ * the extension's already-loaded config rather than re-reading settings on every
+ * call. Fall back to loadMmemoryConfig(session.settings, session.cwd) when this
+ * returns null (subagent context or extension not initialised).
+ *
+ * Tool wiring is deferred: ToolSession does not currently expose an ExtensionContext
+ * field, so tools cannot call this yet. Once ToolSession gains a `ctx` field of type
+ * ExtensionContext, tools/mmemory/*-tool.ts should be updated to call this instead
+ * of loadMmemoryConfig directly.
+ */
+export function getMmemorySessionConfig(
+	ctx: import("./extensibility/extensions").ExtensionContext,
+): import("./tools/mmemory/index").MmemoryConfig | null {
+	return sessionMap.get(ctx)?.config ?? null;
+}
+
+
+// ── Mental models cache invalidation ─────────────────────────────────────────
+//
+// Keyed by projectDir (string) so the slash command handler can signal a reload
+// without needing access to the extension's WeakMap or ExtensionContext.
+// Set by invalidateMentalModelsCache(); cleared on next before_agent_start.
+const pendingMentalModelReload = new Set<string>();
+
+export function invalidateMentalModelsCache(projectDir: string): void {
+	pendingMentalModelReload.add(projectDir);
+}
 
 export function createMmemoryExtension(api: ExtensionAPI): void {
 	api.setLabel("mmemory");
@@ -203,6 +301,7 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 		const state = createSessionState(ctx);
 		if (!state) return;
 		sessionMap.set(ctx, state);
+
 	});
 
 	api.on("before_agent_start", async (event, ctx) => {
@@ -227,22 +326,39 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 			};
 		}
 
-		// First turn: fire-and-forget recall with deadline
+		// Lazy-load mental models on first turn; reload when invalidated by /mmemory mm regenerate
+		const mmProjectDir = resolvePaths(state.config).projectDir;
+		const needsReload = pendingMentalModelReload.has(mmProjectDir);
+		if (state.mentalModelsSnippet === undefined || needsReload) {
+			if (needsReload) pendingMentalModelReload.delete(mmProjectDir);
+			state.mentalModelsSnippet = await loadMentalModels(state.config).catch(() => "");
+		}
+
+		// First turn: recall and cache snippet for subsequent turns
 		if (!state.hasRecalledForFirstTurn) {
 			state.hasRecalledForFirstTurn = true;
+			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
+			const rawQuery = composeRecallQuery(prompt, messages, state.config.retainContextTurns);
+			const query = truncateRecallQuery(rawQuery, prompt, state.config.recallMaxQueryChars);
 			const result = await executeMemoryRecall(
-				prompt.slice(0, 400), undefined, state.config,
+				query, undefined, state.config,
 			).catch(() => null);
 			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
 			if (snippet) {
 				state.lastRecallSnippet = snippet;
-				return { systemPrompt: systemPrompt.trimEnd() + "\n\n" + snippet };
 			}
 		}
 
-		// Subsequent turns: inject cached snippet
-		if (state.lastRecallSnippet) {
-			return { systemPrompt: systemPrompt.trimEnd() + "\n\n" + state.lastRecallSnippet };
+		// Inject mental models on every turn (after lazy-load ensures they're available)
+		const mmBlock = state.mentalModelsSnippet
+			? `<mental_models>\n${state.mentalModelsSnippet}\n</mental_models>`
+			: undefined;
+
+		if (state.lastRecallSnippet || mmBlock) {
+			let extra = systemPrompt.trimEnd();
+			if (state.lastRecallSnippet) extra += "\n\n" + state.lastRecallSnippet;
+			if (mmBlock) extra += "\n\n" + mmBlock;
+			return { systemPrompt: extra };
 		}
 
 		return undefined;
@@ -255,7 +371,7 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 
 		const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
 		state.lastRetainedTurn = state.turnCount;
-		void retainSession(state, messages).catch(() => {});
+		void retainSession(state, messages, ctx).catch(() => {});
 	});
 
 	api.on("session.compacting", async (event, ctx) => {
@@ -264,15 +380,21 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 
 		const messages: AgentMessage[] = event.messages ?? [];
 		const firstUser = messages.find(m => m.role === "user");
-		const query = firstUser
+		const rawPrompt = firstUser
 			? (Array.isArray(firstUser.content)
 					? (firstUser.content as { type: string; text?: string }[])
 						.filter(c => c.type === "text")
 						.map(c => c.text ?? "")
 						.join(" ")
 					: String(firstUser.content ?? "")
-			  ).slice(0, 400)
+			  )
 			: "project context";
+		const rawQuery = composeRecallQuery(
+			rawPrompt,
+			messages as { role: string; content: unknown }[],
+			state.config.retainContextTurns,
+		);
+		const query = truncateRecallQuery(rawQuery, rawPrompt, state.config.recallMaxQueryChars);
 
 		const result = await executeMemoryRecall(query, undefined, state.config).catch(() => null);
 		const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
