@@ -39,12 +39,15 @@ export interface MmemoryConfig {
 	scoping: "per-project" | "per-project-tagged" | "global";
 	retainEveryNTurns: number;
 	retainContextTurns: number;
+	recallMaxQueryChars: number;
 	recallLimit: number;
 	recallDeadlineMs: number;
 	recencyWeight: number;
 	deduplicationThreshold: number;
 	serverIdleTimeoutMinutes: number;
 	autoRetain: boolean;
+	maxTranscriptChars: number;
+	maxRawFacts: number;
 }
 
 export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConfig | null {
@@ -72,13 +75,16 @@ export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConf
 		extractionMode: mmemory.extractionMode ?? "verbatim",
 		scoping: mmemory.scoping ?? "per-project-tagged",
 		retainEveryNTurns: mmemory.retainEveryNTurns ?? 3,
-		retainContextTurns: mmemory.retainContextTurns ?? 0,
+		retainContextTurns: mmemory.retainContextTurns ?? 3,
+		recallMaxQueryChars: mmemory.recallMaxQueryChars ?? 2000,
 		recallLimit: mmemory.recallLimit ?? 10,
 		recallDeadlineMs: mmemory.recallDeadlineMs ?? 10_000,
 		recencyWeight: mmemory.recencyWeight ?? 0.3,
 		deduplicationThreshold: mmemory.deduplicationThreshold ?? 0.92,
 		serverIdleTimeoutMinutes: mmemory.serverIdleTimeoutMinutes ?? 10,
 		autoRetain: mmemory.autoRetain !== false,
+		maxTranscriptChars: mmemory.maxTranscriptChars ?? 0,
+		maxRawFacts: mmemory.maxRawFacts ?? 100,
 	};
 }
 
@@ -91,6 +97,7 @@ export interface MmemoryPaths {
 	vectorsPath: string;      // indexDir/vectors.safetensors
 	vectorsMetaPath: string;  // indexDir/vectors.meta.json
 	factsPath: string;        // projectDir/facts.json  (Phase 3)
+	observationsPath: string; // projectDir/observations.json  (Phase 3)
 	mentalModelsDir: string;  // projectDir/mental_models  (Phase 3)
 }
 
@@ -105,6 +112,7 @@ export function resolvePaths(config: MmemoryConfig): MmemoryPaths {
 		vectorsPath: path.join(indexDir, "vectors.safetensors"),
 		vectorsMetaPath: path.join(indexDir, "vectors.meta.json"),
 		factsPath: path.join(projectDir, "facts.json"),
+		observationsPath: path.join(projectDir, "observations.json"),
 		mentalModelsDir: path.join(projectDir, "mental_models"),
 	};
 }
@@ -112,6 +120,121 @@ export function resolvePaths(config: MmemoryConfig): MmemoryPaths {
 /** Returns paths for the global project dir (cross-project per-project-tagged scope). */
 export function resolveGlobalPaths(config: MmemoryConfig): MmemoryPaths {
 	return resolvePaths({ ...config, projectName: "global" });
+}
+
+
+// ── Recall query composition ──────────────────────────────────────────────────
+
+export const STRIP_TAGS_REGEX = /<memories>[\s\S]*?<\/memories>|<mental_models>[\s\S]*?<\/mental_models>/g;
+
+function stripMemoryTagsLocal(text: string): string {
+	return text.replace(STRIP_TAGS_REGEX, "").trim();
+}
+
+/**
+ * Slice messages to the last N turns, where a turn boundary is a user message.
+ * Returns the trailing tail starting at the (N-th from the end) user message.
+ */
+export function sliceLastTurnsByUserBoundary(
+	messages: { role: string; content: unknown }[],
+	turns: number,
+): { role: string; content: unknown }[] {
+	if (messages.length === 0 || turns <= 0) return [];
+
+	let userTurnsSeen = 0;
+	let startIndex = -1;
+
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "user") {
+			userTurnsSeen += 1;
+			if (userTurnsSeen >= turns) {
+				startIndex = i;
+				break;
+			}
+		}
+	}
+
+	return startIndex === -1 ? [...messages] : messages.slice(startIndex);
+}
+
+function extractMessageText(content: unknown): string {
+	if (Array.isArray(content)) {
+		return (content as { type: string; text?: string }[])
+			.filter(c => c.type === "text")
+			.map(c => c.text ?? "")
+			.join(" ");
+	}
+	return String(content ?? "");
+}
+
+/**
+ * Compose a recall query from the latest user prompt plus optional prior context.
+ *
+ * When `recallContextTurns <= 1` the query is just the trimmed latest prompt.
+ * Otherwise we prepend a `Prior context:` block built from the trailing
+ * `recallContextTurns` user-bounded turns (memory tags stripped, latest prompt
+ * suppressed to avoid duplicating it inside the context block).
+ */
+export function composeRecallQuery(
+	latestQuery: string,
+	messages: { role: string; content: unknown }[],
+	recallContextTurns: number,
+): string {
+	const latest = latestQuery.trim();
+	if (recallContextTurns <= 1 || messages.length === 0) return latest;
+
+	const contextual = sliceLastTurnsByUserBoundary(messages, recallContextTurns);
+	const contextLines: string[] = [];
+
+	for (const msg of contextual) {
+		const content = stripMemoryTagsLocal(extractMessageText(msg.content)).trim();
+		if (!content) continue;
+		if (msg.role === "user" && content === latest) continue;
+		contextLines.push(`${msg.role}: ${content}`);
+	}
+
+	if (contextLines.length === 0) return latest;
+	return ["Prior context:", contextLines.join("\n"), latest].join("\n\n");
+}
+
+/**
+ * Truncate a composed recall query to `maxChars`.
+ *
+ * Always preserves the latest user message. Drops oldest context lines first
+ * and degrades gracefully when even the latest message exceeds the budget.
+ */
+export function truncateRecallQuery(query: string, latestQuery: string, maxChars: number): string {
+	if (maxChars <= 0 || query.length <= maxChars) return query;
+
+	const latest = latestQuery.trim();
+	const latestOnly = latest.length > maxChars ? latest.slice(0, maxChars) : latest;
+
+	if (!query.includes("Prior context:")) return latestOnly;
+
+	const contextMarker = "Prior context:\n\n";
+	const markerIndex = query.indexOf(contextMarker);
+	if (markerIndex === -1) return latestOnly;
+
+	const suffix = `\n\n${latest}`;
+	const suffixIndex = query.lastIndexOf(suffix);
+	if (suffixIndex === -1) return latestOnly;
+	if (suffix.length >= maxChars) return latestOnly;
+
+	const contextBody = query.slice(markerIndex + contextMarker.length, suffixIndex);
+	const contextLines = contextBody.split("\n").filter(Boolean);
+
+	const kept: string[] = [];
+	for (let i = contextLines.length - 1; i >= 0; i--) {
+		kept.unshift(contextLines[i]);
+		const candidate = `${contextMarker}${kept.join("\n")}${suffix}`;
+		if (candidate.length > maxChars) {
+			kept.shift();
+			break;
+		}
+	}
+
+	if (kept.length > 0) return `${contextMarker}${kept.join("\n")}${suffix}`;
+	return latestOnly;
 }
 
 // ── Server singleton per storage root ────────────────────────────────────────
@@ -199,6 +322,129 @@ export function noteFilename(): string {
 
 // ── Core operations ───────────────────────────────────────────────────────────
 
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
+	const tmp = filePath + ".tmp";
+	const dir = path.dirname(filePath);
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(tmp, JSON.stringify(data, null, 2), "utf-8");
+	await fs.rename(tmp, filePath);
+}
+
+function parseJsonArrayOrWrapped(raw: string, wrapKey: string): unknown[] {
+	const parsed = JSON.parse(raw.trim());
+	if (Array.isArray(parsed)) return parsed;
+	const wrapped = (parsed as any)?.[wrapKey];
+	return Array.isArray(wrapped) ? wrapped : [];
+}
+
+function keywordMatchAndMerge(
+	items: unknown[],
+	query: string,
+	textFn: (item: unknown) => string,
+	dateFn: (item: unknown) => string | undefined,
+	boostFactor: number,
+	quota: number,
+	existing: { text: string; score?: number; when?: string }[],
+	recallLimit: number,
+): { text: string; score?: number; when?: string }[] {
+	if (items.length === 0) return existing;
+	const qwords = query.toLowerCase().match(/\b\w{3,}\b/g) ?? [];
+	if (qwords.length === 0) return existing;
+	const hits = items
+		.map(item => {
+			const txt = textFn(item).toLowerCase();
+			const matching = qwords.filter(w => new RegExp(`\\b${w}\\b`).test(txt)).length;
+			return { text: textFn(item), score: (matching / qwords.length) * boostFactor, when: dateFn(item) };
+		})
+		.filter(h => h.score > 0)
+		.sort((a, b) => b.score - a.score)
+		.slice(0, quota);
+	if (hits.length === 0) return existing;
+	const combined = [...hits, ...existing];
+	const seen = new Set<string>();
+	return combined
+		.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+		.filter(r => {
+			const key = r.text.slice(0, 80);
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		})
+		.slice(0, recallLimit);
+}
+
+// ── Facts extraction & recall ─────────────────────────────────────────────────
+
+export interface FactEntry {
+	fact: string;
+	entities?: string[];
+	date?: string;
+	extracted_at?: string;
+}
+
+/** Read and parse facts.json; returns [] on missing or corrupt file. */
+export async function loadFacts(config: MmemoryConfig): Promise<FactEntry[]> {
+	const { factsPath } = resolvePaths(config);
+	try {
+		const raw = await fs.readFile(factsPath, "utf-8");
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((f): f is FactEntry => typeof f?.fact === "string");
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Orchestrator: parse LLM output, merge with existing facts.json, write atomically.
+ * `extractFn` is provided by the caller (extension) and keeps this file free of
+ * ExtensionContext.
+ */
+export async function executeMemoryExtract(
+	config: MmemoryConfig,
+	extractFn: () => Promise<string>,
+): Promise<void> {
+	const { factsPath } = resolvePaths(config);
+	let rawOutput: string;
+	try {
+		rawOutput = await extractFn();
+	} catch (err) {
+		console.error("[mmemory] extractFn failed:", err);
+		return;
+	}
+
+	let newFacts: FactEntry[];
+	try {
+		const arr = parseJsonArrayOrWrapped(rawOutput, "facts");
+		const today = new Date().toISOString().slice(0, 10);
+		newFacts = arr
+			.filter((f): f is FactEntry => typeof (f as any)?.fact === "string")
+			.map(f => ({
+				...(f as FactEntry),
+				extracted_at: (f as FactEntry).extracted_at ?? today,
+			}));
+	} catch (err) {
+		console.error("[mmemory] Failed to parse LLM fact output:", err);
+		return;
+	}
+
+	if (newFacts.length === 0) return;
+
+	// Load existing, merge, dedup by fact string (case-insensitive)
+	const existing = await loadFacts(config);
+	const seen = new Set(existing.map(f => f.fact.toLowerCase()));
+	const toAdd = newFacts.filter(f => !seen.has(f.fact.toLowerCase()));
+	if (toAdd.length === 0) return;
+
+	const merged = [...existing, ...toAdd];
+	try {
+		await atomicWriteJson(factsPath, merged);
+	} catch (err) {
+		console.error("[mmemory] Failed to write facts.json:", err);
+	}
+}
 export interface RecallResult {
 	text: string;
 	resultCount: number;
@@ -274,6 +520,23 @@ export async function executeMemoryRecall(
 		};
 	}
 
+	// ── Facts recall (additive — no-op when facts.json is empty) ──────────────
+	const allFacts = await loadFacts(config);
+	results = keywordMatchAndMerge(
+		allFacts, query,
+		f => (f as FactEntry).fact,
+		f => (f as FactEntry).date ?? (f as FactEntry).extracted_at,
+		1.2, Math.ceil(config.recallLimit / 3), results, config.recallLimit,
+	);
+
+	// ── Observations recall (additive — no-op when observations.json is empty) ──
+	const allObservations = await loadObservations(config);
+	results = keywordMatchAndMerge(
+		allObservations, query,
+		o => (o as ObservationEntry).observation,
+		o => (o as ObservationEntry).date ?? (o as ObservationEntry).consolidated_at,
+		1.5, Math.ceil(config.recallLimit / 4), results, config.recallLimit,
+	);
 	if (results.length === 0) return { text: "No relevant memories found.", resultCount: 0 };
 
 	const lines: string[] = [`Found ${results.length} relevant memories:\n`];
@@ -283,6 +546,122 @@ export async function executeMemoryRecall(
 		lines.push(`• ${r.text}${when}${score}`);
 	}
 	return { text: lines.join("\n"), resultCount: results.length };
+}
+
+// ── Observations (consolidated facts) ────────────────────────────────────────
+
+export interface ObservationEntry {
+	observation: string;
+	entities?: string[];
+	date?: string;
+	consolidated_at?: string;
+}
+
+export interface ConsolidationResult {
+	observationCount: number;
+	factsConsumed: number;
+	skipped: boolean;
+	message: string;
+}
+
+/** Read and parse observations.json; returns [] on missing or corrupt file. */
+export async function loadObservations(config: MmemoryConfig): Promise<ObservationEntry[]> {
+	const { observationsPath } = resolvePaths(config);
+	const obsPath = observationsPath;
+	try {
+		const raw = await fs.readFile(obsPath, "utf-8");
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((o): o is ObservationEntry => typeof o?.observation === "string");
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Consolidate raw facts into higher-level observations.
+ * `consolidateFn` is supplied by the caller (keeps this file free of ExtensionContext).
+ */
+export async function executeMemoryConsolidate(
+	config: MmemoryConfig,
+	consolidateFn: (factsJson: string) => Promise<string>,
+): Promise<ConsolidationResult> {
+	const maxRawFacts = config.maxRawFacts;
+	try {
+		const facts = await loadFacts(config);
+		if (facts.length < maxRawFacts) {
+			return {
+				skipped: true,
+				factsConsumed: facts.length,
+				observationCount: 0,
+				message: `Only ${facts.length} facts (threshold: ${maxRawFacts}). Run more sessions first.`,
+			};
+		}
+
+		const factsJson = JSON.stringify(facts, null, 2);
+		const truncated = factsJson.length > 20000 ? factsJson.slice(0, 20000) : factsJson;
+
+		let rawOutput: string;
+		try {
+			rawOutput = await consolidateFn(truncated);
+		} catch (err) {
+			return {
+				skipped: false,
+				factsConsumed: facts.length,
+				observationCount: 0,
+				message: `consolidateFn failed: ${err instanceof Error ? err.message : String(err)}`,
+			};
+		}
+
+		let observations: ObservationEntry[];
+		try {
+			const arr = parseJsonArrayOrWrapped(rawOutput, "observations");
+			observations = arr
+				.filter((o): o is ObservationEntry => typeof (o as any)?.observation === "string")
+			.map(o => ({
+				...(o as ObservationEntry),
+				consolidated_at: (o as ObservationEntry).consolidated_at ?? new Date().toISOString(),
+			}));
+		} catch (err) {
+			return {
+				skipped: false,
+				factsConsumed: facts.length,
+				observationCount: 0,
+				message: `Failed to parse consolidation output: ${err instanceof Error ? err.message : String(err)}`,
+			};
+		}
+
+		if (observations.length === 0) {
+			return {
+				skipped: false,
+				factsConsumed: facts.length,
+				observationCount: 0,
+				message: "Consolidation produced no observations after filtering.",
+			};
+		}
+
+		// Intentional full replacement: observations.json is always the complete synthesis
+		// of the current facts corpus. Merging would accumulate stale observations from
+		// prior passes. If only a truncated slice of facts was processed (20000-char cap),
+		// previous observations covering the unprocessed tail are lost — acceptable
+		// because the next consolidation pass will cover the full corpus again.
+		const { observationsPath: obsPathW } = resolvePaths(config);
+		await atomicWriteJson(obsPathW, observations);
+
+		return {
+			skipped: false,
+			factsConsumed: facts.length,
+			observationCount: observations.length,
+			message: `Consolidated ${facts.length} facts into ${observations.length} observations.`,
+		};
+	} catch (err) {
+		return {
+			skipped: false,
+			factsConsumed: 0,
+			observationCount: 0,
+			message: `Consolidation failed: ${err instanceof Error ? err.message : String(err)}`,
+		};
+	}
 }
 
 /**
@@ -321,8 +700,7 @@ export async function executeMemoryRetain(
 	content: string,
 	config: MmemoryConfig,
 ): Promise<string> {
-	const STRIP_TAGS = /<memories>[\s\S]*?<\/memories>|<mental_models>[\s\S]*?<\/mental_models>/g;
-	const cleaned = content.replace(STRIP_TAGS, "").trim();
+	const cleaned = content.replace(STRIP_TAGS_REGEX, "").trim();
 	if (!cleaned) return "Nothing to retain after stripping memory injection tags.";
 
 	const paths = resolvePaths(config);
@@ -365,4 +743,87 @@ export async function executeMemoryReflect(
 		`Based on the above project memories, synthesize a concise answer to: ${query}`,
 	].join("\n");
 	return { text: synthesisText, resultCount: result.resultCount };
+}
+
+// ── Mental models ─────────────────────────────────────────────────────────────
+
+export interface MentalModelSeedResult {
+	generated: string[];  // model ids written
+	skipped: string[];    // model ids that failed
+}
+
+const BUILT_IN_MODELS = [
+	{
+		id: "user-preferences",
+		query: "What does the user prefer in coding style, tooling, communication, and review? Capture only durable preferences.",
+	},
+	{
+		id: "project-conventions",
+		query: "What are this project conventions for code style, build, testing, release, and PR review?",
+	},
+	{
+		id: "project-decisions",
+		query: "What durable architectural or product decisions have been made, and what rationale was recorded?",
+	},
+];
+
+/**
+ * Seed mental model files from project memories.
+ * `reflectFn` is provided by the caller and performs recall + LLM synthesis.
+ * Returns which model ids written and which failed.
+ */
+export async function executeMemoryMentalModelSeed(
+	config: MmemoryConfig,
+	reflectFn: (query: string, systemPrompt: string) => Promise<string>,
+): Promise<MentalModelSeedResult> {
+	const { mentalModelsDir } = resolvePaths(config);
+	await fs.mkdir(mentalModelsDir, { recursive: true });
+
+	const generated: string[] = [];
+	const skipped: string[] = [];
+
+	for (const model of BUILT_IN_MODELS) {
+		try {
+			const systemPrompt =
+				`Synthesize project memories into a concise reference document for: ${model.query} ` +
+				`Write in present tense, plain prose, no filler. ` +
+				`Only include information actually supported by the provided memories.`;
+			const result = await reflectFn(model.query, systemPrompt);
+			await fs.writeFile(path.join(mentalModelsDir, `${model.id}.md`), result, "utf-8");
+			generated.push(model.id);
+		} catch {
+			skipped.push(model.id);
+		}
+	}
+
+	return { generated, skipped };
+}
+
+/**
+ * Load all .md files from mentalModelsDir, sorted by name.
+ * Returns empty string when directory is missing or contains no .md files.
+ */
+export async function loadMentalModels(config: MmemoryConfig): Promise<string> {
+	const { mentalModelsDir } = resolvePaths(config);
+	let entries: string[];
+	try {
+		entries = (await fs.readdir(mentalModelsDir))
+			.filter(f => f.endsWith(".md"))
+			.sort();
+	} catch {
+		return "";
+	}
+	if (entries.length === 0) return "";
+
+	const parts: string[] = [];
+	for (const entry of entries) {
+		try {
+			const content = await fs.readFile(path.join(mentalModelsDir, entry), "utf-8");
+			const id = entry.replace(/\.md$/, "");
+			parts.push(`${id}:\n${content.trim()}`);
+		} catch {
+			// skip unreadable files
+		}
+	}
+	return parts.join("\n\n");
 }

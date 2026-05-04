@@ -28,6 +28,9 @@ export class MmemoryRetainTool implements AgentTool<typeof schema> {
 	}
 
 	async execute(_toolCallId: string, { content }: { content: string }): Promise<AgentToolResult> {
+		// TODO(wiring): use getMmemorySessionConfig(this.session.ctx) here once ToolSession
+		// exposes a `ctx: ExtensionContext` field — avoids re-reading settings on every call.
+		// See mmemory-extension.ts getMmemorySessionConfig for the ready-made accessor.
 		const config = loadMmemoryConfig(this.session.settings, this.session.cwd);
 		if (!config) {
 			return toolResult().text("Memory system is not enabled.").done();

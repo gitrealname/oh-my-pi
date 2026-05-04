@@ -1,18 +1,24 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { hasMReviewHtml, openMReviewSession } from "../tools/mreview/index";
+import { invalidateMentalModelsCache } from "../mmemory-extension";
 import {
 	executeMemoryBuild,
+	executeMemoryConsolidate,
+	executeMemoryMentalModelSeed,
 	executeMemoryRecall,
 	executeMemoryReflect,
 	formatRecallForSystemPrompt,
 	getOrCreateServerClient,
+	loadFacts,
+	loadMentalModels,
 	loadMmemoryConfig,
 	resolvePaths,
 } from "../tools/mmemory/index";
-
+import { completeSimple } from "@oh-my-pi/pi-ai";
+import { resolveModelRoleValue } from "../config/model-resolver";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
@@ -112,6 +118,34 @@ const shutdownHandler = (_command: ParsedBuiltinSlashCommand, runtime: BuiltinSl
 };
 
 
+
+async function callLLMForMemory(
+	role: string,
+	systemPrompt: string,
+	userPrompt: string,
+	runtime: BuiltinSlashCommandRuntime,
+): Promise<string> {
+	const registry = runtime.ctx.session.modelRegistry;
+	const resolved = resolveModelRoleValue(role, registry.getAll(), { modelRegistry: registry });
+	const model = resolved.model ?? runtime.ctx.session.model;
+	if (!model) throw new Error(`No model for role: ${role}`);
+	const sessionId = runtime.ctx.sessionManager.getSessionId();
+	const apiKey = await registry.getApiKey(model, sessionId);
+	if (!apiKey) throw new Error(`No API key for model: ${model.provider}/${model.id}`);
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt,
+			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+		},
+		{ apiKey },
+	);
+	if (response.stopReason === "error" || !response.content) throw new Error("LLM call failed");
+	return response.content
+		.filter((c: { type: string; text?: string }) => c.type === "text")
+		.map((c: { type: string; text?: string }) => c.text ?? "")
+		.join("");
+}
 
 const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<string | undefined> => {
 	const args = command.args.trim();
@@ -232,6 +266,33 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.showStatus("mmemory: enqueue — use the extension to trigger a retain cycle.");
 			break;
 		}
+		case "consolidate": {
+			const maxRawFactsOverride = restStr.match(/--max-facts\s+(\d+)/)?.[1];
+			const effectiveConfig = maxRawFactsOverride
+				? { ...config, maxRawFacts: parseInt(maxRawFactsOverride, 10) }
+				: config;
+			runtime.ctx.showStatus(`mmemory: consolidating (threshold: ${effectiveConfig.maxRawFacts} facts)...`);
+			try {
+				const facts = await loadFacts(config);
+				const systemPrompt = [
+					"You are a precise knowledge consolidator. Merge the raw facts below into a smaller set of higher-level observations.",
+					"Return ONLY a JSON array (no markdown fences, no prose) of objects with exactly these fields:",
+					'{"observation": string (one concise declarative sentence), "entities": string[] (key concepts), "date": string (YYYY-MM-DD)}',
+					"Deduplicate. Merge related facts. Discard resolved ephemeral items. Target: ~20% of input count.",
+				].join(" ");
+				const userPrompt = `Facts (${facts.length} items):\n\n${JSON.stringify(facts, null, 2).slice(0, 15000)}`;
+				const responseText = await callLLMForMemory(effectiveConfig.consolidateModelRole, systemPrompt, userPrompt, runtime);
+				const result = await executeMemoryConsolidate(effectiveConfig, async () => responseText);
+				runtime.ctx.showStatus(
+					result.skipped
+						? result.message
+						: `mmemory: consolidated ${result.factsConsumed} facts into ${result.observationCount} observations.`,
+				);
+			} catch (e) {
+				runtime.ctx.showWarning(`mmemory consolidate: ${String(e)}`);
+			}
+			break;
+		}
 		case "global": {
 			runtime.ctx.showStatus("mmemory: scope switched to global for this session (set in extension state).");
 			break;
@@ -240,9 +301,53 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.showStatus("mmemory: scope reset to per-project-tagged.");
 			break;
 		}
+		case "mm": {
+			const mmSub = rest[0];
+			const mmPaths = resolvePaths(config);
+			if (mmSub === "list") {
+				try {
+					const files = readdirSync(mmPaths.mentalModelsDir).filter(f => f.endsWith(".md")).sort();
+					if (files.length === 0) {
+						runtime.ctx.showStatus("mmemory mm: no mental model files. Run /mmemory mm regenerate.");
+					} else {
+						for (const f of files) {
+							const st = statSync(path.join(mmPaths.mentalModelsDir, f));
+							runtime.ctx.showStatus(`mmemory mm: ${f}  ${st.size}B  ${st.mtime.toISOString().slice(0, 19).replace("T", " ")}`);
+						}
+					}
+				} catch {
+					runtime.ctx.showStatus("mmemory mm: mental_models/ directory not found.");
+				}
+			} else if (mmSub === "regenerate") {
+				runtime.ctx.showStatus("mmemory mm: regenerating mental models...");
+				try {
+					const recallResult = await executeMemoryRecall(
+						"project context preferences conventions decisions", undefined, config,
+					);
+					const memoriesText = recallResult.resultCount > 0 ? recallResult.text : "";
+					const result = await executeMemoryMentalModelSeed(config, async (query, systemPrompt) => {
+						const userPrompt = memoriesText
+							? `Available memories:\n${memoriesText}\n\nQuery: ${query}`
+							: `No memories available yet.\n\nQuery: ${query}`;
+						return callLLMForMemory(config.consolidateModelRole, systemPrompt, userPrompt, runtime);
+					});
+					const ok = result.generated.length;
+					const fail = result.skipped.length;
+					runtime.ctx.showStatus(
+						`mmemory mm: regenerated ${ok} model(s)${fail > 0 ? `, ${fail} failed (${result.skipped.join(", ")})` : ""}.`,
+					);
+				if (ok > 0) invalidateMentalModelsCache(mmPaths.projectDir);
+				} catch (e) {
+					runtime.ctx.showWarning(`mmemory mm regenerate: ${String(e)}`);
+				}
+			} else {
+				runtime.ctx.showStatus("Usage: /mmemory mm list | /mmemory mm regenerate");
+			}
+			break;
+		}
 		default: {
 			runtime.ctx.showStatus(
-				"Usage: /mmemory <recall|retain|reflect|view|clear|enqueue|status> [args]",
+				"Usage: /mmemory <recall|retain|reflect|view|clear|enqueue|consolidate|mm|status> [args]",
 			);
 		}
 	}
@@ -1236,19 +1341,21 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 
 	{
 		name: "mmemory",
-		description: "Memory operations: recall, retain, reflect, view, clear, enqueue, status",
-		inlineHint: "<recall|retain|reflect|view|clear|enqueue|status> [args]",
+		description: "Memory operations: recall, retain, reflect, view, clear, enqueue, consolidate, mm, status",
+		inlineHint: "<recall|retain|reflect|view|clear|enqueue|consolidate|mm|status> [args]",
 		allowArgs: true,
 		subcommands: [
-			{ name: "recall",  description: "Search memories with BM25+semantic retrieval" },
-			{ name: "retain",  description: "Store information (auto-triggered by extension)" },
-			{ name: "reflect", description: "Synthesize memories on a topic" },
-			{ name: "view",    description: "Show current recall snippet" },
-			{ name: "clear",   description: "Delete memories (--from DATE [--to DATE] | --session ID)" },
-			{ name: "enqueue", description: "Force retain now" },
-			{ name: "status",  description: "Show memory system status" },
-			{ name: "global",  description: "Switch to global scope this session" },
-			{ name: "project", description: "Switch back to per-project-tagged scope" },
+			{ name: "recall",      description: "Search memories with BM25+semantic retrieval" },
+			{ name: "retain",      description: "Store information (auto-triggered by extension)" },
+			{ name: "reflect",     description: "Synthesize memories on a topic" },
+			{ name: "view",        description: "Show current recall snippet" },
+			{ name: "clear",       description: "Delete memories (--from DATE [--to DATE] | --session ID)" },
+			{ name: "enqueue",     description: "Force retain now" },
+			{ name: "consolidate", description: "Merge raw facts into observations (--max-facts N, default 100)" },
+			{ name: "mm",          description: "Mental models: list | regenerate" },
+			{ name: "status",      description: "Show memory system status" },
+			{ name: "global",      description: "Switch to global scope this session" },
+			{ name: "project",     description: "Switch back to per-project-tagged scope" },
 		],
 		handle: mmemoryHandler,
 	},
