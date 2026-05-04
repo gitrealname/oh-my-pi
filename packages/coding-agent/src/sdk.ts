@@ -1255,6 +1255,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				modelRegistry,
 			);
 		}
+		extensionRunner?.setTaskDepth(taskDepth);
 
 		const getSessionContext = () => ({
 			sessionManager,

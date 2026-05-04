@@ -179,6 +179,12 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	#taskDepth = 0;
+
+	setTaskDepth(n: number): void {
+		this.#taskDepth = n;
+	}
+
 
 	constructor(
 		private readonly extensions: Extension[],
@@ -407,6 +413,7 @@ export class ExtensionRunner {
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
 			executePython: (code, options) => this.#executePythonFn(code, options),
+			taskDepth: this.#taskDepth,
 		};
 	}
 
