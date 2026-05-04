@@ -44,7 +44,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; d
 .ann-label.question  { background: #1e3a5f; color: #89b4fa; }
 .ann-label.issue     { background: #3d1f2a; color: #f38ba8; }
 
-#ann-input-box { display: none; background: #313244; border: 1px solid #f9e2af; border-radius: 8px; padding: 8px; margin: 8px 0; }
+#ann-input-box { position: relative; display: none; background: #313244; border: 1px solid #f9e2af; border-radius: 8px; padding: 8px; margin: 8px 0; }
+#ann-copy { position: absolute; top: 6px; right: 6px; padding: 2px 7px; border-radius: 3px; font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid #45475a; background: #1e1e2e; color: #6c7086; transition: all 0.15s; }
+#ann-copy:hover { color: #cdd6f4; border-color: #89b4fa; }
+#ann-copy.copied { color: #a6e3a1; border-color: #a6e3a1; }
+body.light #ann-copy { background: #f0f0f0; color: #666; border-color: #ddd; }
+body.light #ann-copy:hover { color: #333; border-color: #999; }
+body.light #ann-copy.copied { color: #2e7d32; border-color: #2e7d32; }
 #ann-input-box .ann-location { font-size: 10px; color: #6c7086; margin-bottom: 6px; }
 #ann-input-box .label-row { display: flex; gap: 4px; margin-bottom: 6px; flex-wrap: wrap; }
 #ann-input-box .lbl { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid transparent; background: #1e1e2e; color: #6c7086; transition: all 0.1s; }
@@ -263,6 +269,7 @@ function openCommentBox() {
   noteBox.style.display = 'block';
   noteBox.style.fontSize = fontSize + 'px';
   noteBox.innerHTML = `
+    <button id="ann-copy" title="Copy selection to clipboard">Copy</button>
     <div class="ann-location">${locationText ? locationText + ' - ' : ''}"${previewText}"</div>
     <div class="label-row">
       <button class="lbl suggestion" data-label="suggestion" title="Proposes an improvement">suggestion</button>
@@ -278,6 +285,16 @@ function openCommentBox() {
   wrapper.after(noteBox);
   // Pre-activate default label
   noteBox.querySelector('.lbl.nit').classList.add('active');
+
+  // Copy selection to clipboard
+  noteBox.querySelector('#ann-copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(selectedText).then(() => {
+      const btn = noteBox.querySelector('#ann-copy');
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+    });
+  });
 
   // Label pill toggle
   noteBox.querySelectorAll('.lbl').forEach(btn => {
