@@ -43,8 +43,7 @@ export class MmemoryRecallTool implements AgentTool<typeof schema> {
 			if (!config) {
 				return toolResult().text("Memory system is not enabled.").done();
 			}
-			const sessionId = this.session.getSessionId?.() ?? "default";
-			const result = await executeMemoryRecall(sessionId, query, scope, config);
+			const result = await executeMemoryRecall(query, scope, config);
 			return toolResult().text(result.text).done();
 		});
 	}

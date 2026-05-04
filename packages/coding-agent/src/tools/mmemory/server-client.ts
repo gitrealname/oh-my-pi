@@ -59,6 +59,8 @@ export class MmemoryServerClient {
 				this.proc = null;
 			}
 		}
+		// Re-check after any await — another caller may have started while we were pinging
+		if (this.startPromise) return this.startPromise;
 		this.startPromise = this.#start().finally(() => {
 			this.startPromise = null;
 		});
@@ -125,6 +127,10 @@ export class MmemoryServerClient {
 		return new Promise((resolve, reject) => {
 			const socket = net.createConnection(this.port, "127.0.0.1", () => {
 				socket.write(JSON.stringify(req) + "\n");
+			});
+			socket.setTimeout(15_000, () => {
+				socket.destroy();
+				reject(new Error("mmemory server query timed out after 15s"));
 			});
 			let buf = "";
 			socket.on("data", (d: Buffer) => {

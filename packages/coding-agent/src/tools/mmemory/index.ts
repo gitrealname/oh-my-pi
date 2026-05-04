@@ -97,9 +97,10 @@ export function resolvePaths(config: MmemoryConfig): MmemoryPaths {
 	};
 }
 
-// ── Server singleton per session ──────────────────────────────────────────────
+// ── Server singleton per storage root ────────────────────────────────────────
 
 const serverMap = new Map<string, MmemoryServerClient>();
+const serverCreating = new Map<string, Promise<MmemoryServerClient>>();
 
 // Co-locate extracted scripts with the binary when compiled; use ~/.omp/extensions
 // as a stable scratch location in dev (process.execPath is bun itself in that case).
@@ -143,24 +144,32 @@ export async function ensureUpdateScript(): Promise<string> {
 	return ensureScript("mmemory_update.py", mmemoryUpdatePy);
 }
 
-export async function getOrCreateServerClient(sessionId: string, config: MmemoryConfig): Promise<MmemoryServerClient> {
-	const serverScript = await ensureServerScript();
-	const key = `${sessionId}:${config.storagePath}`;
-	let client = serverMap.get(key);
-	if (!client) {
-		client = new MmemoryServerClient(serverScript, config.serverIdleTimeoutMinutes);
-		serverMap.set(key, client);
+export async function getOrCreateServerClient(config: MmemoryConfig): Promise<MmemoryServerClient> {
+	const key = config.storagePath; // one server per storage root, regardless of session
+	const existing = serverMap.get(key);
+	if (existing) return existing;
+	let creating = serverCreating.get(key);
+	if (!creating) {
+		creating = (async () => {
+			const serverScript = await ensureServerScript();
+			const client = new MmemoryServerClient(serverScript, config.serverIdleTimeoutMinutes);
+			serverMap.set(key, client);
+			serverCreating.delete(key);
+			return client;
+		})();
+		serverCreating.set(key, creating);
 	}
-	return client;
+	return creating;
 }
 
-export function disposeServerClient(sessionId: string, config: MmemoryConfig): void {
-	const key = `${sessionId}:${config.storagePath}`;
+export function disposeServerClient(config: MmemoryConfig): void {
+	const key = config.storagePath;
 	const client = serverMap.get(key);
 	if (client) {
 		void client.stop();
 		serverMap.delete(key);
 	}
+	serverCreating.delete(key);
 }
 
 // ── Core operations ───────────────────────────────────────────────────────────
@@ -175,13 +184,12 @@ export interface RecallResult {
  * Delegates parallel BM25+semantic retrieval to the Python server.
  */
 export async function executeMemoryRecall(
-	sessionId: string,
 	query: string,
 	scope: string | undefined,
 	config: MmemoryConfig,
 ): Promise<RecallResult> {
 	const paths = resolvePaths(config);
-	const client = await getOrCreateServerClient(sessionId, config);
+	const client = await getOrCreateServerClient(config);
 
 	let response: any;
 	try {
@@ -193,7 +201,7 @@ export async function executeMemoryRecall(
 				facts_path: paths.factsPath,
 				scope: scope ?? config.scoping,
 				project: config.projectName,
-				limit: config.recallLimit,
+				limit: config.recallLimit * 3,  // over-retrieve; scope-filter then slice to recallLimit
 				recency_weight: config.recencyWeight,
 			}),
 			new Promise((_, reject) =>
@@ -225,11 +233,10 @@ export async function executeMemoryRecall(
  * Trigger the server's background build action to index new memory files.
  */
 export async function executeMemoryBuild(
-	sessionId: string,
 	config: MmemoryConfig,
 ): Promise<void> {
 	const paths = resolvePaths(config);
-	const client = await getOrCreateServerClient(sessionId, config);
+	const client = await getOrCreateServerClient(config);
 	try {
 		await client.query("build", {
 			memory_dir: paths.memoryDir,
@@ -258,26 +265,32 @@ export function formatRecallForSystemPrompt(result: RecallResult): string | unde
  * that bypass the extension lifecycle.
  */
 export async function executeMemoryRetain(
-	_sessionId: string,
 	content: string,
-	_config: MmemoryConfig,
+	config: MmemoryConfig,
 ): Promise<string> {
-	// The extension's auto-retain handles this on agent_end.
-	// Direct retain via tool writes verbatim content as a memory note.
-	return `Memory note queued for indexing: ${content.slice(0, 100)}${content.length > 100 ? "..." : ""}`;
+	const paths = resolvePaths(config);
+	await fs.mkdir(paths.memoryDir, { recursive: true });
+	const today = new Date().toISOString().slice(0, 10);
+	const suffix = Date.now().toString(36).slice(-6);
+	const filename = `${today}-note-${suffix}.md`;
+	const filePath = path.join(paths.memoryDir, filename);
+	const header = `# Memory Note — ${today}\n\n`;
+	await fs.writeFile(filePath, header + content, "utf-8");
+	// Trigger background re-index
+	void executeMemoryBuild(config).catch(() => {});
+	return `Retained: ${filename}`;
 }
 
 /**
  * executeMemoryReflect delegates to recall with a synthesis framing.
  */
 export async function executeMemoryReflect(
-	sessionId: string,
 	query: string,
 	scope: string | undefined,
 	config: MmemoryConfig,
 ): Promise<RecallResult> {
 	// Reflect = recall with higher limit, framed as synthesis request
-	const result = await executeMemoryRecall(sessionId, query, scope, {
+	const result = await executeMemoryRecall(query, scope, {
 		...config,
 		recallLimit: Math.min(config.recallLimit * 2, 20),
 	});
