@@ -1154,7 +1154,8 @@ export class ModelRegistry {
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
-		if (!configuredProviders.has("ollama")) {
+		const disabled = getDisabledProviderIdsFromSettings();
+		if (!configuredProviders.has("ollama") && !disabled.has("ollama")) {
 			this.#discoverableProviders.push({
 				provider: "ollama",
 				api: "openai-responses",
@@ -1164,7 +1165,7 @@ export class ModelRegistry {
 			});
 			this.#keylessProviders.add("ollama");
 		}
-		if (!configuredProviders.has("llama.cpp")) {
+		if (!configuredProviders.has("llama.cpp") && !disabled.has("llama.cpp")) {
 			this.#discoverableProviders.push({
 				provider: "llama.cpp",
 				api: "openai-responses",
@@ -1177,7 +1178,7 @@ export class ModelRegistry {
 				this.#keylessProviders.add("llama.cpp");
 			}
 		}
-		if (!configuredProviders.has("lm-studio")) {
+		if (!configuredProviders.has("lm-studio") && !disabled.has("lm-studio")) {
 			this.#discoverableProviders.push({
 				provider: "lm-studio",
 				api: "openai-completions",
