@@ -1914,6 +1914,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+
+	"mmemory.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "MMemory",
+			description:
+				"Enable memory extension tools (mmemory_recall, mmemory_retain, mmemory_reflect). Requires Python + fastembed + safetensors.",
+		},
+	},
 	// Tool execution
 	"tools.intentTracing": {
 		type: "boolean",

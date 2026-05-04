@@ -43,6 +43,10 @@ import { IrcTool } from "./irc";
 import { JobTool } from "./job";
 import { NotebookTool } from "./notebook";
 import { MReviewTool } from "./mreview/tool";
+import { MMemoryTool } from "./mmemory/tool";
+import { MmemoryRecallTool } from "./mmemory/recall-tool";
+import { MmemoryReflectTool } from "./mmemory/reflect-tool";
+import { MmemoryRetainTool } from "./mmemory/retain-tool";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import { RecipeTool } from "./recipe";
@@ -302,6 +306,9 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	retain: HindsightRetainTool.createIf,
 	recall: HindsightRecallTool.createIf,
 	reflect: HindsightReflectTool.createIf,
+	mmemory_retain: MmemoryRetainTool.createIf,
+	mmemory_recall: MmemoryRecallTool.createIf,
+	mmemory_reflect: MmemoryReflectTool.createIf,
 };
 
 export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
@@ -310,6 +317,8 @@ export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 	report_tool_issue: s => createReportToolIssueTool(s),
 	exit_plan_mode: s => new ExitPlanModeTool(s),
 	resolve: s => new ResolveTool(s),
+	// mmemory: event-bus gateway for .memory prefix; hidden from agent — agent uses mmemory_recall/retain/reflect
+	mmemory: MMemoryTool.createIf,
 };
 
 export type ToolName = keyof typeof BUILTIN_TOOLS;
@@ -462,8 +471,16 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			const currentDepth = session.taskDepth ?? 0;
 			return maxDepth < 0 || currentDepth < maxDepth;
 		}
-		const enabledSetting = `${name}.enabled` as SettingPath;
-		if (enabledSetting in SETTINGS_SCHEMA) return session.settings.get(enabledSetting) !== false;
+		if (name === "mbrowser") return session.settings.get("mbrowser.enabled");
+		if (name === "mreview") return session.settings.get("mreview.enabled");
+		if (
+			name === "mmemory" ||
+			name === "mmemory_retain" ||
+			name === "mmemory_recall" ||
+			name === "mmemory_reflect"
+		) {
+			return session.settings.get("mmemory.enabled" as any);
+		}
 		return true;
 	};
 	if (includeYield && requestedTools && !requestedTools.includes("yield")) {

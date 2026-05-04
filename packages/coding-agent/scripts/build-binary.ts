@@ -23,6 +23,8 @@ async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): 
 }
 
 async function main(): Promise<void> {
+	const buildTime = new Date().toISOString();
+
 	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 	try {
 		await runCommand(["bun", "--cwd=../natives", "run", "embed:native"]);
@@ -33,15 +35,12 @@ async function main(): Promise<void> {
 					"bun",
 					"build",
 					"--compile",
-					"--define",
-					'process.env.PI_COMPILED="true"',
-					"--external",
-					"mupdf",
-					"--root",
-					"../..",
+					"--define", 'process.env.PI_COMPILED="true"',
+					"--define", `process.env.BUILD_TIME="${buildTime}"`,
+					"--external", "mupdf",
+					"--root", "../..",
 					"./src/cli.ts",
-					"--outfile",
-					"dist/omp",
+					"--outfile", "dist/omp",
 				],
 				buildEnv,
 			);

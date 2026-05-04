@@ -30,23 +30,61 @@
  *   - No sharing, no paste service, no plannotator.ai cloud dependencies.
  *     Entirely local.
  */
-import { existsSync, readFileSync } from "node:fs";
+import * as os from "node:os";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import { fileURLToPath } from "node:url";
+
+// mreview-ui.html is embedded at compile time via Bun's asset import.
+// HTMLBundle is Bun's type for *.html imports; with { type: "text" } returns
+// the raw string at runtime despite the type mismatch.
+import mreviewUiHtmlAsset from "./mreview-ui.html" with { type: "text" };
+const EMBEDDED_HTML = mreviewUiHtmlAsset as unknown as string;
+
 import { startMReviewServer } from "./server";
 
 export type { MReviewDecision } from "./server";
 
-const MREVIEW_UI_PATH = (() => {
-	const exeDir = resolvePath(process.execPath, "..");
-	const exeCandidate = resolvePath(exeDir, "mreview-ui.html");
-	if (existsSync(exeCandidate)) return exeCandidate;
-	return fileURLToPath(new URL("./mreview-ui.html", import.meta.url));
-})();
+// Timestamp baked in at compile time. Falls back to epoch in dev (bun run).
+const BUILD_TIME = new Date(process.env.BUILD_TIME ?? 0);
 
-/** Returns true if the mreview-ui.html sidecar is present. */
+// Co-locate the sidecar with the binary when compiled; use ~/.omp in dev.
+const MREVIEW_SIDECAR = process.env.PI_COMPILED === "true"
+	? resolvePath(process.execPath, "..", "mreview-ui.html")
+	: resolvePath(os.homedir(), ".omp", "mreview-ui.html");
+
+/**
+ * Resolve the HTML content to serve.
+ *
+ * When the embedded build is newer than the local sidecar, flushes the embedded
+ * content to disk so the developer can continue iterating from the latest version.
+ *
+ * Rules:
+ *   - No local file             → flush embedded to disk, serve it
+ *   - local.mtime >= BUILD_TIME → use local  (developer is iterating on it)
+ *   - local.mtime <  BUILD_TIME → flush embedded to disk, serve it  (build is newer)
+ */
+function resolveHtmlContent(): string {
+	try {
+		const { mtimeMs } = statSync(MREVIEW_SIDECAR);
+		if (mtimeMs >= BUILD_TIME.getTime()) {
+			return readFileSync(MREVIEW_SIDECAR, "utf-8"); // local is newer — dev is working on it
+		}
+	} catch {
+		// Missing or unreadable — fall through to flush
+	}
+	// Embedded is newer (or file missing): write to disk so dev can edit from latest
+	try {
+		mkdirSync(resolvePath(MREVIEW_SIDECAR, ".."), { recursive: true });
+		writeFileSync(MREVIEW_SIDECAR, EMBEDDED_HTML, "utf-8");
+	} catch {
+		// Write failed (e.g. read-only install dir) — serve from memory silently
+	}
+	return EMBEDDED_HTML;
+}
+
+/** Always true — HTML is embedded in the binary. */
 export function hasMReviewHtml(): boolean {
-	return existsSync(MREVIEW_UI_PATH);
+	return true;
 }
 
 /**
@@ -94,12 +132,10 @@ export async function openMReviewSession(
   config: MReviewConfig = {},
   signal?: AbortSignal,
 ): Promise<import("./server").MReviewDecision> {
-	const uiPath = MREVIEW_UI_PATH;
-	const htmlContent = readFileSync(uiPath, "utf-8");
   const server = await startMReviewServer({
     markdown,
     filePath,
-    htmlContent,
+    htmlContent: resolveHtmlContent(),
     cwd: ctx.cwd,
     agent: config.agent,
   });
