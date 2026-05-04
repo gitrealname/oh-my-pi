@@ -87,7 +87,7 @@ function parseWmicTable(output: string, header: string): string | null {
 const AGENTS_MD_MIN_DEPTH = 1;
 const AGENTS_MD_MAX_DEPTH = 4;
 const AGENTS_MD_LIMIT = 200;
-const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
+const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 15000;
 const AGENTS_MD_EXCLUDED_DIRS = new Set(["node_modules", ".git"]);
 
 export interface AgentsMdSearch {
