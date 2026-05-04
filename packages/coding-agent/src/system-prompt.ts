@@ -99,6 +99,7 @@ export interface AgentsMdSearch {
 
 async function listAgentsMdFiles(root: string, limit: number): Promise<string[]> {
 	try {
+		const t0 = Date.now();
 		const result = await glob({
 			pattern: "**/AGENTS.md",
 			path: root,
@@ -109,6 +110,7 @@ async function listAgentsMdFiles(root: string, limit: number): Promise<string[]>
 			maxResults: limit * 4,
 			cache: true,
 		});
+		const globMs = Date.now() - t0;
 		const files: string[] = [];
 		for (const m of result.matches) {
 			const rel = m.path.replace(/\\/g, "/");
@@ -121,6 +123,10 @@ async function listAgentsMdFiles(root: string, limit: number): Promise<string[]>
 			files.push(rel);
 			if (files.length >= limit) break;
 		}
+		logger.debug(
+			`[system-prompt] buildAgentsMdSearch: glob=${globMs}ms candidates=${result.matches.length} accepted=${files.length} root=${root}`,
+			{ source: "system-prompt" },
+		);
 		return Array.from(new Set(files)).sort().slice(0, limit);
 	} catch {
 		return [];
@@ -128,7 +134,12 @@ async function listAgentsMdFiles(root: string, limit: number): Promise<string[]>
 }
 
 export async function buildAgentsMdSearch(cwd: string): Promise<AgentsMdSearch> {
+	const t0 = Date.now();
 	const files = await listAgentsMdFiles(cwd, AGENTS_MD_LIMIT);
+	logger.debug(
+		`[system-prompt] buildAgentsMdSearch done: ${Date.now() - t0}ms files=${files.length}`,
+		{ source: "system-prompt" },
+	);
 	return {
 		scopePath: ".",
 		limit: AGENTS_MD_LIMIT,
