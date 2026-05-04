@@ -9,6 +9,7 @@ import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink } from "../session/streaming-output";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
+import { normalizeCommandForWindows } from "./bash-win-normalize";
 
 export interface BashExecutorOptions {
 	cwd?: string;
@@ -65,20 +66,6 @@ async function resolveShellCwd(cwd: string | undefined): Promise<string | undefi
 	} catch {
 		return IS_WINDOWS ? normalizeCwdForWindows(cwd) : cwd;
 	}
-}
-
-/**
- * On Windows, Git Bash maps `/dev/null` to `<drive>:/dev/null` when the
- * redirect is processed by the Bun/brush runtime layer rather than the shell
- * itself. Rewrite shell-style null-device references to the Windows `NUL`
- * device so the redirect is always handled correctly.
- *
- * Also normalises backslashes in the cwd to forward slashes so Git Bash
- * receives a POSIX-style path rather than a Windows path.
- */
-function normalizeCommandForWindows(command: string): string {
-	// Replace > /dev/null and 2>/dev/null (and variants with spaces) with NUL
-	return command.replace(/\b(2\s*>|>\s*)\/dev\/null\b/g, (_, prefix) => `${prefix}NUL`);
 }
 
 function normalizeCwdForWindows(cwd: string): string {
