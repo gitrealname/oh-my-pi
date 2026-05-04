@@ -1,9 +1,12 @@
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
+import * as nodePath from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { sanitizeText } from "@oh-my-pi/pi-natives";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
+import { executePython } from "../../eval/py/executor";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
@@ -170,6 +173,13 @@ export class InputController {
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.observe")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionObserver());
+		}
+
+		for (let slot = 1; slot <= 10; slot++) {
+			for (const key of this.ctx.keybindings.getKeys(`app.script.${slot}` as "app.script.1")) {
+				const capturedSlot = slot;
+				this.ctx.editor.setCustomKeyHandler(key, () => void this.handleScript(capturedSlot));
+			}
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
@@ -577,6 +587,116 @@ export class InputController {
 		} catch {
 			this.ctx.showStatus("Failed to read clipboard");
 			return false;
+		}
+	}
+
+	// ─── Script executor ────────────────────────────────────────────────────
+
+	/** Return true if output looks like a path to an existing image file. */
+	#isImagePath(output: string): boolean {
+		if (output.includes("\n")) return false;
+		if (!/\.(png|jpe?g|gif|webp|bmp)$/i.test(output)) return false;
+		try { return existsSync(output); } catch { return false; }
+	}
+
+	/** Derive MIME type from a file extension. */
+	#mimeFromPath(p: string): string {
+		const ext = nodePath.extname(p).toLowerCase();
+		return ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
+			: ext === ".gif" ? "image/gif"
+			: ext === ".webp" ? "image/webp"
+			: ext === ".bmp" ? "image/bmp"
+			: "image/png";
+	}
+
+	/** Run a command string; returns stdout text. Prefix dispatch:
+	 *  - `py: <code>`  → executePython via existing IPython kernel
+	 *  - `js: <code>`  → bun --eval (in-process Bun; no ToolSession needed)
+	 *  - anything else → shell spawn, capture stdout
+	 */
+	async #runScriptCommand(cmd: string): Promise<string> {
+		const trimmed = cmd.trim();
+
+		if (trimmed.startsWith("py:")) {
+			const code = trimmed.slice(3).trimStart();
+			const result = await executePython(code, { cwd: this.ctx.sessionManager.getCwd() });
+			return result.output.trim();
+		}
+
+		if (trimmed.startsWith("js:")) {
+			const code = trimmed.slice(3).trimStart();
+			const proc = Bun.spawn(["bun", "--eval", code], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: this.ctx.sessionManager.getCwd(),
+			});
+			const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+			return out.trim();
+		}
+
+		// Generic shell command — split on whitespace (quoted paths: use py:/js:)
+		const parts = trimmed.split(/\s+/);
+		const proc = Bun.spawn(parts, {
+			stdout: "pipe",
+			stderr: "pipe",
+			cwd: this.ctx.sessionManager.getCwd(),
+		});
+		const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		return out.trim();
+	}
+
+	async handleScript(slot: number): Promise<void> {
+		const cmd = settings.get(`scripts.${slot}.command` as "scripts.1.command");
+		if (!cmd) {
+			const desc = settings.get(`scripts.${slot}.description` as "scripts.1.description") ?? `Script ${slot}`;
+			this.ctx.showStatus(`${desc}: no command configured (scripts.${slot}.command)`);
+			return;
+		}
+
+		const desc = settings.get(`scripts.${slot}.description` as "scripts.1.description") ?? `Script ${slot}`;
+		try {
+			const output = await this.#runScriptCommand(cmd);
+			if (!output) {
+				this.ctx.showStatus(`${desc}: no output`);
+				return;
+			}
+
+			// ── Image path branch ──────────────────────────────────────────────
+			if (this.#isImagePath(output)) {
+				const bytes = await fs.readFile(output);
+				let imageData = await ensureSupportedImageInput({
+					type: "image",
+					data: bytes.toBase64(),
+					mimeType: this.#mimeFromPath(output),
+				});
+				if (!imageData) {
+					this.ctx.showStatus(`${desc}: unsupported image format`);
+					return;
+				}
+			if (settings.get("images.autoResize")) {
+				try {
+					const resized = await resizeImage(imageData);
+					imageData = { type: "image", data: Buffer.from(resized.buffer).toString("base64"), mimeType: resized.mimeType };
+				} catch { /* keep original */ }
+			}
+			this.ctx.pendingImages.push(imageData);
+				const num = this.ctx.pendingImages.length;
+				this.ctx.editor.insertText(`[Image #${num}] `);
+				this.ctx.ui.requestRender();
+				return;
+			}
+
+			// ── Text branch ────────────────────────────────────────────────────
+			// Small output: insert inline. Large output: bracketed-paste so OMP
+			// shows its "Large paste" indicator and the user can review before send.
+			const INLINE_LIMIT = 500;
+			if (output.length <= INLINE_LIMIT) {
+				this.ctx.editor.insertText(output);
+			} else {
+				this.ctx.editor.handleInput(`\x1b[200~${output}\x1b[201~`);
+			}
+		} catch (err) {
+			this.ctx.showStatus(`${desc} failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
 
