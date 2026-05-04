@@ -19,6 +19,16 @@ type ConfigurableEditorAction = Extract<
 	| "app.message.dequeue"
 	| "app.clipboard.pasteImage"
 	| "app.clipboard.copyPrompt"
+	| "app.script.1"
+	| "app.script.2"
+	| "app.script.3"
+	| "app.script.4"
+	| "app.script.5"
+	| "app.script.6"
+	| "app.script.7"
+	| "app.script.8"
+	| "app.script.9"
+	| "app.script.10"
 >;
 
 const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
@@ -38,6 +48,16 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.message.dequeue": ["alt+up"],
 	"app.clipboard.pasteImage": ["ctrl+v"],
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
+	"app.script.1":  [],
+	"app.script.2":  [],
+	"app.script.3":  [],
+	"app.script.4":  [],
+	"app.script.5":  [],
+	"app.script.6":  [],
+	"app.script.7":  [],
+	"app.script.8":  [],
+	"app.script.9":  [],
+	"app.script.10": [],
 };
 
 /**
