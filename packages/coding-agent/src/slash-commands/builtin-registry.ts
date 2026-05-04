@@ -3,6 +3,12 @@ import * as path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { hasMReviewHtml, openMReviewSession } from "../tools/mreview/index";
+import {
+	executeMemoryRecall,
+	executeMemoryReflect,
+	formatRecallForSystemPrompt,
+	loadMmemoryConfig,
+} from "../tools/mmemory/index";
 
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { SettingPath, SettingValue } from "../config/settings";
@@ -103,6 +109,109 @@ const shutdownHandler = (_command: ParsedBuiltinSlashCommand, runtime: BuiltinSl
 };
 
 
+
+const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<string | undefined> => {
+	const args = command.args.trim();
+	const [subcommand, ...rest] = args.split(/\s+/);
+	const restStr = rest.join(" ");
+	const cwd = runtime.ctx.sessionManager.getCwd();
+	const config = loadMmemoryConfig(settings as any, cwd);
+	runtime.ctx.editor.setText("");
+
+	if (!config) {
+		runtime.ctx.showWarning("mmemory: not enabled. Set mmemory.enabled: true in config.");
+		return;
+	}
+
+	switch (subcommand) {
+		case "recall": {
+			if (!restStr) { runtime.ctx.showStatus("Usage: /mmemory recall <query>"); return; }
+			const scopeMatch = restStr.match(/--scope\s+(\S+)/);
+			const scope = scopeMatch ? scopeMatch[1] : undefined;
+			const query = restStr.replace(/--scope\s+\S+/, "").trim();
+			runtime.ctx.showStatus(`mmemory: recalling "${query}"...`);
+			const result = await executeMemoryRecall("manual", query, scope, config);
+			runtime.ctx.showStatus(result.resultCount > 0
+				? `mmemory: ${result.resultCount} memories found.`
+				: "mmemory: no memories found.");
+			await runtime.ctx.session.agent.prompt(
+				`[Memory recall result for "${query}"]\n\n${result.text}`,
+			);
+			break;
+		}
+		case "reflect": {
+			if (!restStr) { runtime.ctx.showStatus("Usage: /mmemory reflect <query>"); return; }
+			const scopeMatch = restStr.match(/--scope\s+(\S+)/);
+			const scope = scopeMatch ? scopeMatch[1] : undefined;
+			const query = restStr.replace(/--scope\s+\S+/, "").trim();
+			runtime.ctx.showStatus(`mmemory: reflecting on "${query}"...`);
+			const result = await executeMemoryReflect("manual", query, scope, config);
+			runtime.ctx.showStatus(`mmemory: reflect done (${result.resultCount} memories).`);
+			await runtime.ctx.session.agent.prompt(
+				`[Memory reflection on "${query}"]\n\n${result.text}`,
+			);
+			break;
+		}
+		case "retain": {
+			runtime.ctx.showStatus("mmemory: retain is handled automatically by the extension.");
+			break;
+		}
+		case "view": {
+			const viewResult = await executeMemoryRecall("manual", "recent context", undefined, config);
+			const snippet = formatRecallForSystemPrompt(viewResult);
+			runtime.ctx.showStatus(snippet ? "mmemory: showing recall snippet." : "mmemory: no memories loaded.");
+			if (snippet) {
+				await runtime.ctx.session.agent.prompt(`[Current memory recall snippet]\n\n${snippet}`);
+			}
+			break;
+		}
+		case "status": {
+			const memDir = path.join(config.storagePath, config.projectName);
+			const enabled = settings.get("mmemory.enabled" as SettingPath);
+			runtime.ctx.showStatus(
+				`mmemory: enabled=${String(enabled)}, project=${config.projectName}, path=${memDir}, scoping=${config.scoping}`,
+			);
+			break;
+		}
+		case "clear": {
+			// Selective clear — requires --from and/or --to or --session
+			const fromMatch = restStr.match(/--from\s+(\S+)/);
+			const toMatch = restStr.match(/--to\s+(\S+)/);
+			const sessionMatch = restStr.match(/--session\s+(\S+)/);
+			if (!fromMatch && !toMatch && !sessionMatch) {
+				runtime.ctx.showWarning(
+					"mmemory clear requires --from DATE, --to DATE, or --session ID. Full deletion is not supported.",
+				);
+				return;
+			}
+			const from = fromMatch?.[1];
+			const to = toMatch?.[1];
+			const sessionId = sessionMatch?.[1];
+			const rangeDesc = sessionId
+				? `session ${sessionId}`
+				: `${from ?? "*"} → ${to ?? "*"}`;
+			runtime.ctx.showStatus(`mmemory: clear ${rangeDesc} — use the extension's CLI for confirmed deletion.`);
+			break;
+		}
+		case "enqueue": {
+			runtime.ctx.showStatus("mmemory: enqueue — use the extension to trigger a retain cycle.");
+			break;
+		}
+		case "global": {
+			runtime.ctx.showStatus("mmemory: scope switched to global for this session (set in extension state).");
+			break;
+		}
+		case "project": {
+			runtime.ctx.showStatus("mmemory: scope reset to per-project-tagged.");
+			break;
+		}
+		default: {
+			runtime.ctx.showStatus(
+				"Usage: /mmemory <recall|retain|reflect|view|clear|enqueue|status> [args]",
+			);
+		}
+	}
+};
 const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<void> => {
 	const args = command.args.trim().replace(/^@/, ""); // strip leading @ from @file mentions
 	if (!args) {
@@ -1088,6 +1197,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 		inlineHint: "<file.md>",
 		allowArgs: true,
 		handle: mreviewHandler,
+	},
+
+	{
+		name: "mmemory",
+		description: "Memory operations: recall, retain, reflect, view, clear, enqueue, status",
+		inlineHint: "<recall|retain|reflect|view|clear|enqueue|status> [args]",
+		allowArgs: true,
+		subcommands: [
+			{ name: "recall",  description: "Search memories with BM25+semantic retrieval" },
+			{ name: "retain",  description: "Store information (auto-triggered by extension)" },
+			{ name: "reflect", description: "Synthesize memories on a topic" },
+			{ name: "view",    description: "Show current recall snippet" },
+			{ name: "clear",   description: "Delete memories (--from DATE [--to DATE] | --session ID)" },
+			{ name: "enqueue", description: "Force retain now" },
+			{ name: "status",  description: "Show memory system status" },
+			{ name: "global",  description: "Switch to global scope this session" },
+			{ name: "project", description: "Switch back to per-project-tagged scope" },
+		],
+		handle: mmemoryHandler,
 	},
 
 ];

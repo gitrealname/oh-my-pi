@@ -5,6 +5,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import { executePython } from "../../eval/py/executor";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { SessionManager } from "../../session/session-manager";
@@ -169,6 +170,8 @@ export class ExtensionRunner {
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string = () => "";
+	#executePythonFn: NonNullable<ExtensionContextActions["executePython"]> = (code, options) =>
+		executePython(code, { ...options, cwd: options?.cwd ?? this.cwd });
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -214,6 +217,8 @@ export class ExtensionRunner {
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		this.#executePythonFn = contextActions.executePython ?? ((code, options) =>
+			executePython(code, { ...options, cwd: options?.cwd ?? this.cwd }));
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -401,6 +406,7 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
+			executePython: (code, options) => this.#executePythonFn(code, options),
 		};
 	}
 

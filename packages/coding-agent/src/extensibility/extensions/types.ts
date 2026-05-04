@@ -29,6 +29,7 @@ import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
+import type { PythonExecutorOptions } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { Theme } from "../../modes/theme/theme";
@@ -243,6 +244,11 @@ export interface ExtensionContext {
 	getSystemPrompt(): string;
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
+	/** Execute Python code via the shared kernel (session-scoped or per-call). */
+	executePython?(
+		code: string,
+		options?: Pick<PythonExecutorOptions, "sessionId" | "cwd" | "deadlineMs" | "timeoutMs" | "signal">,
+	): Promise<PythonResult>;
 }
 
 /**
@@ -1319,6 +1325,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string;
+	executePython?: ExtensionContext["executePython"];
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */
