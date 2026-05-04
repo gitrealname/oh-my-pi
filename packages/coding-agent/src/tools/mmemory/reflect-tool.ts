@@ -29,7 +29,7 @@ export class MmemoryReflectTool implements AgentTool<typeof schema> {
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MmemoryReflectTool | null {
-		if (!session.settings.get("mmemory.enabled" as any)) return null;
+		if (!session.settings.get("mmemory.enabled")) return null;
 		return new MmemoryReflectTool(session);
 	}
 

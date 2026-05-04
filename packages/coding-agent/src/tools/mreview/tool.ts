@@ -39,7 +39,7 @@ export class MReviewTool implements AgentTool<typeof schema> {
 	}
 
 	static createIf(session: ToolSession): MReviewTool | null {
-		if (!session.settings.get("mreview.enabled" as any)) return null;
+		if (!session.settings.get("mreview.enabled")) return null;
 		return new MReviewTool(session);
 	}
 
