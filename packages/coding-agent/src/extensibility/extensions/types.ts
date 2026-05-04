@@ -256,6 +256,8 @@ export interface ExtensionContext {
 		code: string,
 		options?: Pick<PythonExecutorOptions, "sessionId" | "cwd" | "deadlineMs" | "timeoutMs" | "signal">,
 	): Promise<PythonResult>;
+	/** Task recursion depth. 0 = top-level session; >0 = subagent. */
+	readonly taskDepth: number;
 }
 
 /**

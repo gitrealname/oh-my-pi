@@ -6,8 +6,14 @@
  *
  * Protocol: newline-delimited JSON over TCP (localhost only).
  * Server prints "READY:<port>" to stdout before accepting connections.
+ *
+ * Spawn options:
+ *   windowsHide: true  — no visible console window on Windows
+ *   priority 10        — below-normal priority; server is background infrastructure
+ *   stderr → logger    — Python server logs routed through omp's logger facility
  */
 import * as net from "net";
+import { logger } from "@oh-my-pi/pi-utils";
 import { resolvePython } from "../../stt/transcriber";
 
 export class MmemoryServerClient {
@@ -44,12 +50,8 @@ export class MmemoryServerClient {
 
 	/** Ensure server is alive. Transparent restart after idle-timeout. */
 	async #ensureRunning(): Promise<void> {
-		// If a start is already in flight, wait for it
-		if (this.startPromise) {
-			return this.startPromise;
-		}
+		if (this.startPromise) return this.startPromise;
 		if (this.port > 0) {
-			// Ping to check if still alive
 			try {
 				await this.#rawQuery({ action: "ping" });
 				return;
@@ -59,7 +61,6 @@ export class MmemoryServerClient {
 				this.proc = null;
 			}
 		}
-		// Re-check after any await — another caller may have started while we were pinging
 		if (this.startPromise) return this.startPromise;
 		this.startPromise = this.#start().finally(() => {
 			this.startPromise = null;
@@ -68,23 +69,64 @@ export class MmemoryServerClient {
 	}
 
 	async #start(): Promise<void> {
-		// Bun.spawn is available in the Bun runtime
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const spawn = (globalThis as any).Bun?.spawn;
 		if (!spawn) throw new Error("mmemory server requires Bun runtime");
 
 		this.proc = spawn(
 			[this.pythonCmd, this.serverScriptPath, "--port", "0", "--timeout", String(this.idleTimeoutMinutes)],
-			{ stdout: "pipe", stderr: "pipe" },
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				// No visible console window on Windows — consistent with all other
+				// background subprocess spawns in omp (LSP servers, plugins, eval gateway).
+				windowsHide: true,
+			},
 		);
-		// Slightly elevated priority for recall responsiveness
+
+		// Below-normal process priority — the mmemory server is background infrastructure.
+		// Recall performance comes from the warm model, not from CPU scheduling.
+		// Priority 10 = BELOW_NORMAL_PRIORITY_CLASS on Windows; nice ~10 on Unix.
 		try {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(process as any).setPriority?.(this.proc.pid as number, -5);
+			process.setPriority?.(this.proc.pid as number, 10);
 		} catch {
-			// Non-fatal: priority setting may require elevated permissions on some systems
+			// Non-fatal — elevated permissions may be required on some systems.
 		}
+
+		// Route Python server stderr → omp logger. Server logs [mmemory] prefixed messages.
+		// Without this, all Python-side diagnostics (model load times, build stats, errors)
+		// are silently dropped.
+		this.#consumeStderr();
+
 		this.port = await this.#readReadyPort();
+	}
+
+	/** Drain stderr from the Python process and route through omp's logger. */
+	#consumeStderr(): void {
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+		const stderr: NodeJS.ReadableStream | undefined = this.proc?.stderr;
+		if (!stderr) return;
+
+		let buf = "";
+		stderr.on("data", (chunk: Buffer | string) => {
+			buf += typeof chunk === "string" ? chunk : chunk.toString();
+			const lines = buf.split("\n");
+			buf = lines.pop() ?? "";
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (trimmed) {
+					// ERROR lines surface as warn; everything else as debug (hidden in normal use)
+					if (trimmed.includes("ERROR")) {
+						logger.warn(trimmed, { source: "mmemory-server" });
+					} else {
+						logger.debug(trimmed, { source: "mmemory-server" });
+					}
+				}
+			}
+		});
+		stderr.on("end", () => {
+			if (buf.trim()) logger.debug(buf.trim(), { source: "mmemory-server" });
+		});
 	}
 
 	/** Read "READY:<port>" line from stdout. Times out after 30s. */
@@ -133,9 +175,7 @@ export class MmemoryServerClient {
 				reject(new Error("mmemory server query timed out after 15s"));
 			});
 			let buf = "";
-			socket.on("data", (d: Buffer) => {
-				buf += d.toString();
-			});
+			socket.on("data", (d: Buffer) => { buf += d.toString(); });
 			socket.on("end", () => {
 				try {
 					resolve(JSON.parse(buf));

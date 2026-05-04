@@ -4,10 +4,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { hasMReviewHtml, openMReviewSession } from "../tools/mreview/index";
 import {
+	executeMemoryBuild,
 	executeMemoryRecall,
 	executeMemoryReflect,
 	formatRecallForSystemPrompt,
+	getOrCreateServerClient,
 	loadMmemoryConfig,
+	resolvePaths,
 } from "../tools/mmemory/index";
 
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
@@ -166,17 +169,21 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			break;
 		}
 		case "status": {
-			const memDir = path.join(config.storagePath, config.projectName);
+			const mmPaths = resolvePaths(config);
 			const enabled = settings.get("mmemory.enabled" as SettingPath);
+			const hasChunks = existsSync(mmPaths.chunksPath);
+			const chunkCount = hasChunks
+				? (() => { try { return (JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as unknown[]).length; } catch { return "?"; } })()
+				: 0;
 			runtime.ctx.showStatus(
-				`mmemory: enabled=${String(enabled)}, project=${config.projectName}, path=${memDir}, scoping=${config.scoping}`,
+				`mmemory: enabled=${String(enabled)}, project=${config.projectName}, ` +
+				`chunks=${chunkCount}, scoping=${config.scoping}, path=${mmPaths.projectDir}`,
 			);
 			break;
 		}
 		case "clear": {
-			// Selective clear — requires --from and/or --to or --session
-			const fromMatch = restStr.match(/--from\s+(\S+)/);
-			const toMatch = restStr.match(/--to\s+(\S+)/);
+			const fromMatch    = restStr.match(/--from\s+(\S+)/);
+			const toMatch      = restStr.match(/--to\s+(\S+)/);
 			const sessionMatch = restStr.match(/--session\s+(\S+)/);
 			if (!fromMatch && !toMatch && !sessionMatch) {
 				runtime.ctx.showWarning(
@@ -184,13 +191,41 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 				);
 				return;
 			}
-			const from = fromMatch?.[1];
-			const to = toMatch?.[1];
+			const from      = fromMatch?.[1];
+			const to        = toMatch?.[1];
 			const sessionId = sessionMatch?.[1];
-			const rangeDesc = sessionId
-				? `session ${sessionId}`
-				: `${from ?? "*"} → ${to ?? "*"}`;
-			runtime.ctx.showStatus(`mmemory: clear ${rangeDesc} — use the extension's CLI for confirmed deletion.`);
+			const mmPaths   = resolvePaths(config);
+			const rangeDesc = sessionId ? `session ${sessionId}` : `${from ?? "*"} → ${to ?? "*"}`;
+
+			runtime.ctx.showStatus(`mmemory: clearing ${rangeDesc}...`);
+			try {
+				// Delegate to server — runs under _build_lock, preventing race with in-flight builds
+				const client = await getOrCreateServerClient(config);
+				const resp = await client.query("clear", {
+					project_dir: mmPaths.projectDir,
+					from_date:   from,
+					to_date:     to,
+					session_id:  sessionId,
+				}) as { status?: string; deleted?: number; remaining?: number; error?: string };
+
+				if (resp.error) {
+					runtime.ctx.showWarning(`mmemory clear: ${resp.error}`);
+					break;
+				}
+				const deleted = resp.deleted ?? 0;
+				if (deleted > 0) {
+					// Vectors were deleted by the server; trigger rebuild so next recall re-embeds
+					void executeMemoryBuild(config).catch(() => {});
+					runtime.ctx.showStatus(
+						`mmemory: cleared ${deleted} chunk(s) matching ${rangeDesc} ` +
+						`(${resp.remaining ?? 0} remain). Rebuilding index.`,
+					);
+				} else {
+					runtime.ctx.showStatus(`mmemory: no chunks matched ${rangeDesc}.`);
+				}
+			} catch (e) {
+				runtime.ctx.showWarning(`mmemory clear: server error — ${String(e)}`);
+			}
 			break;
 		}
 		case "enqueue": {

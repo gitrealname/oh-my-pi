@@ -2,14 +2,13 @@
  * mmemory — Built-in inline lifecycle extension.
  *
  * Inspired by Hindsight (https://github.com/vectorize-io/hindsight) by Vectorize — Apache 2.0.
- * See research/omp/dist-templates/extensions/mmemory.README.md for attribution.
  *
  * Registered as an inline ExtensionFactory in sdk.ts alongside createAutoresearchExtension.
  * No sidecar file needed — compiled into the binary.
  *
  * Responsibilities:
  *   - Auto-recall on first agent turn (inject <memories> into system prompt)
- *   - Auto-retain on agent_end (every N turns)
+ *   - Auto-retain on agent_end (every N turns) — suppressed for subagents (taskDepth > 0)
  *   - .memory prefix → inject <memory_mode> directive
  *   - session.compacting → inject recall snippet into compaction context
  *   - Server lifecycle (shared via getOrCreateServerClient in tools/mmemory/index.ts)
@@ -26,14 +25,28 @@ import {
 	formatRecallForSystemPrompt,
 	loadMmemoryConfig,
 	resolvePaths,
+	sessionFilename,
 } from "./tools/mmemory/index";
+
+// ── Tag stripping (anti-feedback loop prevention) ─────────────────────────────
+//
+// Recalled <memories> are injected into the system prompt. If they leak into the
+// retained transcript, they get re-embedded in the next session's recall — a
+// positive feedback loop that degrades quality silently. Strip before writing.
+
+const STRIP_TAGS = /<memories>[\s\S]*?<\/memories>|<mental_models>[\s\S]*?<\/mental_models>/g;
+
+function stripMemoryInjections(text: string): string {
+	return text.replace(STRIP_TAGS, "").trim();
+}
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
 interface MmemorySessionState {
 	readonly config: import("./tools/mmemory/index").MmemoryConfig;
-	readonly memoryDir: string;
+	readonly queueDir: string;
 	readonly sessionId: string;
+	readonly sessionStartTime: Date;
 	lastRecallSnippet: string | undefined;
 	hasRecalledForFirstTurn: boolean;
 	lastRetainedTurn: number;
@@ -41,16 +54,44 @@ interface MmemorySessionState {
 }
 
 function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
+	// Subagent guard: subagents must not auto-retain — their exploration transcripts
+	// would pollute the memory store with internal monologue.
+	if (ctx.taskDepth > 0) return null;
+
 	const config = loadMmemoryConfig(settings, ctx.cwd);
 	if (!config) return null;
-	const { memoryDir } = resolvePaths(config);
 
-	// Scaffold storage directory + kb_config.yaml on first use
-	const isNew = !fs.existsSync(memoryDir);
-	fs.mkdirSync(memoryDir, { recursive: true });
+	const { projectDir, queueDir, indexDir, mentalModelsDir } = resolvePaths(config);
+
+	// Scaffold storage directories on first use
+	const isNew = !fs.existsSync(projectDir);
+	for (const dir of [queueDir, indexDir, mentalModelsDir]) {
+		fs.mkdirSync(dir, { recursive: true });
+	}
+
+	// Privacy: write .gitignore files to keep memory data out of git.
+	// Written unconditionally (cheap, idempotent) so moving storagePath into a
+	// git repo later doesn't silently expose conversation history.
+	const GITIGNORE_ALL = "# mmemory — conversation memory is private, never commit\n*\n";
+	// At project dir level — excludes queue/, index/, etc.
+	const gitignoreProject = path.join(projectDir, ".gitignore");
+	if (!fs.existsSync(gitignoreProject)) {
+		fs.writeFileSync(gitignoreProject, GITIGNORE_ALL, "utf-8");
+	}
+	// At storagePath level — excludes all project subdirs if storagePath lands in a repo.
+	const gitignoreStorage = path.join(config.storagePath, ".gitignore");
+	if (!fs.existsSync(gitignoreStorage)) {
+		fs.writeFileSync(
+			gitignoreStorage,
+			"# mmemory — memory data is private, never commit\n*\n!.gitignore\n",
+			"utf-8",
+		);
+	}
+
 	if (isNew) {
-		console.log(`[mmemory] Created memory store: ${memoryDir}`);
-		const kbConfigPath = path.join(memoryDir, "..", "kb_config.yaml");
+		console.log(`[mmemory] Created memory store: ${projectDir}`);
+		// Auto-generate kb_config.yaml entry so kb_search.py shows this as [external]
+		const kbConfigPath = path.join(projectDir, "..", "kb_config.yaml");
 		if (!fs.existsSync(kbConfigPath)) {
 			fs.writeFileSync(
 				kbConfigPath,
@@ -61,14 +102,24 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 				`  description: "Managed by mmemory — use /mmemory commands, not kb_update"\n`,
 				"utf-8",
 			);
-			console.log(`[mmemory] Created ${kbConfigPath}`);
 		}
 	}
 
+	// Scaffold global/ dir for per-project-tagged cross-project scoping
+	if (config.scoping === "per-project-tagged") {
+		const globalPaths = resolvePaths({ ...config, projectName: "global" });
+		fs.mkdirSync(globalPaths.queueDir, { recursive: true });
+		fs.mkdirSync(globalPaths.indexDir, { recursive: true });
+	}
+
+	const sessionStartTime = new Date();
+	const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
 	return {
 		config,
-		memoryDir,
-		sessionId: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+		queueDir,
+		sessionId,
+		sessionStartTime,
 		lastRecallSnippet: undefined,
 		hasRecalledForFirstTurn: false,
 		lastRetainedTurn: 0,
@@ -76,41 +127,68 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 	};
 }
 
+// ── Transcript builder ────────────────────────────────────────────────────────
+//
+// Turn-boundary format: each chunk = one user+assistant pair. The Python server's
+// chunk_by_turns() parses **User:** / **Assistant:** markers to reconstruct pairs.
+// Memory injection tags are stripped before writing (anti-feedback loop).
+
 function buildTranscript(messages: { role: string; content: unknown }[], contextTurns: number): string {
 	const relevant = contextTurns > 0 ? messages.slice(-contextTurns * 2) : messages;
 	const parts: string[] = [];
-	for (const m of relevant) {
-		const text = Array.isArray(m.content)
+
+	for (let i = 0; i < relevant.length; i++) {
+		const m = relevant[i];
+		if (m.role !== "user") continue;
+
+		const rawUser = Array.isArray(m.content)
 			? (m.content as { type: string; text?: string }[])
 				.filter(c => c.type === "text")
 				.map(c => c.text ?? "")
 				.join(" ")
 			: String(m.content ?? "");
-		if (!text.trim()) continue;
-		if (m.role === "user") parts.push(`**User:** ${text.trim()}`);
-		else if (m.role === "assistant") parts.push(`**Assistant:** ${text.slice(0, 1000).trim()}`);
+		const userText = stripMemoryInjections(rawUser).trim();
+		if (!userText) continue;
+
+		const next = relevant[i + 1];
+		let assistantText = "";
+		if (next?.role === "assistant") {
+			const rawAsst = Array.isArray(next.content)
+				? (next.content as { type: string; text?: string }[])
+					.filter(c => c.type === "text")
+					.map(c => c.text ?? "")
+					.join(" ")
+				: String(next.content ?? "");
+			assistantText = stripMemoryInjections(rawAsst).trim();
+		}
+
+		if (!userText && !assistantText) continue;
+
+		const turnParts: string[] = [];
+		if (userText) turnParts.push(`**User:** ${userText}`);
+		if (assistantText) turnParts.push(`**Assistant:** ${assistantText}`);
+		parts.push(turnParts.join("\n\n"));
 	}
-	return parts.join("\n\n");
+
+	return parts.join("\n\n---\n\n");
 }
 
 async function retainSession(state: MmemorySessionState, messages: { role: string; content: unknown }[]): Promise<void> {
 	const transcript = buildTranscript(messages, state.config.retainContextTurns);
 	if (!transcript) return;
 
-	const extracted =
-		state.config.extractionMode === "verbatim"
-			? transcript
-			: `<!-- extracted ${new Date().toISOString()} -->\n${transcript}`;
-
 	const today = new Date().toISOString().slice(0, 10);
-	const filePath = path.join(state.memoryDir, `${today}-${state.sessionId}.md`);
+	// Fixed filename per session — repeated retains overwrite the same file
+	const filename = sessionFilename(state.sessionId, state.sessionStartTime);
+	const filePath = path.join(state.queueDir, filename);
+
 	fs.writeFileSync(
 		filePath,
-		`# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${extracted}`,
+		`# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}`,
 		"utf-8",
 	);
 
-	// Background re-index via shared server client
+	// Server reads queue/*.md, embeds new chunks, deletes processed .md files
 	void executeMemoryBuild(state.config).catch(() => {});
 }
 
@@ -152,9 +230,9 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 		// First turn: fire-and-forget recall with deadline
 		if (!state.hasRecalledForFirstTurn) {
 			state.hasRecalledForFirstTurn = true;
-			const result = await executeMemoryRecall(prompt.slice(0, 400), undefined, state.config).catch(
-				() => null,
-			);
+			const result = await executeMemoryRecall(
+				prompt.slice(0, 400), undefined, state.config,
+			).catch(() => null);
 			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
 			if (snippet) {
 				state.lastRecallSnippet = snippet;
