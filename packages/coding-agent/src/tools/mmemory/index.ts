@@ -5,13 +5,15 @@
  *   - The /mmemory slash command handler (builtin-registry.ts)
  *   - MmemoryRetainTool, MmemoryRecallTool, MmemoryReflectTool
  *
- * Storage layout:
- *   ~/.omp/mmemory/<project>/
- *     YYYY-MM-DD-<sessionId>.md     memory files (one per retained session)
- *     chunks.json                   BM25 source (all chunk texts + metadata)
- *     vectors.safetensors           float32 embeddings [N, 384]
- *     vectors.meta.json             chunk→index mapping + build metadata
- *     facts.json                    structured facts (5-dim extraction)
+ * Storage layout (`<storagePath>/<projectName>/`):
+ *   YYYY-MM-DD-<sessionId>.md  memory files (one per retained session)
+ *   chunks.json                BM25 source (all chunk texts + metadata)
+ *   vectors.safetensors        float32 embeddings [N, 384]
+ *   vectors.meta.json          chunk→index mapping + build metadata
+ *   facts.json                 structured facts (5-dim extraction)
+ *
+ * storagePath defaults to <exe-dir>/extensions/mmemory/ (compiled) or ~/.omp/mmemory/ (dev).
+ * Set storagePath + projectName in config.yml to co-locate with your knowledge base.
  */
 import * as fs from "node:fs/promises";
 import * as os from "os";
@@ -48,7 +50,9 @@ export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConf
 	const projectName = mmemory.projectName ?? path.basename(cwd ?? process.cwd());
 	const storagePath = mmemory.storagePath
 		? (mmemory.storagePath as string).replace(/^~/, os.homedir())
-		: path.join(os.homedir(), ".omp", "mmemory");
+		: process.env.PI_COMPILED === "true"
+			? path.join(path.dirname(process.execPath), "extensions", "mmemory")
+			: path.join(os.homedir(), ".omp", "mmemory");
 
 	return {
 		storagePath,
