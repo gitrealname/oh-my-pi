@@ -32,8 +32,7 @@ export class MmemoryRetainTool implements AgentTool<typeof schema> {
 		if (!config) {
 			return toolResult().text("Memory system is not enabled.").done();
 		}
-		const sessionId = this.session.getSessionId?.() ?? "default";
-		const msg = await executeMemoryRetain(sessionId, content, config);
+		const msg = await executeMemoryRetain(content, config);
 		return toolResult().text(msg).done();
 	}
 }

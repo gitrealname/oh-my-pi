@@ -130,7 +130,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			const scope = scopeMatch ? scopeMatch[1] : undefined;
 			const query = restStr.replace(/--scope\s+\S+/, "").trim();
 			runtime.ctx.showStatus(`mmemory: recalling "${query}"...`);
-			const result = await executeMemoryRecall("manual", query, scope, config);
+			const result = await executeMemoryRecall(query, scope, config);
 			runtime.ctx.showStatus(result.resultCount > 0
 				? `mmemory: ${result.resultCount} memories found.`
 				: "mmemory: no memories found.");
@@ -145,7 +145,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			const scope = scopeMatch ? scopeMatch[1] : undefined;
 			const query = restStr.replace(/--scope\s+\S+/, "").trim();
 			runtime.ctx.showStatus(`mmemory: reflecting on "${query}"...`);
-			const result = await executeMemoryReflect("manual", query, scope, config);
+			const result = await executeMemoryReflect(query, scope, config);
 			runtime.ctx.showStatus(`mmemory: reflect done (${result.resultCount} memories).`);
 			await runtime.ctx.session.agent.prompt(
 				`[Memory reflection on "${query}"]\n\n${result.text}`,
@@ -157,7 +157,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			break;
 		}
 		case "view": {
-			const viewResult = await executeMemoryRecall("manual", "recent context", undefined, config);
+			const viewResult = await executeMemoryRecall("recent context", undefined, config);
 			const snippet = formatRecallForSystemPrompt(viewResult);
 			runtime.ctx.showStatus(snippet ? "mmemory: showing recall snippet." : "mmemory: no memories loaded.");
 			if (snippet) {

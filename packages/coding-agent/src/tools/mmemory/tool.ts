@@ -13,8 +13,6 @@ import type { ToolSession } from "..";
 import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { toolResult } from "../tool-result";
 
-const DEBOUNCE_MS = 10_000;
-const debounceMap = new Map<string, number>();
 
 const schema = Type.Object({
 	query: Type.String({
@@ -55,13 +53,7 @@ export class MMemoryTool implements AgentTool<typeof schema> {
 		toolCallId: string,
 		{ query, operation = "recall", scope }: { query: string; operation?: string; scope?: string },
 	): Promise<AgentToolResult> {
-		// Debounce: prevent re-entry loop from synthetic slash injection
-		const now = Date.now();
-		const last = debounceMap.get(toolCallId);
-		if (last !== undefined && now - last < DEBOUNCE_MS) {
-			return toolResult().text("").done();
-		}
-		debounceMap.set(toolCallId, now);
+
 
 		const scopeFlag = scope ? ` --scope ${scope}` : "";
 		const slashCmd = `/mmemory ${operation} ${query}${scopeFlag}`.trim();

@@ -183,7 +183,16 @@ class MmemoryServer:
         if self.model is not None:
             return
         os.environ["FASTEMBED_CACHE_PATH"] = str(MODEL_CACHE)
-        from fastembed import TextEmbedding  # type: ignore[import]
+        try:
+            from fastembed import TextEmbedding  # type: ignore[import]
+        except ImportError:
+            print(
+                "[mmemory] ERROR: fastembed not installed.\n"
+                "  Run: pip install fastembed safetensors numpy\n"
+                "  Then restart the omp session.",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(1)
         t0 = time.time()
         print(f"[mmemory] Loading model {MODEL_NAME}...", file=sys.stderr, flush=True)
         self.model = TextEmbedding(MODEL_NAME, cache_dir=str(MODEL_CACHE))
@@ -199,6 +208,15 @@ class MmemoryServer:
             return None
         try:
             from safetensors.numpy import load_file  # type: ignore[import]
+        except ImportError:
+            print(
+                "[mmemory] ERROR: fastembed not installed.\n"
+                "  Run: pip install fastembed safetensors numpy\n"
+                "  Then restart the omp session.",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(1)
+        try:
             vecs = load_file(str(p))["vectors"]
             self._vectors_cache[path] = vecs
             return vecs
@@ -288,12 +306,12 @@ class MmemoryServer:
             if vecs is None or len(vecs) == 0:
                 return
             scores = cosine_similarity(query_emb, vecs)
-            top_idx = np.argsort(scores)[::-1][: limit * 2]
+            top_idx = np.argsort(scores)[::-1][: limit * 3]
             sem_results.extend((int(i), float(scores[i])) for i in top_idx if scores[i] > 0.1)
 
         def run_bm25() -> None:
             idx = self._load_bm25(chunks_path)
-            bm25_results.extend(bm25_search(idx, query, limit * 2))
+            bm25_results.extend(bm25_search(idx, query, limit * 3))
 
         t1 = threading.Thread(target=run_semantic)
         t2 = threading.Thread(target=run_bm25)
@@ -391,7 +409,16 @@ class MmemoryServer:
     ) -> None:
         """Scan .md files, chunk, embed new chunks, save safetensors + BM25 JSON."""
         self._load_model()
-        from safetensors.numpy import load_file, save_file  # type: ignore[import]
+        try:
+            from safetensors.numpy import load_file, save_file  # type: ignore[import]
+        except ImportError:
+            print(
+                "[mmemory] ERROR: fastembed not installed.\n"
+                "  Run: pip install fastembed safetensors numpy\n"
+                "  Then restart the omp session.",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(1)
 
         md_dir = Path(memory_dir)
         if not md_dir.exists():
