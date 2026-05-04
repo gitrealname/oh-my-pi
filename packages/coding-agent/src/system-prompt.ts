@@ -264,20 +264,18 @@ async function getEnvironmentInfo(): Promise<Array<{ label: string; value: strin
 			process.env.SHELL?.toLowerCase().includes("bash")
 		) {
 			shellLabel = "bash";
-		} else if (process.env.PSModulePath) {
-			shellLabel = "powershell";
 		} else {
-			// Fall back to configured shell path
+			// Neither MSYSTEM nor BASH_VERSION set — fall back to configured shell
+			// path; if that also doesn't resolve to bash, label as cmd.
+			// Note: PSModulePath is unreliable (Git Bash inherits it from Windows).
 			try {
 				const settings = await Settings.init();
 				const { shell } = settings.getShellConfig();
-				if (shell) {
-					shellLabel = shell.split(/[/\\]/).pop()?.replace(/\.exe$/i, "").toLowerCase();
-				}
+				const base = shell?.split(/[/\\]/).pop()?.replace(/\.exe$/i, "").toLowerCase();
+				shellLabel = base?.includes("bash") ? "bash" : base?.includes("powershell") || base?.includes("pwsh") ? "powershell" : "cmd";
 			} catch {
-				// Non-fatal
+				shellLabel = "cmd";
 			}
-			shellLabel ??= "cmd";
 		}
 	}
 
