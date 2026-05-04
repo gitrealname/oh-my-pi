@@ -26,6 +26,7 @@ import {
 import chalk from "chalk";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { createAutoresearchExtension } from "./autoresearch";
+import { createMmemoryExtension } from "./mmemory-extension";
 import { createPromptEngine } from "./prompt-engine";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability } from "./capability/rule";
@@ -1185,6 +1186,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const inlineExtensions: ExtensionFactory[] = options.extensions ? [...options.extensions] : [];
 		inlineExtensions.push(createAutoresearchExtension);
 		inlineExtensions.push(createPromptEngine);
+		inlineExtensions.push(createMmemoryExtension);
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
