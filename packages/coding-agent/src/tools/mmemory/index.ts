@@ -12,7 +12,8 @@
  *   vectors.meta.json          chunk→index mapping + build metadata
  *   facts.json                 structured facts (5-dim extraction)
  *
- * storagePath defaults to <exe-dir>/extensions/mmemory/ (compiled) or ~/.omp/mmemory/ (dev).
+ * storagePath defaults to $PI_CODING_AGENT_DIR/mmemory/ (launched via o/ow),
+ * <exe-dir>/extensions/mmemory/ (compiled, no agent dir), or ~/.omp/mmemory/ (dev).
  * Set storagePath + projectName in config.yml to co-locate with your knowledge base.
  */
 import * as fs from "node:fs/promises";
@@ -50,9 +51,11 @@ export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConf
 	const projectName = mmemory.projectName ?? path.basename(cwd ?? process.cwd());
 	const storagePath = mmemory.storagePath
 		? (mmemory.storagePath as string).replace(/^~/, os.homedir())
-		: process.env.PI_COMPILED === "true"
-			? path.join(path.dirname(process.execPath), "extensions", "mmemory")
-			: path.join(os.homedir(), ".omp", "mmemory");
+		: process.env.PI_CODING_AGENT_DIR
+			? path.join(process.env.PI_CODING_AGENT_DIR, "mmemory")
+			: process.env.PI_COMPILED === "true"
+				? path.join(path.dirname(process.execPath), "extensions", "mmemory")
+				: path.join(os.homedir(), ".omp", "mmemory");
 
 	return {
 		storagePath,
