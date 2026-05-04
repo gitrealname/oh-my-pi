@@ -45,7 +45,7 @@ export class MMemoryTool implements AgentTool<typeof schema> {
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MMemoryTool | null {
-		if (!session.settings.get("mmemory.enabled" as any)) return null;
+		if (!session.settings.get("mmemory.enabled")) return null;
 		return new MMemoryTool(session);
 	}
 

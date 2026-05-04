@@ -19,7 +19,10 @@ import * as path from "node:path";
 import { settings } from "./config/settings";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "./extensibility/extensions";
-import { completeSimple } from "@oh-my-pi/pi-ai";
+import type { ReadonlySessionManager } from "./session/session-manager";
+import { completeSimple, validateToolCall } from "@oh-my-pi/pi-ai";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
+import { Type } from "@sinclair/typebox";
 import { resolveModelRoleValue } from "./config/model-resolver";
 import {
 	STRIP_TAGS_REGEX,
@@ -53,10 +56,16 @@ interface MmemorySessionState {
 function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 	// Subagent guard: subagents must not auto-retain — their exploration transcripts
 	// would pollute the memory store with internal monologue.
-	if (ctx.taskDepth > 0) return null;
+	if (ctx.taskDepth > 0) {
+		logger.debug("[mmemory] skipping init: subagent context (taskDepth > 0)", { source: "mmemory" });
+		return null;
+	}
 
 	const config = loadMmemoryConfig(settings, ctx.cwd);
-	if (!config) return null;
+	if (!config) {
+		logger.debug("[mmemory] skipping init: mmemory disabled or config missing", { source: "mmemory" });
+		return null;
+	}
 
 	const { projectDir, queueDir, indexDir, mentalModelsDir } = resolvePaths(config);
 
@@ -86,6 +95,7 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 	}
 
 	if (isNew) {
+		logger.debug(`[mmemory] Created memory store: ${projectDir}`, { source: "mmemory" });
 		console.log(`[mmemory] Created memory store: ${projectDir}`);
 		// Auto-generate kb_config.yaml entry so kb_search.py shows this as [external]
 		const kbConfigPath = path.join(projectDir, "..", "kb_config.yaml");
@@ -131,44 +141,58 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 // chunk_by_turns() parses **User:** / **Assistant:** markers to reconstruct pairs.
 // Memory injection tags are stripped before writing (anti-feedback loop).
 
-function buildTranscript(messages: { role: string; content: unknown }[], contextTurns: number, maxTranscriptChars = 0): string {
-	const relevant = contextTurns > 0 ? messages.slice(-contextTurns * 2) : messages;
-	const parts: string[] = [];
+interface TranscriptResult {
+	transcript: string;
+	/** Number of user+assistant pairs included. */
+	pairsFound: number;
+	/** Number of user messages skipped (empty after tag-stripping). */
+	userSkipped: number;
+}
 
-	for (let i = 0; i < relevant.length; i++) {
-		const m = relevant[i];
-		if (m.role !== "user") continue;
+function buildTranscript(messages: { role: string; content: unknown }[], contextTurns: number, maxTranscriptChars = 0): TranscriptResult {
+	// Walk backwards collecting complete user→assistant pairs, ignoring tool/system entries.
+	// contextTurns=0 means take all pairs.
+	const pairs: Array<{ user: string; assistant: string }> = [];
+	let i = messages.length - 1;
+	while (i >= 0 && (contextTurns === 0 || pairs.length < contextTurns)) {
+		// Find the next assistant message scanning backwards
+		while (i >= 0 && messages[i].role !== "assistant") i--;
+		if (i < 0) break;
+		const aMsg = messages[i--];
+		// Find the user message immediately preceding (skip tool/system entries)
+		while (i >= 0 && messages[i].role !== "user") i--;
+		if (i < 0) break;
+		const uMsg = messages[i--];
 
-		const rawUser = Array.isArray(m.content)
-			? (m.content as { type: string; text?: string }[])
+		const rawUser = Array.isArray(uMsg.content)
+			? (uMsg.content as { type: string; text?: string }[])
 				.filter(c => c.type === "text")
 				.map(c => c.text ?? "")
 				.join(" ")
-			: String(m.content ?? "");
+			: String(uMsg.content ?? "");
 		const userText = rawUser.replace(STRIP_TAGS_REGEX, "").trim();
 		if (!userText) continue;
 
-		const next = relevant[i + 1];
-		let assistantText = "";
-		if (next?.role === "assistant") {
-			const rawAsst = Array.isArray(next.content)
-				? (next.content as { type: string; text?: string }[])
-					.filter(c => c.type === "text")
-					.map(c => c.text ?? "")
-					.join(" ")
-				: String(next.content ?? "");
-			assistantText = rawAsst.replace(STRIP_TAGS_REGEX, "").trim();
-		}
+		const rawAsst = Array.isArray(aMsg.content)
+			? (aMsg.content as { type: string; text?: string }[])
+				.filter(c => c.type === "text")
+				.map(c => c.text ?? "")
+				.join(" ")
+			: String(aMsg.content ?? "");
+		const assistantText = rawAsst.replace(STRIP_TAGS_REGEX, "").trim();
 
-		if (!userText && !assistantText) continue;
-
-		const turnParts: string[] = [];
-		if (userText) turnParts.push(`**User:** ${userText}`);
-		if (assistantText) turnParts.push(`**Assistant:** ${assistantText}`);
-		parts.push(turnParts.join("\n\n"));
+		pairs.unshift({ user: userText, assistant: assistantText });
 	}
 
+	const pairsFound = pairs.length;
+	const userSkipped = 0; // legacy field kept for log compat
+
 	const SEP = "\n\n---\n\n";
+	const parts = pairs.map(({ user, assistant }) => {
+		const turnParts: string[] = [`**User:** ${user}`];
+		if (assistant) turnParts.push(`**Assistant:** ${assistant}`);
+		return turnParts.join("\n\n");
+	});
 	let result = parts.join(SEP);
 
 	// Trim from the start (oldest turns first) until the transcript fits.
@@ -182,7 +206,7 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 		result = result.slice(start);
 	}
 
-	return result;
+	return { transcript: result, pairsFound, userSkipped };
 }
 
 async function extractFromTranscript(
@@ -190,7 +214,6 @@ async function extractFromTranscript(
 	config: import("./tools/mmemory/index").MmemoryConfig,
 	ctx: ExtensionContext,
 ): Promise<void> {
-	// Resolve the model for the configured role
 	const resolved = resolveModelRoleValue(
 		config.modelRole,
 		ctx.modelRegistry.getAll(),
@@ -203,13 +226,29 @@ async function extractFromTranscript(
 	const apiKey = await ctx.modelRegistry.getApiKey(model, sessionId);
 	if (!apiKey) return;
 
+	// Use a tool call to force structured output — plain text prompts let the model
+	// return code blocks, prose preambles, or empty arrays instead of valid JSON.
+	const ExtractionTool = {
+		name: "store_facts",
+		description: "Store durable facts extracted from the conversation.",
+		parameters: Type.Object({
+			facts: Type.Array(
+				Type.Object({
+					fact:     Type.String({ description: "One concise sentence stating a durable fact." }),
+					entities: Type.Array(Type.String(), { description: "Key names, paths, or concepts." }),
+					date:     Type.String({ description: "YYYY-MM-DD — use today if unknown." }),
+				}),
+			),
+		}),
+	};
+
 	const systemPrompt =
-		`You are a precise knowledge extractor. Extract durable facts from the conversation transcript below. ` +
-		`Return ONLY a JSON array (no markdown fences, no prose) of objects with exactly these fields: ` +
-		`{"fact": string (one concise sentence), "entities": string[] (key names/paths/concepts mentioned), ` +
-		`"date": string (YYYY-MM-DD, today if unknown)}. ` +
-		`Omit transient details, errors already resolved, and anything not useful across sessions.`;
-	// Extraction LLM context budget — independent of maxTranscriptChars
+		`You are a precise knowledge extractor. ` +
+		`Extract durable technical facts from the conversation transcript: decisions made, bugs fixed, ` +
+		`config values, constraints, and conventions that will be useful in future sessions. ` +
+		`Omit transient details, resolved errors, and anything not useful across sessions. ` +
+		`If nothing durable is present, call store_facts with an empty array.`;
+
 	const userPrompt = transcript.length > 8000 ? transcript.slice(0, 8000) : transcript;
 
 	const response = await completeSimple(
@@ -217,18 +256,33 @@ async function extractFromTranscript(
 		{
 			systemPrompt,
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+			tools: [ExtractionTool],
 		},
-		{ apiKey },
+		{ apiKey, maxTokens: 1024 },
 	);
 
 	if (response.stopReason === "error" || !response.content) return;
-	const textContent = response.content
-		.filter((c: { type: string; text?: string }) => c.type === "text")
-		.map((c: { type: string; text?: string }) => c.text ?? "")
-		.join("");
-	if (!textContent.trim()) return;
 
-	await executeMemoryExtract(config, async () => textContent);
+	// Extract the tool call — fall back to text parsing if the model didn't use the tool.
+	const toolCall = response.content.find(
+		(c: { type: string }) => c.type === "toolCall",
+	) as ToolCall | undefined;
+
+	await executeMemoryExtract(config, async () => {
+		if (toolCall?.name === "store_facts") {
+			try {
+				const validated = validateToolCall([ExtractionTool], toolCall) as { facts: unknown[] };
+				return JSON.stringify(validated.facts);
+			} catch {
+				// fall through to text parse
+			}
+		}
+		// Fallback: model responded with text — try to extract JSON from it
+		return (response.content ?? [])
+			.filter((c: { type: string; text?: string }) => c.type === "text")
+			.map((c: { type: string; text?: string }) => c.text ?? "")
+			.join("");
+	});
 }
 
 async function retainSession(
@@ -236,8 +290,20 @@ async function retainSession(
 	messages: { role: string; content: unknown }[],
 	ctx: ExtensionContext | null,
 ): Promise<void> {
-	const transcript = buildTranscript(messages, state.config.retainContextTurns, state.config.maxTranscriptChars);
-	if (!transcript) return;
+	const userCount = messages.filter(m => m.role === "user").length;
+	logger.debug(
+		`[mmemory] buildTranscript: total=${messages.length} user=${userCount} contextTurns=${state.config.retainContextTurns} maxChars=${state.config.maxTranscriptChars}`,
+		{ source: "mmemory" },
+	);
+	const { transcript, pairsFound, userSkipped } = buildTranscript(messages, state.config.retainContextTurns, state.config.maxTranscriptChars);
+	if (!transcript) {
+		logger.debug(
+			`[mmemory] retainSession: empty transcript (input had ${userCount} user messages, pairs=${pairsFound} skipped=${userSkipped}), skipping`,
+			{ source: "mmemory" },
+		);
+		return;
+	}
+	logger.debug(`[mmemory] retainSession: transcript=${transcript.length} chars pairs=${pairsFound} skipped=${userSkipped}`, { source: "mmemory" });
 
 	const today = new Date().toISOString().slice(0, 10);
 	// Fixed filename per session — repeated retains overwrite the same file
@@ -249,18 +315,20 @@ async function retainSession(
 		`# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}`,
 		"utf-8",
 	);
-
+	logger.debug(`[mmemory] queue file written: ${filename} (${transcript.length} chars)`, { source: "mmemory" });
 	if (state.config.extractionMode === "structured" && ctx) {
-		void extractFromTranscript(transcript, state.config, ctx).catch(e => logger.debug(`[mmemory] extraction failed: ${e}`, { source: 'mmemory' }));
+		logger.debug("[mmemory] scheduling structured extraction", { source: "mmemory" });
+		void extractFromTranscript(transcript, state.config, ctx).catch(e => logger.debug(`[mmemory] extraction failed: ${e}`, { source: "mmemory" }));
 	}
 
 	// Server reads queue/*.md, embeds new chunks, deletes processed .md files
-	void executeMemoryBuild(state.config).catch(e => logger.debug(`[mmemory] build failed: ${e}`, { source: 'mmemory' }));
+	logger.debug("[mmemory] scheduling build", { source: "mmemory" });
+	void executeMemoryBuild(state.config).catch(e => logger.warn(`[mmemory] build failed: ${e}`, { source: "mmemory" }));
 }
 
 // ── Extension factory ─────────────────────────────────────────────────────────
 
-const sessionMap = new WeakMap<ExtensionContext, MmemorySessionState>();
+const sessionMap = new WeakMap<ReadonlySessionManager, MmemorySessionState>();
 
 /**
  * Returns the live MmemoryConfig for the given extension context, or null if the
@@ -279,7 +347,7 @@ const sessionMap = new WeakMap<ExtensionContext, MmemorySessionState>();
 export function getMmemorySessionConfig(
 	ctx: import("./extensibility/extensions").ExtensionContext,
 ): import("./tools/mmemory/index").MmemoryConfig | null {
-	return sessionMap.get(ctx)?.config ?? null;
+	return sessionMap.get(ctx.sessionManager)?.config ?? null;
 }
 
 
@@ -300,12 +368,12 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 	api.on("session_start", (_event, ctx) => {
 		const state = createSessionState(ctx);
 		if (!state) return;
-		sessionMap.set(ctx, state);
-
+		sessionMap.set(ctx.sessionManager, state);
+		logger.debug(`[mmemory] session started: ${state.sessionId} storagePath=${state.config.storagePath} project=${state.config.projectName} extractionMode=${state.config.extractionMode} retainEvery=${state.config.retainEveryNTurns}`, { source: "mmemory" });
 	});
 
 	api.on("before_agent_start", async (event, ctx) => {
-		const state = sessionMap.get(ctx);
+		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) return undefined;
 
 		state.turnCount++;
@@ -335,17 +403,25 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 		}
 
 		// First turn: recall and cache snippet for subsequent turns
+		// First turn: recall and cache snippet for subsequent turns
 		if (!state.hasRecalledForFirstTurn) {
 			state.hasRecalledForFirstTurn = true;
 			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
 			const rawQuery = composeRecallQuery(prompt, messages, state.config.retainContextTurns);
 			const query = truncateRecallQuery(rawQuery, prompt, state.config.recallMaxQueryChars);
+			logger.debug(`[mmemory] first-turn recall: query=${query.slice(0, 80)}...`, { source: "mmemory" });
 			const result = await executeMemoryRecall(
 				query, undefined, state.config,
-			).catch(() => null);
+			).catch((e) => {
+				logger.debug(`[mmemory] recall failed: ${e}`, { source: "mmemory" });
+				return null;
+			});
 			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
 			if (snippet) {
 				state.lastRecallSnippet = snippet;
+				logger.debug(`[mmemory] recall injected: ${result?.resultCount} results`, { source: "mmemory" });
+			} else {
+				logger.debug("[mmemory] recall: no results to inject", { source: "mmemory" });
 			}
 		}
 
@@ -365,17 +441,27 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 	});
 
 	api.on("agent_end", async (event, ctx) => {
-		const state = sessionMap.get(ctx);
+		const state = sessionMap.get(ctx.sessionManager);
 		if (!state?.config.autoRetain) return;
-		if (state.turnCount - state.lastRetainedTurn < state.config.retainEveryNTurns) return;
+		const due = state.turnCount - state.lastRetainedTurn >= state.config.retainEveryNTurns;
+		logger.debug(`[mmemory] agent_end: turn=${state.turnCount} lastRetained=${state.lastRetainedTurn} every=${state.config.retainEveryNTurns} due=${due}`, { source: "mmemory" });
+		if (!due) return;
 
-		const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
+		// agent_end only carries messages added this turn (new assistant + tool results).
+		// We need the full conversation history to build a meaningful transcript.
+		const messages = ctx.sessionManager
+			.getEntries()
+			.filter((e): e is import("./session/session-manager").SessionMessageEntry => e.type === "message")
+			.map(e => e.message as { role: string; content: unknown });
 		state.lastRetainedTurn = state.turnCount;
-		void retainSession(state, messages, ctx).catch(() => {});
+		logger.debug(`[mmemory] retain firing: session=${state.sessionId} messages=${messages.length}`, { source: "mmemory" });
+		void retainSession(state, messages, ctx).catch((e) => {
+			logger.warn(`[mmemory] retain failed: ${e}`, { source: "mmemory" });
+		});
 	});
 
 	api.on("session.compacting", async (event, ctx) => {
-		const state = sessionMap.get(ctx);
+		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) return undefined;
 
 		const messages: AgentMessage[] = event.messages ?? [];
@@ -401,11 +487,22 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 		return snippet ? { context: [snippet] } : undefined;
 	});
 
-	api.on("session_shutdown", (_event, ctx) => {
-		const state = sessionMap.get(ctx);
-		if (state) {
-			disposeServerClient(state.config);
-			sessionMap.delete(ctx);
+	api.on("session_shutdown", async (_event, ctx) => {
+		const state = sessionMap.get(ctx.sessionManager);
+		if (!state) return;
+		// P4-3: retain on shutdown to capture content since the last periodic retain.
+		// Only fires if autoRetain is on and there's been at least one turn since last retain.
+		if (state.config.autoRetain && state.turnCount > state.lastRetainedTurn) {
+			const messages = ctx.sessionManager
+				.getEntries()
+				.filter((e): e is import("./session/session-manager").SessionMessageEntry => e.type === "message")
+				.map(e => e.message as { role: string; content: unknown });
+			logger.debug(`[mmemory] shutdown retain: session=${state.sessionId} turns_since_last=${state.turnCount - state.lastRetainedTurn}`, { source: "mmemory" });
+			await retainSession(state, messages, ctx).catch(e =>
+				logger.warn(`[mmemory] shutdown retain failed: ${e}`, { source: "mmemory" }),
+			);
 		}
+		disposeServerClient(state.config);
+		sessionMap.delete(ctx.sessionManager);
 	});
 }

@@ -7,7 +7,9 @@ retain_mission concept are derived from Hindsight's design.
 
 TCP socket server, line-delimited JSON protocol (localhost only).
 Holds the fastembed model in memory for fast repeated recall.
-Auto-stops after idle timeout. Prints READY:<port> to stdout.
+Auto-stops after idle timeout. Port is fixed (passed via --port).
+stderr is redirected to --log-file; nothing is written to stdout.
+
 
 Storage layout (managed by this server):
     project_dir/
@@ -37,9 +39,9 @@ Actions:
     shutdown      Graceful stop.
 
 Usage:
-    python mmemory_server.py                     # random port (prints READY:<port>)
-    python mmemory_server.py --port 19385        # fixed port
-    python mmemory_server.py --timeout 10        # idle timeout in minutes
+    python mmemory_server.py --port 49200           # fixed port (required)
+    python mmemory_server.py --port 49200 --timeout 10
+    python mmemory_server.py --port 49200 --log-file /path/to/server.log
 """
 
 import collections
@@ -63,7 +65,6 @@ MODEL_NAME = "BAAI/bge-small-en-v1.5"
 MODEL_CACHE = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".cache"))) / "fastembed"
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
     sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
 
 
@@ -78,6 +79,7 @@ if sys.platform == "win32":
 
 TURN_MARKER = re.compile(r"\*\*(User|Assistant):\*\*\s*")
 MAX_TURN_WORDS = 400
+MIN_CHUNK_WORDS = 20
 
 
 def chunk_by_turns(text: str, file_path: str) -> list[dict]:
@@ -503,7 +505,12 @@ class MmemoryServer:
                 print(f"[mmemory] Failed to read {md_file.name}: {e}", file=sys.stderr, flush=True)
 
         # ── 3. Filter to truly new chunks ─────────────────────────────────────
-        chunks_to_add = [c for c in new_raw_chunks if c["hash"] not in existing_hashes]
+        new_chunks_by_hash = [c for c in new_raw_chunks if c["hash"] not in existing_hashes]
+        chunks_to_add = [c for c in new_chunks_by_hash if len(c["text"].split()) >= MIN_CHUNK_WORDS]
+        low_content_dropped = len(new_chunks_by_hash) - len(chunks_to_add)
+        if low_content_dropped:
+            print(f"[mmemory] Dropped {low_content_dropped} low-content chunk(s) (< {MIN_CHUNK_WORDS} words).",
+                  file=sys.stderr, flush=True)
 
         if not chunks_to_add:
             # Nothing new to embed; still delete processed files
@@ -748,7 +755,6 @@ class MmemoryServer:
         srv.settimeout(1.0)
         self.port = srv.getsockname()[1]
 
-        print(f"READY:{self.port}", flush=True)
         print(f"[mmemory] PID {os.getpid()} listening on 127.0.0.1:{self.port}", file=sys.stderr, flush=True)
 
         watchdog = threading.Thread(target=self._idle_watchdog, daemon=True)
@@ -789,16 +795,46 @@ def main() -> None:
     except Exception:
         pass  # non-fatal; priority is a best-effort hint
 
-    port = 0
+    port = 49200
     timeout = DEFAULT_TIMEOUT
+    log_file: str | None = None
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == "--port" and i + 1 < len(sys.argv):
             port = int(sys.argv[i + 1]); i += 2
         elif sys.argv[i] == "--timeout" and i + 1 < len(sys.argv):
             timeout = int(sys.argv[i + 1]); i += 2
+        elif sys.argv[i] == "--log-file" and i + 1 < len(sys.argv):
+            log_file = sys.argv[i + 1]; i += 2
         else:
             i += 1
+
+    if log_file:
+        import pathlib
+        pathlib.Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_file, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
+        sys.stderr = log_fh  # type: ignore[assignment]
+
+    # ── Pre-bind guard: exit cleanly if another instance already owns the port ──
+    # The client-side pre-spawn ping in server-client.ts is the primary guard,
+    # but races and third-party spawns can still land two processes here.
+    # A clean exit is far better than a bind crash that leaves the client
+    # waiting 30s for a ready ping that never arrives.
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(("127.0.0.1", port))
+        s.sendall(json.dumps({"action": "ping"}).encode() + b"\n")
+        s.recv(256)
+        s.close()
+        print(
+            f"[mmemory] Port {port} already has a live server — exiting to avoid duplicate.",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(0)
+    except OSError:
+        pass  # nothing listening — safe to bind
+
     MmemoryServer(port, timeout).run()
 
 

@@ -1,3 +1,5 @@
+import { MMEMORY_SCHEMA_ENTRIES, type MmemorySettings } from "./settings-schema-m-extensions";
+
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking";
@@ -1925,6 +1927,7 @@ export const SETTINGS_SCHEMA = {
 				"Enable memory extension tools (mmemory_recall, mmemory_retain, mmemory_reflect). Requires Python + fastembed + safetensors.",
 		},
 	},
+	...MMEMORY_SCHEMA_ENTRIES,
 	// Tool execution
 	"tools.intentTracing": {
 		type: "boolean",
@@ -2750,6 +2753,7 @@ export interface GroupTypeMap {
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;
+	mmemory: MmemorySettings;
 }
 
 export type GroupPrefix = keyof GroupTypeMap;

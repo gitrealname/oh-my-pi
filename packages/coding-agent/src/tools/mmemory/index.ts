@@ -23,6 +23,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import { MmemoryServerClient } from "./server-client";
 import mmemoryServerPy from "./mmemory_server.py" with { type: "text" };
@@ -45,19 +46,20 @@ export interface MmemoryConfig {
 	recencyWeight: number;
 	deduplicationThreshold: number;
 	serverIdleTimeoutMinutes: number;
+	serverPort: number;
+	serverLogFile: string | undefined;
 	autoRetain: boolean;
 	maxTranscriptChars: number;
 	maxRawFacts: number;
 }
 
 export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConfig | null {
-	if (!settings.get("mmemory.enabled" as any)) return null;
-	const raw = (settings as any).getRaw?.() ?? {};
-	const mmemory = raw.mmemory ?? {};
+	if (!settings.get("mmemory.enabled")) return null;
 
-	const projectName = mmemory.projectName ?? path.basename(cwd ?? process.cwd());
-	const storagePath = mmemory.storagePath
-		? (mmemory.storagePath as string).replace(/^~/, os.homedir())
+	const projectName = settings.get("mmemory.projectName") ?? path.basename(cwd ?? process.cwd());
+	const rawStoragePath = settings.get("mmemory.storagePath");
+	const storagePath = rawStoragePath
+		? rawStoragePath.replace(/^~/, os.homedir())
 		: process.env.PI_CODING_AGENT_DIR
 			? path.join(process.env.PI_CODING_AGENT_DIR, "mmemory")
 			: process.env.PI_COMPILED === "true"
@@ -67,24 +69,24 @@ export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConf
 	return {
 		storagePath,
 		projectName,
-		modelRole: mmemory.modelRole ?? "smol",
-		consolidateModelRole: mmemory.consolidateModelRole ?? mmemory.modelRole ?? "smol",
-		retainMission:
-			mmemory.retainMission ??
-			"Focus on technical decisions, API contracts, constraints, error patterns, and project conventions",
-		extractionMode: mmemory.extractionMode ?? "verbatim",
-		scoping: mmemory.scoping ?? "per-project-tagged",
-		retainEveryNTurns: mmemory.retainEveryNTurns ?? 3,
-		retainContextTurns: mmemory.retainContextTurns ?? 3,
-		recallMaxQueryChars: mmemory.recallMaxQueryChars ?? 2000,
-		recallLimit: mmemory.recallLimit ?? 10,
-		recallDeadlineMs: mmemory.recallDeadlineMs ?? 10_000,
-		recencyWeight: mmemory.recencyWeight ?? 0.3,
-		deduplicationThreshold: mmemory.deduplicationThreshold ?? 0.92,
-		serverIdleTimeoutMinutes: mmemory.serverIdleTimeoutMinutes ?? 10,
-		autoRetain: mmemory.autoRetain !== false,
-		maxTranscriptChars: mmemory.maxTranscriptChars ?? 0,
-		maxRawFacts: mmemory.maxRawFacts ?? 100,
+		modelRole:               settings.get("mmemory.modelRole")               ?? "smol",
+		consolidateModelRole:    settings.get("mmemory.consolidateModelRole")     ?? settings.get("mmemory.modelRole") ?? "smol",
+		retainMission:           settings.get("mmemory.retainMission")            ?? "Focus on technical decisions, API contracts, constraints, error patterns, and project conventions",
+		extractionMode:          settings.get("mmemory.extractionMode"),
+		scoping:                 settings.get("mmemory.scoping"),
+		retainEveryNTurns:       settings.get("mmemory.retainEveryNTurns"),
+		retainContextTurns:      settings.get("mmemory.retainContextTurns"),
+		recallMaxQueryChars:     settings.get("mmemory.recallMaxQueryChars"),
+		recallLimit:             settings.get("mmemory.recallLimit"),
+		recallDeadlineMs:        settings.get("mmemory.recallDeadlineMs"),
+		recencyWeight:           settings.get("mmemory.recencyWeight"),
+		deduplicationThreshold:  settings.get("mmemory.deduplicationThreshold"),
+		serverIdleTimeoutMinutes: settings.get("mmemory.serverIdleTimeoutMinutes"),
+		serverPort:              settings.get("mmemory.serverPort"),
+		serverLogFile:           settings.get("mmemory.serverLogFile")?.replace(/^~/, os.homedir()),
+		autoRetain:              settings.get("mmemory.autoRetain"),
+		maxTranscriptChars:      settings.get("mmemory.maxTranscriptChars"),
+		maxRawFacts:             settings.get("mmemory.maxRawFacts"),
 	};
 }
 
@@ -237,10 +239,15 @@ export function truncateRecallQuery(query: string, latestQuery: string, maxChars
 	return latestOnly;
 }
 
-// ── Server singleton per storage root ────────────────────────────────────────
+// ── Server singleton per port ─────────────────────────────────────────────────
+//
+// One server process handles all projects. The port is fixed and configurable
+// (mmemory.serverPort, default 49200). Project identity travels in each request
+// as `project_dir`. The singleton is keyed by port so multiple configs that
+// share the same port (the common case) reuse the same client.
 
-const serverMap = new Map<string, MmemoryServerClient>();
-const serverCreating = new Map<string, Promise<MmemoryServerClient>>();
+const serverMap = new Map<number, MmemoryServerClient>();
+const serverCreating = new Map<number, Promise<MmemoryServerClient>>();
 
 const MMEMORY_EXT_DIR = process.env.PI_COMPILED === "true"
 	? path.join(path.dirname(process.execPath), "extensions")
@@ -266,14 +273,20 @@ export async function ensureServerScript(): Promise<string> {
 }
 
 export async function getOrCreateServerClient(config: MmemoryConfig): Promise<MmemoryServerClient> {
-	const key = config.storagePath;
+	const key = config.serverPort;
 	const existing = serverMap.get(key);
 	if (existing) return existing;
 	let creating = serverCreating.get(key);
 	if (!creating) {
 		creating = (async () => {
 			const serverScript = await ensureServerScript();
-			const client = new MmemoryServerClient(serverScript, config.serverIdleTimeoutMinutes);
+			const logFile = config.serverLogFile ?? path.join(config.storagePath, "mmemory-server.log");
+			const client = new MmemoryServerClient(
+				serverScript,
+				config.serverPort,
+				logFile,
+				config.serverIdleTimeoutMinutes,
+			);
 			serverMap.set(key, client);
 			serverCreating.delete(key);
 			return client;
@@ -284,7 +297,7 @@ export async function getOrCreateServerClient(config: MmemoryConfig): Promise<Mm
 }
 
 export function disposeServerClient(config: MmemoryConfig): void {
-	const key = config.storagePath;
+	const key = config.serverPort;
 	const client = serverMap.get(key);
 	if (client) {
 		void client.stop();
@@ -333,7 +346,17 @@ async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
 }
 
 function parseJsonArrayOrWrapped(raw: string, wrapKey: string): unknown[] {
-	const parsed = JSON.parse(raw.trim());
+	// LLMs sometimes prefix JSON with prose (e.g. "Here are the facts:\n[...]").
+	// Strip everything before the first '[' or '{' so JSON.parse doesn't choke.
+	const trimmed = raw.trim();
+	const arrayStart = trimmed.indexOf("[");
+	const objectStart = trimmed.indexOf("{");
+	const start =
+		arrayStart === -1 ? objectStart
+		: objectStart === -1 ? arrayStart
+		: Math.min(arrayStart, objectStart);
+	const jsonStr = start > 0 ? trimmed.slice(start) : trimmed;
+	const parsed = JSON.parse(jsonStr);
 	if (Array.isArray(parsed)) return parsed;
 	const wrapped = (parsed as any)?.[wrapKey];
 	return Array.isArray(wrapped) ? wrapped : [];
@@ -410,8 +433,9 @@ export async function executeMemoryExtract(
 	let rawOutput: string;
 	try {
 		rawOutput = await extractFn();
+		logger.debug(`[mmemory] extract: LLM returned ${rawOutput.length} chars`, { source: "mmemory" });
 	} catch (err) {
-		console.error("[mmemory] extractFn failed:", err);
+		logger.warn(`[mmemory] extractFn failed: ${err}`, { source: "mmemory" });
 		return;
 	}
 
@@ -425,24 +449,32 @@ export async function executeMemoryExtract(
 				...(f as FactEntry),
 				extracted_at: (f as FactEntry).extracted_at ?? today,
 			}));
+		logger.debug(`[mmemory] extract: parsed ${newFacts.length} facts from LLM output`, { source: "mmemory" });
 	} catch (err) {
-		console.error("[mmemory] Failed to parse LLM fact output:", err);
+		logger.warn(`[mmemory] failed to parse LLM fact output: ${err} — raw: ${rawOutput.slice(0, 200)}`, { source: "mmemory" });
 		return;
 	}
 
-	if (newFacts.length === 0) return;
+	if (newFacts.length === 0) {
+		logger.debug("[mmemory] extract: no new facts after filtering", { source: "mmemory" });
+		return;
+	}
 
 	// Load existing, merge, dedup by fact string (case-insensitive)
 	const existing = await loadFacts(config);
 	const seen = new Set(existing.map(f => f.fact.toLowerCase()));
 	const toAdd = newFacts.filter(f => !seen.has(f.fact.toLowerCase()));
-	if (toAdd.length === 0) return;
+	if (toAdd.length === 0) {
+		logger.debug("[mmemory] extract: all facts already known, nothing to add", { source: "mmemory" });
+		return;
+	}
 
 	const merged = [...existing, ...toAdd];
 	try {
 		await atomicWriteJson(factsPath, merged);
+		logger.debug(`[mmemory] extract: wrote ${toAdd.length} new facts (total: ${merged.length})`, { source: "mmemory" });
 	} catch (err) {
-		console.error("[mmemory] Failed to write facts.json:", err);
+		logger.warn(`[mmemory] failed to write facts.json: ${err}`, { source: "mmemory" });
 	}
 }
 export interface RecallResult {
@@ -539,11 +571,10 @@ export async function executeMemoryRecall(
 	);
 	if (results.length === 0) return { text: "No relevant memories found.", resultCount: 0 };
 
-	const lines: string[] = [`Found ${results.length} relevant memories:\n`];
+	const lines: string[] = [];
 	for (const r of results) {
-		const score = typeof r.score === "number" ? ` (score: ${r.score.toFixed(3)})` : "";
 		const when = r.when ? ` [${r.when}]` : "";
-		lines.push(`• ${r.text}${when}${score}`);
+		lines.push(`• ${r.text}${when}`);
 	}
 	return { text: lines.join("\n"), resultCount: results.length };
 }
@@ -670,21 +701,23 @@ export async function executeMemoryConsolidate(
  */
 export async function executeMemoryBuild(config: MmemoryConfig): Promise<void> {
 	const paths = resolvePaths(config);
+	logger.debug(`[mmemory] build: project=${paths.projectDir}`, { source: "mmemory" });
 	const client = await getOrCreateServerClient(config);
 	try {
-		await client.query("build", {
+		const result = await client.query("build", {
 			project_dir: paths.projectDir,
 			dedup_threshold: config.deduplicationThreshold,
-		});
-	} catch {
-		// Build is fire-and-forget — errors are non-fatal
+		}) as any;
+		logger.debug(`[mmemory] build complete: new=${result?.new_chunks ?? "?"} total=${result?.total_chunks ?? "?"} deduped=${result?.deduped ?? "?"}`, { source: "mmemory" });
+	} catch (err) {
+		logger.warn(`[mmemory] build error: ${err}`, { source: "mmemory" });
 	}
 }
 
 /** Format a recall result for system prompt injection. */
 export function formatRecallForSystemPrompt(result: RecallResult): string | undefined {
 	if (result.resultCount === 0) return undefined;
-	return `<memories>\n${result.text}\n</memories>`;
+	return `<memories>\nRelevant context from past sessions:\n${result.text}\n</memories>`;
 }
 
 /**
@@ -709,7 +742,8 @@ export async function executeMemoryRetain(
 	const filePath = path.join(paths.queueDir, filename);
 	const today = new Date().toISOString().slice(0, 10);
 	await fs.writeFile(filePath, `# Memory Note — ${today}\n\n${cleaned}`, "utf-8");
-	void executeMemoryBuild(config).catch(() => {});
+	logger.debug(`[mmemory] tool retain: wrote ${filename} (${cleaned.length} chars)`, { source: "mmemory" });
+	void executeMemoryBuild(config).catch((e) => logger.warn(`[mmemory] build after retain failed: ${e}`, { source: "mmemory" }));
 	return `Retained: ${filename}`;
 }
 
