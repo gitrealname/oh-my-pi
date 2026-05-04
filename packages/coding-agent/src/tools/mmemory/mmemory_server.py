@@ -609,6 +609,18 @@ class MmemoryServer:
         max_score = float(np.max(scores))
         return {"is_duplicate": max_score >= threshold, "max_score": max_score}
 
+    def _handle_embed(self, req: dict) -> dict:
+        """Embed a list of texts. Returns vectors as nested lists (float32).
+
+        Compatible with the semantic_server embed action so KB semantic-server
+        can delegate to this server instead of loading its own model copy.
+        """
+        self._load_model()
+        texts: list[str] = req.get("texts", [])
+        if not texts:
+            return {"error": "texts required"}
+        vectors = [v.tolist() for v in self.model.embed(texts)]
+        return {"vectors": vectors, "count": len(vectors)}
 
     def _handle_clear(self, req: dict) -> dict:
         """Remove chunks matching a date range or session ID from chunks.json.
@@ -697,6 +709,7 @@ class MmemoryServer:
             "rebuild":      lambda r: self._handle_build({**r, "force_rebuild": True}),
             "clear":        self._handle_clear,
             "dedup_check":  self._handle_dedup_check,
+            "embed":        self._handle_embed,
         }.get(action)
         if not handler:
             return {"error": f"unknown action: {action}"}
