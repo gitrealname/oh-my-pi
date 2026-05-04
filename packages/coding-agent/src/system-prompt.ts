@@ -9,7 +9,7 @@ import { $env, getGpuCachePath, getProjectDir, hasFsCode, isEnoent, logger, prom
 import { $ } from "bun";
 import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
-import type { SkillsSettings } from "./config/settings";
+import { Settings, type SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
@@ -245,6 +245,22 @@ async function getEnvironmentInfo(): Promise<Array<{ label: string; value: strin
 	} catch {
 		cpuModel = undefined;
 	}
+
+	// Resolve the configured shell so the model knows to use POSIX path conventions
+	// even when the host OS is Windows (e.g. Git Bash on win32).
+	let shellLabel: string | undefined;
+	try {
+		const settings = await Settings.init();
+		const { shell } = settings.getShellConfig();
+		if (shell) {
+			// Reduce to the basename without extension: "/usr/bin/bash" → "bash",
+			// "C:/Program Files/Git/bin/bash.exe" → "bash"
+			shellLabel = shell.split(/[/\\]/).pop()?.replace(/\.exe$/i, "");
+		}
+	} catch {
+		// Non-fatal: shell label is optional
+	}
+
 	const entries: Array<{ label: string; value: string | undefined }> = [
 		{ label: "OS", value: `${os.platform()} ${os.release()}` },
 		{ label: "Distro", value: os.type() },
@@ -253,6 +269,7 @@ async function getEnvironmentInfo(): Promise<Array<{ label: string; value: strin
 		{ label: "CPU", value: cpuModel },
 		{ label: "GPU", value: gpu },
 		{ label: "Terminal", value: getTerminalName() },
+		{ label: "Shell", value: shellLabel },
 	];
 	return entries.filter((e): e is { label: string; value: string } => !!e.value);
 }
