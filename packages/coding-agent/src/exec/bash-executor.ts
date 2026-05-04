@@ -94,9 +94,14 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const commandCwd = await resolveShellCwd(options?.cwd);
 	const commandEnv = options?.env ? { ...NON_INTERACTIVE_ENV, ...options.env } : NON_INTERACTIVE_ENV;
 
-	// Apply command prefix if configured; on Windows normalise /dev/null → NUL
+	// On Windows with a bash execution shell: normalise /dev/null → NUL, backslash
+	// paths → forward slashes, and bare .cmd invocations → cmd /c.
+	// Skip when the execution shell is cmd or PowerShell — those handle Windows
+	// paths natively and don't need this treatment.
 	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
-	const finalCommand = IS_WINDOWS ? normalizeCommandForWindows(prefixedCommand) : prefixedCommand;
+	const finalCommand = IS_WINDOWS && shell.includes("bash")
+		? normalizeCommandForWindows(prefixedCommand)
+		: prefixedCommand;
 
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({

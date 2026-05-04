@@ -243,20 +243,40 @@ async function getEnvironmentInfo(): Promise<Array<{ label: string; value: strin
 	} catch {
 		cpuModel = undefined;
 	}
-
-	// Resolve the configured shell so the model knows to use POSIX path conventions
-	// even when the host OS is Windows (e.g. Git Bash on win32).
+	// Shell label — only emitted on Windows, where "OS: win32" would otherwise
+	// cause the model to generate Windows-style paths.
+	//
+	// On Linux/macOS the shell is always POSIX-compatible; no label needed.
+	//
+	// Detection order on Windows:
+	//   1. Env vars set by the parent process (most reliable, no config required):
+	//      MSYSTEM     — set by MSYS2/MinGW (Git Bash)
+	//      BASH_VERSION — set by any bash session
+	//      SHELL       — set by bash/zsh even on Windows
+	//   2. Configured execution shell path as fallback.
 	let shellLabel: string | undefined;
-	try {
-		const settings = await Settings.init();
-		const { shell } = settings.getShellConfig();
-		if (shell) {
-			// Reduce to the basename without extension: "/usr/bin/bash" → "bash",
-			// "C:/Program Files/Git/bin/bash.exe" → "bash"
-			shellLabel = shell.split(/[/\\]/).pop()?.replace(/\.exe$/i, "");
+	if (process.platform === "win32") {
+		if (
+			process.env.MSYSTEM ||
+			process.env.BASH_VERSION ||
+			process.env.SHELL?.toLowerCase().includes("bash")
+		) {
+			shellLabel = "bash";
+		} else if (process.env.PSModulePath) {
+			shellLabel = "powershell";
+		} else {
+			// Fall back to configured shell path
+			try {
+				const settings = await Settings.init();
+				const { shell } = settings.getShellConfig();
+				if (shell) {
+					shellLabel = shell.split(/[/\\]/).pop()?.replace(/\.exe$/i, "").toLowerCase();
+				}
+			} catch {
+				// Non-fatal
+			}
+			shellLabel ??= "cmd";
 		}
-	} catch {
-		// Non-fatal: shell label is optional
 	}
 
 	const entries: Array<{ label: string; value: string | undefined }> = [
