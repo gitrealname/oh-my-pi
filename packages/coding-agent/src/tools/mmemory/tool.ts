@@ -13,12 +13,16 @@ import type { ToolSession } from "..";
 import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { toolResult } from "../tool-result";
 
+import embeddedDesc from "../../sidecars/mme-gateway.tool-desc.md" with { type: "text" };
+import { createSidecar, sidecarPath } from "../../utils/m-utils";
+const resolveDesc = createSidecar(sidecarPath("mme-gateway.tool-desc.md"), embeddedDesc);
 
 const schema = Type.Object({
 	query: Type.String({
 		description:
 			"Natural language memory query, or content to store if operation is retain. " +
-			"Be specific: include entity names, file paths, or decision context.",
+			"Be specific: include entity names, file paths, or decision context. " +
+			"Prefix with '/ ' for a one-time global recall (e.g. '/ auth flow').",
 	}),
 	operation: Type.Optional(
 		Type.Union(
@@ -28,7 +32,7 @@ const schema = Type.Object({
 	),
 	scope: Type.Optional(
 		Type.String({
-			description: "Scope override: per-project | per-project-tagged | global",
+			description: "Scope override: per-project (default) | global | / (one-time global for this query only)",
 		}),
 	),
 });
@@ -37,11 +41,7 @@ export class MMemoryTool implements AgentTool<typeof schema> {
 	readonly name = "mmemory";
 	readonly label = "Memory";
 	readonly parameters = schema;
-	readonly description =
-		"Dispatch a memory operation via the session event bus. " +
-		"Called automatically when the user prefixes a message with `.memory`. " +
-		"Do NOT call this tool directly — use mmemory_recall, mmemory_retain, or mmemory_reflect instead.";
-
+	readonly description = resolveDesc();
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MMemoryTool | null {

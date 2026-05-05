@@ -24,6 +24,15 @@ function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
 
+// Dispatch map for doubleEscapeAction — add new actions here, no logic changes needed.
+type DoubleEscapeAction = "branch" | "tree" | "mtree" | "none";
+const DOUBLE_ESCAPE_HANDLERS: Record<DoubleEscapeAction, (ctx: InteractiveModeContext) => void> = {
+	tree:   ctx => ctx.showTreeSelector(),
+	branch: ctx => ctx.showUserMessageSelector(),
+	mtree:  ctx => (ctx as unknown as { showMTreeSelector(): void }).showMTreeSelector(),
+	none:   () => {},
+};
+
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
@@ -76,16 +85,13 @@ export class InputController {
 			} else if (this.ctx.session.isStreaming) {
 				void this.ctx.session.abort();
 			} else if (!this.ctx.editor.getText().trim()) {
-				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
-				const action = settings.get("doubleEscapeAction");
+				// Double-escape with empty editor — action driven by doubleEscapeAction setting.
+				const action = settings.get("doubleEscapeAction") as DoubleEscapeAction;
+				const handler = DOUBLE_ESCAPE_HANDLERS[action] ?? DOUBLE_ESCAPE_HANDLERS.none;
 				if (action !== "none") {
 					const now = Date.now();
 					if (now - this.ctx.lastEscapeTime < 500) {
-						if (action === "tree") {
-							this.ctx.showTreeSelector();
-						} else {
-							this.ctx.showUserMessageSelector();
-						}
+						handler(this.ctx);
 						this.ctx.lastEscapeTime = 0;
 					} else {
 						this.ctx.lastEscapeTime = now;

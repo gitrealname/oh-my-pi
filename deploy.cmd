@@ -15,10 +15,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Deploying mreview-ui.html ...
-copy /Y "%~dp0packages\coding-agent\src\tools\mreview\mreview-ui.html" "%TARGET_DIR%\mreview-ui.html"
+echo Deploying mreview-editor.ui.html ...
+copy /Y "%~dp0packages\coding-agent\src\tools\mreview\mreview-editor.ui.html" "%TARGET_DIR%\mreview-editor.ui.html"
 if errorlevel 1 (
-    echo ERROR: failed to copy mreview-ui.html
+    echo ERROR: failed to copy mreview-editor.ui.html
     exit /b 1
 )
 

@@ -221,12 +221,30 @@ def rrf_merge(sem: list[tuple[int, float]], bm: list[tuple[int, float]], k: int 
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Strip YAML frontmatter block from text. Returns (metadata_dict, body)."""
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+    fm_text = text[4:end]
+    body = text[end + 5:]
+    meta: dict = {}
+    for line in fm_text.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            meta[k.strip()] = v.strip()
+    return meta, body
+
 # ── Server ───────────────────────────────────────────────────────────────────
 
 class MmemoryServer:
-    def __init__(self, port: int, timeout_minutes: int) -> None:
+    def __init__(self, port: int, timeout_minutes: int, pid_file: "Path | None" = None) -> None:
         self.port = port
         self.timeout = timeout_minutes * 60
+        self.pid_file = pid_file
         self.last_activity = time.time()
         self.running = True
         self.model = None
@@ -242,28 +260,76 @@ class MmemoryServer:
         # All project dirs seen since startup — reported in ping so clients can
         # fire build for any that have orphaned queue files after a crash/restart.
         self._known_project_dirs: set[str] = set()
+        self._model_lock  = threading.Lock()
 
+
+    # ── Singleton election ────────────────────────────────────────────────────
+
+    def _acquire_singleton(self) -> bool:
+        """Three-layer race guard. Returns True if this process should proceed.
+
+        Layer 1 — port ping: exit early if a live server already answers.
+        Layer 2 — double-write CAS: write own PID, sleep 50ms, read back.
+                  Last writer wins; earlier writers see a foreign PID and exit.
+        Layer 3 — bind: OS-level guarantee (SO_EXCLUSIVEADDRUSE on Windows).
+        Layers 1+2 are here; layer 3 is in run().
+        """
+        if self.pid_file is None:
+            return True
+
+        own_pid = str(os.getpid())
+
+        # Layer 1: ping the port — if a server already answers, exit.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(("127.0.0.1", self.port))
+            s.sendall(json.dumps({"action": "ping"}).encode() + b"\n")
+            s.recv(256)
+            s.close()
+            print(f"[mmemory] PID {own_pid}: live server on port {self.port} — exiting.",
+                  file=sys.stderr, flush=True)
+            return False
+        except OSError:
+            pass  # no server yet — proceed
+
+        # Layer 2: write own PID, sleep, read back — last writer wins.
+        try:
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(own_pid)
+            time.sleep(0.05)  # 50ms — enough for concurrent writers to land
+            if self.pid_file.read_text().strip() != own_pid:
+                print(f"[mmemory] PID {own_pid}: lost singleton election — exiting.",
+                      file=sys.stderr, flush=True)
+                return False
+        except OSError:
+            pass  # file I/O failure is non-fatal; layer 3 (bind) is the backstop
+
+        return True
 
     # ── Model ────────────────────────────────────────────────────────────────
 
     def _load_model(self) -> None:
         if self.model is not None:
-            return
-        os.environ["FASTEMBED_CACHE_PATH"] = str(MODEL_CACHE)
-        try:
-            from fastembed import TextEmbedding  # type: ignore[import]
-        except ImportError:
-            print(
-                "[mmemory] ERROR: fastembed not installed.\n"
-                "  Run: pip install fastembed safetensors numpy\n"
-                "  Then restart the omp session.",
-                file=sys.stderr, flush=True,
-            )
-            sys.exit(1)
-        t0 = time.time()
-        print(f"[mmemory] Loading model {MODEL_NAME}...", file=sys.stderr, flush=True)
-        self.model = TextEmbedding(MODEL_NAME, cache_dir=str(MODEL_CACHE))
-        print(f"[mmemory] Model ready ({time.time() - t0:.1f}s).", file=sys.stderr, flush=True)
+            return  # fast path — no lock needed once loaded
+        with self._model_lock:
+            if self.model is not None:
+                return  # another thread loaded while we waited for the lock
+            os.environ["FASTEMBED_CACHE_PATH"] = str(MODEL_CACHE)
+            try:
+                from fastembed import TextEmbedding  # type: ignore[import]
+            except ImportError:
+                print(
+                    "[mmemory] ERROR: fastembed not installed.\n"
+                    "  Run: pip install fastembed safetensors numpy\n"
+                    "  Then restart the omp session.",
+                    file=sys.stderr, flush=True,
+                )
+                sys.exit(1)
+            t0 = time.time()
+            print(f"[mmemory] Loading model {MODEL_NAME}...", file=sys.stderr, flush=True)
+            self.model = TextEmbedding(MODEL_NAME, cache_dir=str(MODEL_CACHE))
+            print(f"[mmemory] Model ready ({time.time() - t0:.1f}s).", file=sys.stderr, flush=True)
 
     # ── Paths ────────────────────────────────────────────────────────────────
 
@@ -272,13 +338,47 @@ class MmemoryServer:
         p = Path(project_dir)
         return {
             "queue":        p / "queue",
-            "index":        p / "index",
-            "chunks":       p / "index" / "chunks.json",
-            "vectors":      p / "index" / "vectors.safetensors",
-            "vectors_meta": p / "index" / "vectors.meta.json",
+            "chunks":       p / "chunks.json",
+            "vectors":      p / "vectors.safetensors",
+            "vectors_meta": p / "vectors.meta.json",
         }
 
     # ── Cache helpers ────────────────────────────────────────────────────────
+
+    def _migrate_legacy(self, project_dir: str) -> None:
+        """One-shot migration: projectDir/index/ → flat projectDir/."""
+        import shutil
+        p = Path(project_dir)
+        legacy_dir = p / "index"
+        try:
+            old_chunks = json.loads((legacy_dir / "chunks.json").read_text())
+            project_label = p.name
+            ts_re = re.compile(r"(\d{8})-(\d{6})")
+            for c in old_chunks:
+                c.setdefault("project", project_label)
+                c.setdefault("source", "session")
+                c.setdefault("session_id", None)
+                c.setdefault("agent_tag", "default")
+                if "ts" not in c:
+                    m = ts_re.search(c.get("path", ""))
+                    if m:
+                        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+                        c["ts"] = int(dt.timestamp())
+                    else:
+                        c["ts"] = int(time.time())
+            tmp = p / "chunks.tmp.json"
+            tmp.write_text(json.dumps(old_chunks, indent=2))
+            tmp.replace(p / "chunks.json")
+            for name in ("vectors.safetensors", "vectors.meta.json"):
+                src = legacy_dir / name
+                if src.exists():
+                    shutil.copy2(str(src), str(p / name))
+            shutil.rmtree(str(legacy_dir), ignore_errors=True)
+            self._invalidate(project_dir)
+            print(f"[mmemory] Migrated {len(old_chunks)} chunks from legacy index/ layout.",
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[mmemory] Migration failed (continuing): {e}", file=sys.stderr, flush=True)
 
     def _get_chunks(self, chunks_path: str) -> list[dict]:
         if chunks_path in self._chunks_cache:
@@ -364,11 +464,19 @@ class MmemoryServer:
         recency_weight: float = req.get("recency_weight", 0.3)
         scope: str = req.get("scope", "per-project")
         project: str = req.get("project", "")
+        filter_params: dict = req.get("filter", {})
 
         if not query or not project_dir:
             return {"error": "query and project_dir required"}
         self._known_project_dirs.add(project_dir)
-
+        # One-shot migration: legacy index/ layout → flat layout.
+        # Background thread — recall is time-constrained; the file copy can take
+        # several seconds for large safetensors files. Return empty this call;
+        # next recall will find the migrated data.
+        if (Path(project_dir) / "index" / "chunks.json").exists() and \
+                not (Path(project_dir) / "chunks.json").exists():
+            threading.Thread(target=self._migrate_legacy, args=(project_dir,), daemon=False).start()
+            return {"results": [], "count": 0, "note": "migrating legacy layout — retry in a moment"}
         dirs = self._dirs(project_dir)
 
         # Drain orphaned queue files (e.g. left by a previous crash) without
@@ -403,6 +511,26 @@ class MmemoryServer:
 
         merged = rrf_merge(sem_results, bm25_results)
         chunks = self._get_chunks(chunks_path)
+
+        def _matches_filter(chunk: dict, f: dict) -> bool:
+            if f.get("project") and chunk.get("project") != f["project"]:
+                return False
+            src = f.get("source")
+            if src:
+                chunk_src = chunk.get("source", "session")
+                sources = src if isinstance(src, list) else [src]
+                if chunk_src not in sources:
+                    return False
+            if f.get("ts_after") and chunk.get("ts", 0) < int(f["ts_after"]):
+                return False
+            if f.get("ts_before") and chunk.get("ts", 0) > int(f["ts_before"]):
+                return False
+            if f.get("agent_tag") and chunk.get("agent_tag", "default") != f["agent_tag"]:
+                return False
+            return True
+
+        if filter_params:
+            merged = [(i, s) for i, s in merged if i < len(chunks) and _matches_filter(chunks[i], filter_params)]
 
         today = date.today()
         results = []
@@ -485,9 +613,14 @@ class MmemoryServer:
             )
             sys.exit(1)
 
+        # One-shot migration: legacy index/ layout → flat layout
+        legacy_chunks = Path(project_dir) / "index" / "chunks.json"
+        flat_chunks = Path(project_dir) / "chunks.json"
+        if legacy_chunks.exists() and not flat_chunks.exists():
+            self._migrate_legacy(project_dir)
+
         dirs = self._dirs(project_dir)
         queue_dir = dirs["queue"]
-        index_dir = dirs["index"]
         chunks_path = dirs["chunks"]
         vectors_path = dirs["vectors"]
         vectors_meta_path = dirs["vectors_meta"]
@@ -518,8 +651,16 @@ class MmemoryServer:
         new_raw_chunks: list[dict] = []
         for md_file in queue_files:
             try:
-                text = md_file.read_text(encoding="utf-8", errors="replace")
-                new_raw_chunks.extend(chunk_by_turns(text, str(md_file)))
+                raw = md_file.read_text(encoding="utf-8", errors="replace")
+                fm, text = _parse_frontmatter(raw)
+                chunks = chunk_by_turns(text, str(md_file))
+                for c in chunks:
+                    c["project"]    = fm.get("project",    Path(project_dir).name)
+                    c["source"]     = fm.get("source",     "session")
+                    c["session_id"] = fm.get("session_id", None)
+                    c["ts"]         = int(fm.get("ts", time.time()))
+                    c["agent_tag"]  = fm.get("agent_tag",  "default")
+                new_raw_chunks.extend(chunks)
             except Exception as e:
                 print(f"[mmemory] Failed to read {md_file.name}: {e}", file=sys.stderr, flush=True)
 
@@ -568,6 +709,7 @@ class MmemoryServer:
                 re_parts: list[np.ndarray] = []
                 for b in range(0, len(all_texts), BATCH):
                     re_parts.append(np.array(list(self.model.embed(all_texts[b:b + BATCH])), dtype=np.float32))
+                    self.last_activity = time.time()
                 all_vecs = np.vstack(re_parts) if len(re_parts) > 1 else re_parts[0]
         else:
             # Cases: force_rebuild, model changed, or vectors file missing.
@@ -578,18 +720,21 @@ class MmemoryServer:
             re_parts: list[np.ndarray] = []
             for b in range(0, len(all_texts), BATCH):
                 re_parts.append(np.array(list(self.model.embed(all_texts[b:b + BATCH])), dtype=np.float32))
+                self.last_activity = time.time()
             all_vecs = np.vstack(re_parts) if len(re_parts) > 1 else (re_parts[0] if re_parts else np.zeros((0, 384), dtype=np.float32))
 
         # ── 6. Write atomically (temp → rename) ───────────────────────────────
-        index_dir.mkdir(parents=True, exist_ok=True)
+        Path(project_dir).mkdir(parents=True, exist_ok=True)
 
         # chunks.json: write via temp file to avoid partial reads
         tmp_chunks = chunks_path.with_suffix(".tmp.json")
         tmp_chunks.write_text(json.dumps(all_chunks, indent=2))
         tmp_chunks.replace(chunks_path)
 
-        # vectors.safetensors
-        save_file({"vectors": all_vecs}, str(vectors_path))
+        # vectors.safetensors: write via temp file to match chunks.json atomicity
+        tmp_vectors = vectors_path.with_suffix(".tmp.safetensors")
+        save_file({"vectors": all_vecs}, str(tmp_vectors))
+        tmp_vectors.replace(vectors_path)
 
         self.last_activity = time.time()  # build complete; reset idle window
         # meta: model name + count for rebuild validation
@@ -782,9 +927,25 @@ class MmemoryServer:
                 break
 
     def run(self) -> None:
+        if not self._acquire_singleton():
+            return
+
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", self.port))
+        # Windows SO_REUSEADDR allows multiple sockets to bind the same port —
+        # the wrong behaviour for a singleton server. Use SO_EXCLUSIVEADDRUSE on
+        # Windows so only one socket can own the port at a time.
+        if sys.platform == "win32":
+            SO_EXCLUSIVEADDRUSE = ~socket.SO_REUSEADDR  # (int)(~SO_REUSEADDR) per winsock2.h
+            srv.setsockopt(socket.SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", self.port))
+        except OSError:
+            print(f"[mmemory] Port {self.port} already bound — exiting (lost bind race).",
+                  file=sys.stderr, flush=True)
+            srv.close()
+            return
         srv.listen(8)
         srv.settimeout(1.0)
         self.port = srv.getsockname()[1]
@@ -807,6 +968,11 @@ class MmemoryServer:
             threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
 
         srv.close()
+        if self.pid_file and self.pid_file.exists():
+            try:
+                self.pid_file.unlink()
+            except OSError:
+                pass
         print("[mmemory] Stopped.", file=sys.stderr, flush=True)
 
 
@@ -832,6 +998,7 @@ def main() -> None:
     port = 49200
     timeout = DEFAULT_TIMEOUT
     log_file: str | None = None
+    pid_file: str | None = None
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == "--port" and i + 1 < len(sys.argv):
@@ -840,6 +1007,8 @@ def main() -> None:
             timeout = int(sys.argv[i + 1]); i += 2
         elif sys.argv[i] == "--log-file" and i + 1 < len(sys.argv):
             log_file = sys.argv[i + 1]; i += 2
+        elif sys.argv[i] == "--pid-file" and i + 1 < len(sys.argv):
+            pid_file = sys.argv[i + 1]; i += 2
         else:
             i += 1
 
@@ -849,27 +1018,7 @@ def main() -> None:
         log_fh = open(log_file, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
         sys.stderr = log_fh  # type: ignore[assignment]
 
-    # ── Pre-bind guard: exit cleanly if another instance already owns the port ──
-    # The client-side pre-spawn ping in server-client.ts is the primary guard,
-    # but races and third-party spawns can still land two processes here.
-    # A clean exit is far better than a bind crash that leaves the client
-    # waiting 30s for a ready ping that never arrives.
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.0)
-        s.connect(("127.0.0.1", port))
-        s.sendall(json.dumps({"action": "ping"}).encode() + b"\n")
-        s.recv(256)
-        s.close()
-        print(
-            f"[mmemory] Port {port} already has a live server — exiting to avoid duplicate.",
-            file=sys.stderr, flush=True,
-        )
-        sys.exit(0)
-    except OSError:
-        pass  # nothing listening — safe to bind
-
-    MmemoryServer(port, timeout).run()
+    MmemoryServer(port, timeout, Path(pid_file) if pid_file else None).run()
 
 
 if __name__ == "__main__":

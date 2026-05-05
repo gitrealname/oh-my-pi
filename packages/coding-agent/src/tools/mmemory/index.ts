@@ -5,19 +5,18 @@
  *   - The /mmemory slash command handler (builtin-registry.ts)
  *   - MmemoryRetainTool, MmemoryRecallTool, MmemoryReflectTool
  *
- * Storage layout (`<storagePath>/<projectName>/`):
+ * Storage layout (`<storageRoot>/`):
  *   queue/                      transient .md files; deleted after build processes them
  *     YYYYMMDD-HHMMSS-<sessionId>.md   auto-retain (overwritten each cycle)
  *     YYYYMMDD-HHMMSS-note-<id>.md     tool-initiated retains
- *   index/                      fully derived; delete and rebuild at any time
- *     chunks.json               DURABLE STORE — full chunk texts, append-only
- *     vectors.safetensors       rebuildable from chunks.json
- *     vectors.meta.json         chunk hashes for incremental embedding
- *   facts.json                  Phase 3: extracted facts
- *   mental_models/              Phase 3: seeded summaries
- *   kb_config.yaml              auto-generated registry entry
+ *   chunks.json               DURABLE STORE — full chunk texts, append-only
+ *   vectors.safetensors       rebuildable from chunks.json
+ *   vectors.meta.json         chunk hashes for incremental embedding
+ *   facts.json                Phase 3: extracted facts
+ *   mental_models/            Phase 3: seeded summaries
+ *   kb_config.yaml            auto-generated registry entry
  *
- * storagePath defaults to $PI_CODING_AGENT_DIR/mmemory/ (launched via o/ow),
+ * storageRoot defaults to $PI_CODING_AGENT_DIR/mmemory/ (launched via o/ow),
  * <exe-dir>/extensions/mmemory/ (compiled), or ~/.omp/mmemory/ (dev).
  */
 import * as fs from "node:fs/promises";
@@ -27,17 +26,20 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import { MmemoryServerClient } from "./server-client";
 import mmemoryServerPy from "./mmemory_server.py" with { type: "text" };
+import { resolveTimeFilter } from "./time-filter";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 export interface MmemoryConfig {
-	storagePath: string;
-	projectName: string;
+	storageRoot: string;
+	projectLabel: string;
+	agentTag: string;
 	modelRole: string;
 	consolidateModelRole: string;
+	timeFilterModelRole: string;
 	retainMission: string;
 	extractionMode: "structured" | "verbatim";
-	scoping: "per-project" | "per-project-tagged" | "global";
+	scoping: "per-project" | "global";
 	retainEveryNTurns: number;
 	retainContextTurns: number;
 	recallMaxQueryChars: number;
@@ -53,13 +55,19 @@ export interface MmemoryConfig {
 	maxRawFacts: number;
 }
 
+/** Normalize a filesystem path to a stable project label.
+ *  Replaces backslashes with forward slashes; strips drive colon.
+ *  `D:\.ai` → `D/.ai`, `C:\repos\carity2` → `C/repos/carity2` */
+function normalizeCwd(p: string): string {
+	return p.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1");
+}
+
 export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConfig | null {
 	if (!settings.get("mmemory.enabled")) return null;
 
-	const projectName = settings.get("mmemory.projectName") ?? path.basename(cwd ?? process.cwd());
-	const rawStoragePath = settings.get("mmemory.storagePath");
-	const storagePath = rawStoragePath
-		? rawStoragePath.replace(/^~/, os.homedir())
+	const rawStorageRoot = settings.get("mmemory.storageRoot");
+	const storageRoot = rawStorageRoot
+		? rawStorageRoot.replace(/^~/, os.homedir())
 		: process.env.PI_CODING_AGENT_DIR
 			? path.join(process.env.PI_CODING_AGENT_DIR, "mmemory")
 			: process.env.PI_COMPILED === "true"
@@ -67,10 +75,12 @@ export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConf
 				: path.join(os.homedir(), ".omp", "mmemory");
 
 	return {
-		storagePath,
-		projectName,
+		storageRoot,
 		modelRole:               settings.get("mmemory.modelRole")               ?? "smol",
 		consolidateModelRole:    settings.get("mmemory.consolidateModelRole")     ?? settings.get("mmemory.modelRole") ?? "smol",
+		timeFilterModelRole:     settings.get("mmemory.timeFilterModelRole")      ?? settings.get("mmemory.modelRole") ?? "smol",
+		agentTag:                settings.get("mmemory.agentTag")               ?? "default",
+		projectLabel:            normalizeCwd(cwd ?? process.cwd()),
 		retainMission:           settings.get("mmemory.retainMission")            ?? "Focus on technical decisions, API contracts, constraints, error patterns, and project conventions",
 		extractionMode:          settings.get("mmemory.extractionMode"),
 		scoping:                 settings.get("mmemory.scoping"),
@@ -92,37 +102,31 @@ export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConf
 
 /** Resolved storage paths for a project. */
 export interface MmemoryPaths {
-	projectDir: string;       // storagePath/projectName
-	queueDir: string;         // projectDir/queue  (transient .md files, deleted after build)
-	indexDir: string;         // projectDir/index
-	chunksPath: string;       // indexDir/chunks.json  (durable store)
-	vectorsPath: string;      // indexDir/vectors.safetensors
-	vectorsMetaPath: string;  // indexDir/vectors.meta.json
+	projectDir: string;       // storageRoot
+	queueDir: string;         // storageRoot/queue  (transient .md files, deleted after build)
+	chunksPath: string;       // storageRoot/chunks.json  (durable store)
+	vectorsPath: string;      // storageRoot/vectors.safetensors
+	vectorsMetaPath: string;  // storageRoot/vectors.meta.json
 	factsPath: string;        // projectDir/facts.json  (Phase 3)
 	observationsPath: string; // projectDir/observations.json  (Phase 3)
 	mentalModelsDir: string;  // projectDir/mental_models  (Phase 3)
 }
 
 export function resolvePaths(config: MmemoryConfig): MmemoryPaths {
-	const projectDir = path.join(config.storagePath, config.projectName);
-	const indexDir = path.join(projectDir, "index");
+	const projectDir = config.storageRoot;
 	return {
 		projectDir,
 		queueDir: path.join(projectDir, "queue"),
-		indexDir,
-		chunksPath: path.join(indexDir, "chunks.json"),
-		vectorsPath: path.join(indexDir, "vectors.safetensors"),
-		vectorsMetaPath: path.join(indexDir, "vectors.meta.json"),
+		chunksPath: path.join(projectDir, "chunks.json"),
+		vectorsPath: path.join(projectDir, "vectors.safetensors"),
+		vectorsMetaPath: path.join(projectDir, "vectors.meta.json"),
 		factsPath: path.join(projectDir, "facts.json"),
 		observationsPath: path.join(projectDir, "observations.json"),
 		mentalModelsDir: path.join(projectDir, "mental_models"),
 	};
 }
 
-/** Returns paths for the global project dir (cross-project per-project-tagged scope). */
-export function resolveGlobalPaths(config: MmemoryConfig): MmemoryPaths {
-	return resolvePaths({ ...config, projectName: "global" });
-}
+
 
 
 // ── Recall query composition ──────────────────────────────────────────────────
@@ -280,7 +284,7 @@ export async function getOrCreateServerClient(config: MmemoryConfig): Promise<Mm
 	if (!creating) {
 		creating = (async () => {
 			const serverScript = await ensureServerScript();
-			const logFile = config.serverLogFile ?? path.join(config.storagePath, "mmemory-server.log");
+			const logFile = config.serverLogFile ?? path.join(config.storageRoot, "mmemory-server.log");
 			const client = new MmemoryServerClient(
 				serverScript,
 				config.serverPort,
@@ -488,63 +492,57 @@ export interface RecallResult {
  */
 export async function executeMemoryRecall(
 	query: string,
-	scope: string | undefined,
+	scope: string | undefined | null,
 	config: MmemoryConfig,
+	registry?: import("../config/model-registry").ModelRegistry,
+	settings?: import("../config/settings").Settings,
 ): Promise<RecallResult> {
 	const paths = resolvePaths(config);
 	const client = await getOrCreateServerClient(config);
+
+	// LLM time-filter: detect "yesterday", "last week", etc. and convert to timestamps
+	const timeFilter = registry
+		? await resolveTimeFilter(query, config, registry, settings)
+		: { query };
+	const resolvedQuery = timeFilter.query;
+
+	// Resolve effective scope → project filter
 	const effectiveScope = scope ?? config.scoping;
+	const projectLabel = config.projectLabel;
+	const scopeFilter: Record<string, unknown> =
+		effectiveScope === null || effectiveScope === "global"
+			? {}
+			: effectiveScope === "per-project"
+				? { project: projectLabel }
+				: { project: effectiveScope };  // named project
+
+	const filter: Record<string, unknown> = {
+		...scopeFilter,
+		// agent_tag filter — omitted on global scope so cross-agent recall works
+		...(effectiveScope !== null && effectiveScope !== "global" && config.agentTag !== "default"
+			? { agent_tag: config.agentTag }
+			: {}),
+		...(timeFilter.ts_after  !== undefined ? { ts_after:  timeFilter.ts_after  } : {}),
+		...(timeFilter.ts_before !== undefined ? { ts_before: timeFilter.ts_before } : {}),
+	};
 
 	const recallArgs = {
-		query,
+		query: resolvedQuery,
 		project_dir: paths.projectDir,
-		scope: effectiveScope,
-		project: config.projectName,
+		filter,
 		limit: config.recallLimit * 3,
 		recency_weight: config.recencyWeight,
 	};
 
 	let results: any[];
 	try {
-		if (effectiveScope === "per-project-tagged") {
-			const globalPaths = resolveGlobalPaths(config);
-			const [projectResponse, globalResponse] = await Promise.race([
-				Promise.all([
-					client.query("recall", recallArgs),
-					client.query("recall", {
-						...recallArgs,
-						project_dir: globalPaths.projectDir,
-						scope: "global",
-						project: "global",
-					}),
-				]),
-				new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error("recall timeout")), config.recallDeadlineMs),
-				),
-			]);
-			const combined = [
-				...((projectResponse as any)?.results ?? []),
-				...((globalResponse as any)?.results ?? []),
-			];
-			const seen = new Set<string>();
-			results = combined
-				.filter(r => {
-					const key = String(r.text).slice(0, 80);
-					if (seen.has(key)) return false;
-					seen.add(key);
-					return true;
-				})
-				.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-				.slice(0, config.recallLimit);
-		} else {
-			const response = await Promise.race([
-				client.query("recall", recallArgs),
-				new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error("recall timeout")), config.recallDeadlineMs),
-				),
-			]);
-			results = ((response as any)?.results ?? []).slice(0, config.recallLimit);
-		}
+		const response = await Promise.race([
+			client.query("recall", recallArgs),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("recall timeout")), config.recallDeadlineMs),
+			),
+		]);
+		results = ((response as any)?.results ?? []).slice(0, config.recallLimit);
 	} catch (err) {
 		return {
 			text: `Memory recall unavailable: ${err instanceof Error ? err.message : String(err)}`,

@@ -13,25 +13,26 @@
 // ── mmemory ───────────────────────────────────────────────────────────────────
 
 export const MMEMORY_SCHEMA_ENTRIES = {
-	"mmemory.storagePath": {
+	"mmemory.storageRoot": {
 		type: "string" as const,
 		default: undefined as string | undefined,
 		ui: {
 			tab: "tools" as const,
-			label: "MMemory: Storage path",
+			label: "MMemory: Storage root",
 			description:
-				"Root directory for mmemory storage. Defaults to $PI_CODING_AGENT_DIR/mmemory/ when launched via o/ow, or ~/.omp/mmemory/ otherwise. Supports ~.",
+				"Full path to mmemory storage root. All session memories, queue files, and indexes are stored here. Supports ~.",
 		},
 	},
 
-	"mmemory.projectName": {
+
+	"mmemory.agentTag": {
 		type: "string" as const,
-		default: undefined as string | undefined,
+		default: "default" as string,
 		ui: {
 			tab: "tools" as const,
-			label: "MMemory: Project name",
+			label: "MMemory: Agent tag",
 			description:
-				"Memory bucket name. Defaults to the basename of the working directory. Changing this starts a fresh memory set.",
+				"Isolates memories within the same project by agent identity. Multiple OMP agents in the same working directory can use different tags to maintain separate memory spaces. Default: \"default\" (shared by all untagged agents).",
 		},
 	},
 
@@ -43,6 +44,17 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 			label: "MMemory: Model role",
 			description:
 				"Model role used for fact extraction and recall synthesis. Must match a key in modelRoles.",
+		},
+	},
+
+	"mmemory.timeFilterModelRole": {
+		type: "string" as const,
+		default: undefined as string | undefined,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Time-filter model role",
+			description:
+				"Model role for temporal query preprocessing (converts 'last week' → timestamps). Falls back to mmemory.modelRole. Use a cheap/fast model — this fires on every recall query that contains a time hint.",
 		},
 	},
 
@@ -82,13 +94,13 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 
 	"mmemory.scoping": {
 		type: "enum" as const,
-		values: ["per-project", "per-project-tagged", "global"] as const,
-		default: "per-project-tagged" as "per-project" | "per-project-tagged" | "global",
+		values: ["per-project", "global"] as const,
+		default: "per-project" as "per-project" | "global",
 		ui: {
 			tab: "tools" as const,
-			label: "MMemory: Scoping",
+			label: "MMemory: Default recall scope",
 			description:
-				"per-project — recall from this project only. per-project-tagged — recall from this project + global/. global — single shared store.",
+				"per-project — recall filters to chunks from this project (default). global — no project filter. Overridable per-session with /mmemory / or /mmemory .",
 		},
 	},
 
@@ -224,7 +236,7 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 			tab: "tools" as const,
 			label: "MMemory: Server log file",
 			description:
-				"Path for mmemory Python server stderr output. Defaults to <storagePath>/mmemory-server.log. Supports ~.",
+				"Path for mmemory Python server stderr output. Defaults to <storageRoot>/mmemory-server.log. Supports ~.",
 		},
 	},
 } as const;
@@ -232,13 +244,13 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 /** Typed interface for getGroup("mmemory") */
 export interface MmemorySettings {
 	enabled: boolean;
-	storagePath: string | undefined;
-	projectName: string | undefined;
+	storageRoot: string | undefined;
 	modelRole: string | undefined;
 	consolidateModelRole: string | undefined;
+	timeFilterModelRole: string | undefined;
 	retainMission: string | undefined;
 	extractionMode: "verbatim" | "structured";
-	scoping: "per-project" | "per-project-tagged" | "global";
+	scoping: "per-project" | "global";
 	retainEveryNTurns: number;
 	retainContextTurns: number;
 	recallMaxQueryChars: number;
