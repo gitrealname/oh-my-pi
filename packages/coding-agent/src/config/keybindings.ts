@@ -11,11 +11,14 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 
+import type { AppScriptKeybindings } from "./keybindings-m-scripts";
+import { SCRIPT_KEYBINDING_CONFIGS } from "./keybindings-m-scripts";
+
 /**
  * Application-level keybindings (coding agent specific).
  * Values are always `true` — used for declaration merging.
  */
-interface AppKeybindings {
+interface AppKeybindings extends AppScriptKeybindings {
 	"app.interrupt": true;
 	"app.clear": true;
 	"app.exit": true;
@@ -48,16 +51,6 @@ interface AppKeybindings {
 	"app.plan.toggle": true;
 	"app.history.search": true;
 	"app.stt.toggle": true;
-	"app.script.1": true;
-	"app.script.2": true;
-	"app.script.3": true;
-	"app.script.4": true;
-	"app.script.5": true;
-	"app.script.6": true;
-	"app.script.7": true;
-	"app.script.8": true;
-	"app.script.9": true;
-	"app.script.10": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -199,16 +192,7 @@ export const KEYBINDINGS = {
 		defaultKeys: "alt+h",
 		description: "Toggle speech-to-text",
 	},
-	"app.script.1": { defaultKeys: [], description: "Run script 1" },
-	"app.script.2": { defaultKeys: [], description: "Run script 2" },
-	"app.script.3": { defaultKeys: [], description: "Run script 3" },
-	"app.script.4": { defaultKeys: [], description: "Run script 4" },
-	"app.script.5": { defaultKeys: [], description: "Run script 5" },
-	"app.script.6": { defaultKeys: [], description: "Run script 6" },
-	"app.script.7": { defaultKeys: [], description: "Run script 7" },
-	"app.script.8": { defaultKeys: [], description: "Run script 8" },
-	"app.script.9": { defaultKeys: [], description: "Run script 9" },
-	"app.script.10": { defaultKeys: [], description: "Run script 10" },
+	...SCRIPT_KEYBINDING_CONFIGS,
 } as const satisfies KeybindingDefinitions;
 
 /**

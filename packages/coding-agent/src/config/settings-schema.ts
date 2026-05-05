@@ -1,4 +1,5 @@
 import { MMEMORY_SCHEMA_ENTRIES, type MmemorySettings } from "./settings-schema-m-extensions";
+import { SCRIPT_SCHEMA_ENTRIES } from "./settings-schema-m-scripts";
 
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
@@ -2522,28 +2523,7 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
-
-	// Script executor slots (app.script.1 – app.script.10)
-	"scripts.1.command":      { type: "string", default: undefined },
-	"scripts.1.description":  { type: "string", default: "Script 1" },
-	"scripts.2.command":      { type: "string", default: undefined },
-	"scripts.2.description":  { type: "string", default: "Script 2" },
-	"scripts.3.command":      { type: "string", default: undefined },
-	"scripts.3.description":  { type: "string", default: "Script 3" },
-	"scripts.4.command":      { type: "string", default: undefined },
-	"scripts.4.description":  { type: "string", default: "Script 4" },
-	"scripts.5.command":      { type: "string", default: undefined },
-	"scripts.5.description":  { type: "string", default: "Script 5" },
-	"scripts.6.command":      { type: "string", default: undefined },
-	"scripts.6.description":  { type: "string", default: "Script 6" },
-	"scripts.7.command":      { type: "string", default: undefined },
-	"scripts.7.description":  { type: "string", default: "Script 7" },
-	"scripts.8.command":      { type: "string", default: undefined },
-	"scripts.8.description":  { type: "string", default: "Script 8" },
-	"scripts.9.command":      { type: "string", default: undefined },
-	"scripts.9.description":  { type: "string", default: "Script 9" },
-	"scripts.10.command":     { type: "string", default: undefined },
-	"scripts.10.description": { type: "string", default: "Script 10" },
+	...SCRIPT_SCHEMA_ENTRIES,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
