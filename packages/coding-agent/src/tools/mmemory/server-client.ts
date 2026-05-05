@@ -147,6 +147,7 @@ export class MmemoryServerClient {
 		void this.#drainPendingQueues(pong.pending_queue_projects);
 	}
 
+	/** Poll ping until the server responds or timeout expires.
 	 *  Returns the final pong payload (contains pending_queue_projects). */
 	async #waitUntilReady(): Promise<{ pending_queue_projects?: string[] }> {
 		const deadline = Date.now() + STARTUP_TIMEOUT_MS;
