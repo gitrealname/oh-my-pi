@@ -214,17 +214,15 @@ async function extractFromTranscript(
 	config: import("./tools/mmemory/index").MmemoryConfig,
 	ctx: ExtensionContext,
 ): Promise<void> {
-	const resolved = resolveModelRoleValue(
-		config.modelRole,
-		ctx.modelRegistry.getAll(),
-		{ modelRegistry: ctx.modelRegistry },
-	);
-	const model = resolved.model ?? ctx.model;
+	const registry = ctx.modelRegistry;
+	const roleValue =
+		(config.modelRole && config.modelRole !== "default" ? config.modelRole : undefined) ??
+		settings.get("modelRoles.memory" as "modelRoles.smol") ??
+		settings.get("modelRoles.smol") ??
+		settings.get("modelRoles.default" as "modelRoles.smol");
+	const resolved = resolveModelRoleValue(roleValue, registry.getAvailable(), { modelRegistry: registry });
+	const model = resolved.model;
 	if (!model) return;
-
-	const sessionId = ctx.sessionManager.getSessionId();
-	const apiKey = await ctx.modelRegistry.getApiKey(model, sessionId);
-	if (!apiKey) return;
 
 	// Use a tool call to force structured output — plain text prompts let the model
 	// return code blocks, prose preambles, or empty arrays instead of valid JSON.

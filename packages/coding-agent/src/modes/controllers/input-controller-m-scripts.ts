@@ -29,49 +29,10 @@ import type { InteractiveModeContext } from "../types";
 //
 // A script may emit multiple @omp: directives.  All non-@omp lines are joined
 // and submitted as a user message (LLM sees them as tool-result style input).
-
-const OMP_PREFIX = "@omp:";
-
-type OmpDirective =
-	| { kind: "image"; path: string }
-	| { kind: "text"; content: string }
-	| { kind: "excluded"; content: string }
-	| { kind: "stdout"; content: string };
-
-/** Parse stdout into a list of directives. */
-function parseOutput(raw: string): OmpDirective[] {
-	const directives: OmpDirective[] = [];
-	const stdoutLines: string[] = [];
-
-	for (const line of raw.split("\n")) {
-		if (!line.startsWith(OMP_PREFIX)) {
-			stdoutLines.push(line);
-			continue;
-		}
-		const rest = line.slice(OMP_PREFIX.length);
-		if (rest.startsWith("image:")) {
-			directives.push({ kind: "image", path: rest.slice("image:".length).trim() });
-		} else if (rest.startsWith("text:")) {
-			// Unescape in one pass: \n → newline, \\ → backslash.
-			// Two-pass replace is incorrect — it mis-handles \\n (escaped backslash + n).
-			const raw = rest.slice("text:".length);
-			const content = raw.replace(/\\(n|\\)/g, (_, c) => c === "n" ? "\n" : "\\");
-			directives.push({ kind: "text", content });
-		} else if (rest.startsWith("!!:")) {
-			directives.push({ kind: "excluded", content: rest.slice("!!:".length) });
-		} else {
-			// Unknown @omp: tag — treat as stdout so it's visible/debuggable
-			stdoutLines.push(line);
-		}
-	}
-
-	const stdout = stdoutLines.join("\n").trim();
-	if (stdout) {
-		directives.push({ kind: "stdout", content: stdout });
-	}
-
-	return directives;
-}
+//
+// Pure parser lives in input-controller-m-scripts-protocol.ts (no native deps).
+export type { OmpDirective } from "./input-controller-m-scripts-protocol";
+export { parseOutput } from "./input-controller-m-scripts-protocol";
 
 // ─── Command runner ───────────────────────────────────────────────────────────
 
@@ -131,7 +92,7 @@ function mimeFromPath(p: string): string {
 // ─── Directive handlers ───────────────────────────────────────────────────────
 
 /** Threshold: text at or below this inserts inline; above → bracketed-paste indicator. */
-const INLINE_LIMIT = 1000;
+export const INLINE_LIMIT = 1000;
 
 async function handleImageDirective(path: string, ctx: InteractiveModeContext, desc: string): Promise<void> {
 	const bytes = await fs.readFile(path);

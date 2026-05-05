@@ -18,14 +18,5 @@
  * @property {EmbeddedAddonFile[]} files
  */
 
-import addonPath0 from "../native/pi_natives.win32-x64-modern.node" with { type: "file" };
-import addonPath1 from "../native/pi_natives.win32-x64-baseline.node" with { type: "file" };
-
-export const embeddedAddon = {
-	platformTag: "win32-x64",
-	version: "14.6.3",
-	files: [
-		{ variant: "modern", filename: "pi_natives.win32-x64-modern.node", filePath: addonPath0 },
-		{ variant: "baseline", filename: "pi_natives.win32-x64-baseline.node", filePath: addonPath1 },
-	],
-};
+/** @type {EmbeddedAddon|null} */
+export const embeddedAddon = null;
