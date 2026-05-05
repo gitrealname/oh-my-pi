@@ -450,7 +450,7 @@ class MmemoryServer:
                         self._run_build(pdir, dedup_threshold, False)
                         self._invalidate(pdir)
 
-        threading.Thread(target=_do, daemon=True).start()
+        threading.Thread(target=_do, daemon=False).start()
         return {"status": "accepted"}
 
     def _run_build(self, project_dir: str, dedup_threshold: float, force_rebuild: bool = False) -> None:
