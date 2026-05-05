@@ -358,6 +358,12 @@ class MmemoryServer:
             return {"error": "query and project_dir required"}
 
         dirs = self._dirs(project_dir)
+
+        # Drain orphaned queue files (e.g. left by a previous crash) without
+        # blocking the recall response. A coalesced build fires if needed.
+        queue_dir = dirs["queue"]
+        if queue_dir.exists() and not self._build_lock.locked() and any(queue_dir.glob("*.md")):
+            self._handle_build({"action": "build", "project_dir": project_dir})
         chunks_path = str(dirs["chunks"])
         vectors_path = str(dirs["vectors"])
 
@@ -532,6 +538,7 @@ class MmemoryServer:
             batch = texts[b:b + BATCH]
             print(f"[mmemory] Embedding {b+1}-{b+len(batch)}/{len(texts)} new chunks", file=sys.stderr, flush=True)
             new_parts.append(np.array(list(self.model.embed(batch)), dtype=np.float32))
+            self.last_activity = time.time()  # keep watchdog from firing mid-build
         new_vecs = np.vstack(new_parts) if len(new_parts) > 1 else new_parts[0]
 
         # ── 5. Load existing vectors and extend ───────────────────────────────
@@ -571,6 +578,7 @@ class MmemoryServer:
         # vectors.safetensors
         save_file({"vectors": all_vecs}, str(vectors_path))
 
+        self.last_activity = time.time()  # build complete; reset idle window
         # meta: model name + count for rebuild validation
         vectors_meta_path.write_text(json.dumps({
             "model": MODEL_NAME,
