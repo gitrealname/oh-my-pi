@@ -568,6 +568,7 @@ class MmemoryServer:
                 re_parts: list[np.ndarray] = []
                 for b in range(0, len(all_texts), BATCH):
                     re_parts.append(np.array(list(self.model.embed(all_texts[b:b + BATCH])), dtype=np.float32))
+                    self.last_activity = time.time()
                 all_vecs = np.vstack(re_parts) if len(re_parts) > 1 else re_parts[0]
         else:
             # Cases: force_rebuild, model changed, or vectors file missing.
@@ -578,6 +579,7 @@ class MmemoryServer:
             re_parts: list[np.ndarray] = []
             for b in range(0, len(all_texts), BATCH):
                 re_parts.append(np.array(list(self.model.embed(all_texts[b:b + BATCH])), dtype=np.float32))
+                self.last_activity = time.time()
             all_vecs = np.vstack(re_parts) if len(re_parts) > 1 else (re_parts[0] if re_parts else np.zeros((0, 384), dtype=np.float32))
 
         # ── 6. Write atomically (temp → rename) ───────────────────────────────
@@ -588,8 +590,10 @@ class MmemoryServer:
         tmp_chunks.write_text(json.dumps(all_chunks, indent=2))
         tmp_chunks.replace(chunks_path)
 
-        # vectors.safetensors
-        save_file({"vectors": all_vecs}, str(vectors_path))
+        # vectors.safetensors: write via temp file to match chunks.json atomicity
+        tmp_vectors = vectors_path.with_suffix(".tmp.safetensors")
+        save_file({"vectors": all_vecs}, str(tmp_vectors))
+        tmp_vectors.replace(vectors_path)
 
         self.last_activity = time.time()  # build complete; reset idle window
         # meta: model name + count for rebuild validation

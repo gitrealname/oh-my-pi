@@ -401,7 +401,6 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 		}
 
 		// First turn: recall and cache snippet for subsequent turns
-		// First turn: recall and cache snippet for subsequent turns
 		if (!state.hasRecalledForFirstTurn) {
 			state.hasRecalledForFirstTurn = true;
 			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
@@ -412,6 +411,8 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 				query, undefined, state.config,
 			).catch((e) => {
 				logger.debug(`[mmemory] recall failed: ${e}`, { source: "mmemory" });
+				// Reset flag so next turn retries — server may not have been ready yet.
+				state.hasRecalledForFirstTurn = false;
 				return null;
 			});
 			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
