@@ -86,9 +86,10 @@ export class MmemoryServerClient {
 	async #start(): Promise<void> {
 		// ── 1. Pre-spawn ping: reuse server started by another OMP instance ──────
 		try {
-			await this.#rawQuery({ action: "ping" });
+			const pong = await this.#rawQuery({ action: "ping" }) as { pending_queue_projects?: string[] };
 			logger.debug(`[mmemory] reusing existing server on port ${this.port}`, { source: "mmemory-server" });
 			// proc stays null — we didn't spawn it, so stop() will not kill it
+			await this.#drainPendingQueues(pong.pending_queue_projects);
 			return;
 		} catch {
 			// Not yet responding — continue to spawn
@@ -133,7 +134,7 @@ export class MmemoryServerClient {
 		);
 
 		// ── 4. Wait for ready ────────────────────────────────────────────────────
-		await this.#waitUntilReady();
+		const pong = await this.#waitUntilReady();
 
 		// ── 5. Write PID file — AFTER confirmed ready ────────────────────────────
 		try {
@@ -142,22 +143,38 @@ export class MmemoryServerClient {
 			logger.debug(`[mmemory] failed to write PID file: ${e}`, { source: "mmemory-server" });
 		}
 		logger.debug(`[mmemory] server ready on port ${this.port} (pid ${this.proc?.pid})`, { source: "mmemory-server" });
+		// ── 6. Drain orphaned queue files from previous run ──────────────────────
+		await this.#drainPendingQueues(pong.pending_queue_projects);
 	}
 
 	/** Poll ping until the server responds or timeout expires. */
-	async #waitUntilReady(): Promise<void> {
+	/** Poll ping until the server responds or timeout expires.
+	 *  Returns the final pong payload (contains pending_queue_projects). */
+	async #waitUntilReady(): Promise<{ pending_queue_projects?: string[] }> {
 		const deadline = Date.now() + STARTUP_TIMEOUT_MS;
 		let lastErr: unknown;
 		while (Date.now() < deadline) {
 			try {
-				await this.#rawQuery({ action: "ping" });
-				return;
+				return await this.#rawQuery({ action: "ping" }) as { pending_queue_projects?: string[] };
 			} catch (e) {
 				lastErr = e;
 				await new Promise(r => setTimeout(r, PING_INTERVAL_MS));
 			}
 		}
 		throw new Error(`mmemory server failed to start within ${STARTUP_TIMEOUT_MS / 1000}s: ${lastErr}`);
+	}
+
+	/** Fire a non-blocking build for each project dir that has pending queue files. */
+	async #drainPendingQueues(projects: string[] | undefined): Promise<void> {
+		if (!projects?.length) return;
+		for (const project_dir of projects) {
+			try {
+				await this.#rawQuery({ action: "build", project_dir });
+				logger.debug(`[mmemory] triggered build for orphaned queue: ${project_dir}`, { source: "mmemory-server" });
+			} catch (e) {
+				logger.debug(`[mmemory] failed to trigger orphan build for ${project_dir}: ${e}`, { source: "mmemory-server" });
+			}
+		}
 	}
 
 	// ── PID file helpers ─────────────────────────────────────────────────────
