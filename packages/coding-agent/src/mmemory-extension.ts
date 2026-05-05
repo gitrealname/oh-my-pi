@@ -488,6 +488,43 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			state.mentalModelsSnippet = await loadMentalModels(state.config).catch(() => "");
 			logger.debug(`[mmemory] before_agent_start: mental models len=${state.mentalModelsSnippet?.length ?? 0}`, { source: "mmemory" });
 		}
+
+		// First turn: recall and cache snippet for subsequent turns
+		if (!state.hasRecalledForFirstTurn) {
+			state.hasRecalledForFirstTurn = true;
+			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
+			const rawQuery = composeRecallQuery(prompt, messages, state.config.retainContextTurns);
+			const query = truncateRecallQuery(rawQuery, prompt, state.config.recallMaxQueryChars);
+			logger.debug(`[mmemory] first-turn recall: query=${query.slice(0, 80)}...`, { source: "mmemory" });
+			const result = await executeMemoryRecall(
+				query, undefined, state.config,
+			).catch((e) => {
+				logger.debug(`[mmemory] recall failed: ${e}`, { source: "mmemory" });
+				// Reset flag so next turn retries — server may not have been ready yet.
+				state.hasRecalledForFirstTurn = false;
+				return null;
+			});
+			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
+			if (snippet) {
+				state.lastRecallSnippet = snippet;
+				logger.debug(`[mmemory] recall injected: ${result?.resultCount} results`, { source: "mmemory" });
+			} else {
+				logger.debug("[mmemory] recall: no results to inject", { source: "mmemory" });
+			}
+		}
+
+		// Inject mental models on every turn (after lazy-load ensures they're available)
+		const mmBlock = state.mentalModelsSnippet
+			? `<mental_models>\n${state.mentalModelsSnippet}\n</mental_models>`
+			: undefined;
+
+		if (state.lastRecallSnippet || mmBlock) {
+			let extra = systemPrompt.trimEnd();
+			if (state.lastRecallSnippet) extra += "\n\n" + state.lastRecallSnippet;
+			if (mmBlock) extra += "\n\n" + mmBlock;
+			return { systemPrompt: extra };
+		}
+
 		return undefined;
 	});
 
