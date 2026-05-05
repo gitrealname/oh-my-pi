@@ -798,7 +798,7 @@ export const SETTINGS_SCHEMA = {
 	// Input and startup
 	doubleEscapeAction: {
 		type: "enum",
-		values: ["branch", "tree", "none"] as const,
+		values: ["branch", "tree", "mtree", "none"] as const,
 		default: "tree",
 		ui: {
 			tab: "interaction",

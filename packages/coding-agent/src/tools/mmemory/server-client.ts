@@ -15,8 +15,10 @@
  *     Third-party tooling can tail that file independently.
  *   - Startup: pre-spawn ping first (reuse if another OMP instance already
  *     started the server), then PID-file stale-kill, then spawn.
- *   - PID file written AFTER server is confirmed ready — readers can trust
- *     that a valid PID file means the server is accepting connections.
+ *   - PID file is written by the server itself (passed via --pid-file).
+ *     The client reads it only for stop() and stale-process detection.
+ *     The server uses a double-read pattern to elect a single winner when
+ *     two processes are spawned concurrently.
  *   - stop() never kills the server process. The server has its own idle
  *     timeout and may be shared by other OMP instances or third-party
  *     consumers. stop() only drops the local reference; the server dies
@@ -116,34 +118,27 @@ export class MmemoryServerClient {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const spawn = (globalThis as any).Bun?.spawn;
 		if (!spawn) throw new Error("mmemory server requires Bun runtime");
-
-		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call
 		this.proc = spawn(
 			[
 				this.pythonCmd,
 				this.serverScriptPath,
-				"--port", String(this.port),
-				"--timeout", String(this.idleTimeoutMinutes),
+				"--port",     String(this.port),
+				"--timeout",  String(this.idleTimeoutMinutes),
 				"--log-file", this.logFile,
+				"--pid-file", this.#pidFilePath(),
 			],
 			{
-				stdout: "ignore",
-				stderr: "ignore",  // Python writes to --log-file directly; nothing to drain here
+				stdout:      "ignore",
+				stderr:      "ignore",  // Python writes to --log-file directly
 				windowsHide: true,
 			},
 		);
 
 		// ── 4. Wait for ready ────────────────────────────────────────────────────
 		const pong = await this.#waitUntilReady();
-
-		// ── 5. Write PID file — AFTER confirmed ready ────────────────────────────
-		try {
-			fs.writeFileSync(pidPath, String(this.proc.pid), "utf-8");
-		} catch (e) {
-			logger.debug(`[mmemory] failed to write PID file: ${e}`, { source: "mmemory-server" });
-		}
-		logger.debug(`[mmemory] server ready on port ${this.port} (pid ${this.proc?.pid})`, { source: "mmemory-server" });
-		// ── 6. Drain orphaned queue files from previous run ──────────────────────
+		logger.debug(`[mmemory] server ready on port ${this.port}`, { source: "mmemory-server" });
+		// ── 5. Drain orphaned queue files from previous run ──────────────────────
+		// PID file is now written by the server itself; no client-side write needed.
 		void this.#drainPendingQueues(pong.pending_queue_projects);
 	}
 

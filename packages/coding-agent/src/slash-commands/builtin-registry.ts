@@ -17,6 +17,7 @@ import {
 	loadMmemoryConfig,
 	resolvePaths,
 } from "../tools/mmemory/index";
+import { getRecallScope, setRecallScope, scopeLabel } from "../tools/mmemory/session-scope";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { resolveModelRoleValue } from "../config/model-resolver";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
@@ -169,12 +170,22 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 
 	switch (subcommand) {
 		case "recall": {
-			if (!restStr) { runtime.ctx.showStatus("Usage: /mmemory recall <query>"); return; }
-			const scopeMatch = restStr.match(/--scope\s+(\S+)/);
-			const scope = scopeMatch ? scopeMatch[1] : undefined;
-			const query = restStr.replace(/--scope\s+\S+/, "").trim();
+			if (!restStr) {
+				runtime.ctx.showStatus("Usage: /mmemory recall <query>   or   /mmemory recall / <global query>");
+				return;
+			}
+			let scope: string | null | undefined;
+			let query: string;
+			if (restStr.startsWith("/ ") || restStr === "/") {
+				scope = null;
+				query = restStr.slice(2).trim() || "recent context";
+			} else {
+				const scopeMatch = restStr.match(/--scope\s+(\S+)/);
+				scope = scopeMatch ? scopeMatch[1] : getRecallScope(runtime.ctx.sessionManager);
+				query = restStr.replace(/--scope\s+\S+/, "").trim();
+			}
 			runtime.ctx.showStatus(`mmemory: recalling "${query}"...`);
-			const result = await executeMemoryRecall(query, scope, config);
+			const result = await executeMemoryRecall(query, scope, config, runtime.ctx.session.modelRegistry, settings);
 			runtime.ctx.showStatus(result.resultCount > 0
 				? `mmemory: ${result.resultCount} memories found.`
 				: "mmemory: no memories found.");
@@ -201,7 +212,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			break;
 		}
 		case "view": {
-			const viewResult = await executeMemoryRecall("recent context", undefined, config);
+			const viewResult = await executeMemoryRecall("recent context", undefined, config, runtime.ctx.session.modelRegistry, settings);
 			const snippet = formatRecallForSystemPrompt(viewResult);
 			runtime.ctx.showStatus(snippet ? "mmemory: showing recall snippet." : "mmemory: no memories loaded.");
 			if (snippet) {
@@ -216,9 +227,10 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			const chunkCount = hasChunks
 				? (() => { try { return (JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as unknown[]).length; } catch { return "?"; } })()
 				: 0;
+			const proj = config.projectLabel;
+			const scope = scopeLabel(runtime.ctx.sessionManager, proj);
 			runtime.ctx.showStatus(
-				`mmemory: enabled=${String(enabled)}, project=${config.projectName}, ` +
-				`chunks=${chunkCount}, scoping=${config.scoping}, path=${mmPaths.projectDir}`,
+				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, path=${mmPaths.projectDir}`,
 			);
 			break;
 		}
@@ -300,12 +312,17 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			}
 			break;
 		}
-		case "global": {
-			runtime.ctx.showStatus("mmemory: scope switched to global for this session (set in extension state).");
+		case "global":
+		case "/": {
+			setRecallScope(runtime.ctx.sessionManager, null);
+			runtime.ctx.showStatus("mmemory: recall scope → global. Use /mmemory . to reset.");
 			break;
 		}
-		case "project": {
-			runtime.ctx.showStatus("mmemory: scope reset to per-project-tagged.");
+		case "project":
+		case ".": {
+			const proj = config.projectLabel;
+			setRecallScope(runtime.ctx.sessionManager, proj);
+			runtime.ctx.showStatus(`mmemory: recall scope → ${proj}. Use /mmemory / for global.`);
 			break;
 		}
 		case "mm": {
@@ -329,7 +346,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 				runtime.ctx.showStatus("mmemory mm: regenerating mental models...");
 				try {
 					const recallResult = await executeMemoryRecall(
-						"project context preferences conventions decisions", undefined, config,
+						"project context preferences conventions decisions", undefined, config, runtime.ctx.session.modelRegistry, settings,
 					);
 					const memoriesText = recallResult.resultCount > 0 ? recallResult.text : "";
 					const result = await executeMemoryMentalModelSeed(config, async (query, systemPrompt) => {
@@ -353,9 +370,14 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			break;
 		}
 		default: {
-			runtime.ctx.showStatus(
-				"Usage: /mmemory <recall|retain|reflect|view|clear|enqueue|consolidate|mm|status> [args]",
-			);
+			if (subcommand && !subcommand.startsWith("-")) {
+				setRecallScope(runtime.ctx.sessionManager, subcommand);
+				runtime.ctx.showStatus(`mmemory: recall scope → ${subcommand}. Use /mmemory . to reset.`);
+			} else {
+				runtime.ctx.showStatus(
+					"Usage: /mmemory <recall|retain|reflect|view|clear|enqueue|consolidate|mm|status|/|.> [args]",
+				);
+			}
 		}
 	}
 };

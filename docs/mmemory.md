@@ -5,8 +5,7 @@ transcripts, indexes them with BM25 + semantic search, and injects relevant
 memories into the system prompt at the start of each session.
 
 **No external service, no API keys, no cost beyond the embedding model download.**
-All data stays on disk under a configurable `storagePath`.
-
+All data stays on disk under a configurable `storageRoot`.
 ---
 
 ## Enabling mmemory
@@ -16,8 +15,7 @@ In your `config.yml`:
 ```yaml
 mmemory:
   enabled: true
-  storagePath: D:/.ai/knowledge/projects   # where memory is stored
-  projectName: omp_memory                  # subdirectory name
+  storageRoot: D:/.ai/knowledge/projects/omp_memory   # full path to memory directory
 ```
 
 Requires Python + `pip install fastembed safetensors numpy`.
@@ -37,8 +35,8 @@ Python server reads queue/*.md
   → chunks each transcript at turn boundaries (User+Assistant pairs)
   → hashes each chunk; skips chunks already in chunks.json
   → embeds new chunks with BAAI/bge-small-en-v1.5 (fastembed)
-  → appends new chunks to index/chunks.json
-  → extends index/vectors.safetensors
+  → appends new chunks to chunks.json
+  → extends vectors.safetensors
   → deletes processed .md files from queue/
        ↓
 Next session starts
@@ -56,24 +54,63 @@ visible console window.
 ## Storage Layout
 
 ```
-storagePath/
-  projectName/              e.g. omp_memory/
-    queue/                  ← .md files arrive here; always empty after a build
-    index/
-      chunks.json           ← DURABLE STORE: full text of all indexed chunks
-      vectors.safetensors   ← rebuildable from chunks.json
-      vectors.meta.json     ← {model, count} for rebuild validation
-    mental_models/          ← Phase 3: auto-generated summaries
-    facts.json              ← Phase 3: extracted facts
-    observations.json       ← Phase 3: consolidation output
-    .gitignore              ← * (all memory data private)
-    kb_config.yaml          ← auto-generated: type: external, handler: mmemory
-  global/                   ← cross-project memories (per-project-tagged scope)
-    queue/
-    index/
-    .gitignore
-    kb_config.yaml
+storageRoot/                    e.g. D:/.ai/knowledge/projects/omp_memory/
+  queue/                        ← .md files arrive here; always empty after a build
+  chunks.json                   ← DURABLE STORE: full text of all indexed chunks
+  vectors.safetensors           ← rebuildable from chunks.json
+  vectors.meta.json             ← {model, count} for rebuild validation
+  mental_models/                ← Phase 3: auto-generated summaries
+  facts.json                    ← Phase 3: extracted facts
+  observations.json             ← Phase 3: consolidation output
+  .gitignore                    ← * (all memory data private)
+  kb_config.yaml                ← auto-generated: type: external, handler: mmemory
 ```
+
+Project label is auto-derived from the normalized working directory:
+  `D:\.ai` → `D/.ai`, `C:\repos\carity2` → `C/repos/carity2`
+Not configurable. Use `agentTag` to isolate memories within the same project.
+
+### Queue file format
+
+Each `.md` file written to `queue/` includes YAML frontmatter:
+
+```yaml
+---
+project: D/.ai
+agent_tag: default
+source: session | retain_tool
+session_id: <uuid>
+ts: 2026-05-05T12:34:56.000Z
+---
+<transcript content>
+```
+
+### Chunk metadata
+
+Each chunk stored in `chunks.json` carries the same fields (`project`, `agent_tag`, `source`,
+`session_id`, `ts`) used for filtering during recall.
+
+### Recall filters
+
+`mmemory_recall` and `mmemory_reflect` accept optional filter parameters:
+
+| Filter | Type | Description |
+|---|---|---|
+| `project` | string | Restrict to chunks from a specific project label |
+| `agent_tag` | string | Restrict to chunks from a specific agent tag |
+| `source` | string | Restrict to `session` or `retain_tool` chunks |
+| `ts_after` | number | Unix seconds — exclude chunks older than this timestamp |
+| `ts_before` | number | Unix seconds — exclude chunks newer than this timestamp |
+
+The time-filter system prompt is written to disk on first run and can be customised:
+  Compiled : <binary-dir>/prompts/mmemory-time-filter.md
+  Dev      : ~/.omp/agent-work/prompts/mmemory-time-filter.md
+Edit the local copy to adapt time expressions for different languages or conventions.
+The binary version is restored if the local copy is older than the build timestamp.
+### Migration
+
+On first build after upgrade, the server automatically migrates the legacy `index/`
+layout to the flat layout. No manual intervention is required.
 
 `chunks.json` is the durable store. If `vectors.safetensors` is lost, run
 `/mmemory rebuild` to re-embed from `chunks.json`. If `chunks.json` is lost,
@@ -88,11 +125,13 @@ mmemory:
   enabled: true
 
   # Storage (machine-specific — set in deployed config, not in template)
-  storagePath: D:/.ai/knowledge/projects
-  projectName: omp_memory           # layout: storagePath/projectName/{queue,index}/
+  storageRoot: D:/.ai/knowledge/projects/omp_memory   # full path; project label = auto-derived from cwd
 
   # LLM roles
   modelRole: smol                   # reflect synthesis (Phase 2); extraction (Phase 3)
+  timeFilterModelRole: ~           # model role for time-hint LLM preprocessing;
+                                    #   falls back to modelRole. Use a cheap/fast model.
+                                    #   Default: inherits modelRole.
   consolidateModelRole: smol        # consolidation + mental model seeding (Phase 3)
                                     # upgrade to a large-context model when Phase 3 is wired
 
@@ -104,10 +143,11 @@ mmemory:
   retainContextTurns: 0             # 0 = full session; N = last N turns only
 
   # Scoping
-  scoping: per-project-tagged       # per-project        = this project's queue/ only
-                                    # per-project-tagged = project + global/ (cross-project)
-                                    # global             = all projects
-
+  scoping: per-project             # per-project = this project's queue/ only
+                                    # global      = all projects
+  agentTag: default                 # isolates memories by agent identity within same project
+                                    # global scope (/mmemory /) bypasses this filter
+                                    # existing chunks without this field default to "default"
   # Recall
   recallLimit: 10                   # max chunks returned
   recallDeadlineMs: 10000           # abort if server doesn't respond (cold start protection)
@@ -133,6 +173,15 @@ mmemory:
 | `/mmemory clear --session ID` | Remove chunks from a specific session |
 | `/mmemory enqueue` | Force a retain cycle now |
 
+
+### Scope switching (session-sticky)
+
+```
+/mmemory /                          global scope — recall searches all projects
+/mmemory .                          reset to current project (default)
+/mmemory <name>                     switch to named project (e.g. /mmemory carity2)
+/mmemory recall / <query>           one-time global recall without changing session scope
+```
 Date format for `--from`/`--to`: `YYYY-MM-DD`.
 
 ---
@@ -388,7 +437,7 @@ Phase 2 was completed 2026-05-03 against the `aws-corp` branch.
 | No visible window | `windowsHide: true` on `Bun.spawn` |
 | Background priority | `SetPriorityClass(BELOW_NORMAL)` on Windows; `os.nice(5)` on Unix |
 | Logger integration | Python stderr → `logger.debug/warn` via omp logger |
-| Privacy `.gitignore` | Written at `projectDir` + `storagePath` on first use |
+|| Privacy `.gitignore` | Written at `storageRoot` on first use |
 | Build coalescing | `_pending_build` set; at most 2 sequential builds |
 | H5 BM25 fix | `max(2, N*0.5)` pruning threshold (prevents over-pruning small corpora) |
 | `_run_build` zero-vector fix | `else` branch re-embeds all chunks; zero-padding removed |
@@ -439,7 +488,7 @@ Then restart omp.
 3. If chunk count > 0 but recall returns nothing, try `/mmemory recall <specific query>`
 
 **Want to wipe all memories:**
-Delete `index/chunks.json` and `index/vectors.safetensors` directly (or the entire `projectName/` directory). The extension recreates the directory structure on next session start.
+Delete `chunks.json` and `vectors.safetensors` directly (or the entire `storageRoot/` directory). The extension recreates the directory structure on next session start.
 
 **Vectors out of sync after `/clear`:**
 The server deletes `vectors.safetensors` automatically when chunks are cleared.

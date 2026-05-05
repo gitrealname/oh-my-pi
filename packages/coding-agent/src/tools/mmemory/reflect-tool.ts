@@ -4,6 +4,9 @@ import { Type } from "@sinclair/typebox";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
 import { executeMemoryReflect, loadMmemoryConfig } from ".";
+import embeddedReflectDesc from "../../sidecars/mme-reflect.tool-desc.md" with { type: "text" };
+import { createSidecar, sidecarPath } from "../../utils/m-utils";
+const resolveDesc = createSidecar(sidecarPath("mme-reflect.tool-desc.md"), embeddedReflectDesc);
 
 const schema = Type.Object({
 	query: Type.String({
@@ -13,7 +16,7 @@ const schema = Type.Object({
 	}),
 	scope: Type.Optional(
 		Type.String({
-			description: "Scope override: per-project | per-project-tagged | global",
+			description: "Scope override: per-project | global | / (one-time global for this query only)",
 		}),
 	),
 });
@@ -22,9 +25,7 @@ export class MmemoryReflectTool implements AgentTool<typeof schema> {
 	readonly name = "mmemory_reflect";
 	readonly label = "Memory: Reflect";
 	readonly parameters = schema;
-	readonly description =
-		"Synthesize project memories on a topic. Returns a broader set of relevant memories " +
-		"than recall, useful for understanding accumulated context on a subject.";
+	readonly description = resolveDesc();
 
 	constructor(private readonly session: ToolSession) {}
 
