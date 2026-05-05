@@ -239,6 +239,10 @@ class MmemoryServer:
         self._build_lock = threading.Lock()
         # Coalescing: project dirs that arrived while a build was in flight
         self._pending_build: set[str] = set()
+        # All project dirs seen since startup — reported in ping so clients can
+        # fire build for any that have orphaned queue files after a crash/restart.
+        self._known_project_dirs: set[str] = set()
+
 
     # ── Model ────────────────────────────────────────────────────────────────
 
@@ -333,12 +337,19 @@ class MmemoryServer:
     # ── Handlers ─────────────────────────────────────────────────────────────
 
     def _handle_ping(self, req: dict) -> dict:
+        # Report which known project dirs have unprocessed queue files so the
+        # client can trigger build immediately after a respawn.
+        pending: list[str] = [
+            pd for pd in self._known_project_dirs
+            if any(Path(pd).joinpath("queue").glob("*.md"))
+        ]
         return {
             "status": "ok",
             "pid": os.getpid(),
             "port": self.port,
             "model_loaded": self.model is not None,
             "cached_projects": len(self._chunks_cache),
+            "pending_queue_projects": pending,
         }
 
     def _handle_shutdown(self, req: dict) -> dict:
@@ -356,6 +367,7 @@ class MmemoryServer:
 
         if not query or not project_dir:
             return {"error": "query and project_dir required"}
+        self._known_project_dirs.add(project_dir)
 
         dirs = self._dirs(project_dir)
 
@@ -430,6 +442,7 @@ class MmemoryServer:
         if not project_dir:
             return {"error": "project_dir required"}
 
+        self._known_project_dirs.add(project_dir)
         if self._build_lock.locked():
             self._pending_build.add(project_dir)
             return {"status": "accepted", "note": "coalesced"}
