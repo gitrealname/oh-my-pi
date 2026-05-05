@@ -1,4 +1,5 @@
 import { MMEMORY_SCHEMA_ENTRIES, type MmemorySettings } from "./settings-schema-m-extensions";
+import { PRUNE_SCHEMA_ENTRIES } from "./settings-schema-m-prune";
 import { SCRIPT_SCHEMA_ENTRIES } from "./settings-schema-m-scripts";
 
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
@@ -2445,6 +2446,7 @@ export const SETTINGS_SCHEMA = {
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
 	...SCRIPT_SCHEMA_ENTRIES,
+	...PRUNE_SCHEMA_ENTRIES,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════

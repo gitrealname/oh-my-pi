@@ -19,9 +19,16 @@ import {
 } from "../tools/mmemory/index";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { resolveModelRoleValue } from "../config/model-resolver";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { Spacer, Text } from "@oh-my-pi/pi-tui";
+import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
+import { serializeBatchForSummarizer } from "../session/compaction/mprune-batch";
+import { buildSummarizerPrompt } from "../session/compaction/mprune-prompt";
+import { buildStatsLines, loadPersistentStats } from "../session/compaction/mprune-stats";
+import { getMpruneSessionStats } from "../extensibility/extensions/m-prune-extension";
 import {
 	clearPluginRootsAndCaches,
 	resolveActiveProjectRegistryPath,
@@ -350,6 +357,118 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 				"Usage: /mmemory <recall|retain|reflect|view|clear|enqueue|consolidate|mm|status> [args]",
 			);
 		}
+	}
+};
+
+const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<void> => {
+	const args = command.args.trim();
+	runtime.ctx.editor.setText("");
+
+	const entries = runtime.ctx.sessionManager.getBranch();
+	const enabled = settings.get("mprune.enabled" as SettingPath);
+
+	switch (args || "flush") {
+		case "flush":
+		case "": {
+			if (!enabled) {
+				runtime.ctx.showStatus("mprune: not enabled. Set mprune.enabled: true in config.");
+				return;
+			}
+			const unprunedEntries = entries.filter(e => {
+				if (e.type !== "message") return false;
+				const msg = e.message as { role: string; prunedAt?: number };
+				return msg.role === "toolResult" && msg.prunedAt === undefined;
+			});
+			if (unprunedEntries.length === 0) {
+				runtime.ctx.showStatus("mprune: nothing to prune.");
+				return;
+			}
+			runtime.ctx.showStatus(`mprune: summarizing ${unprunedEntries.length} unpruned tool result(s)...`);
+			try {
+				const registry = runtime.ctx.session.modelRegistry;
+				const roleValue = settings.get("modelRoles.prune" as "modelRoles.smol") ?? settings.get("modelRoles.smol") ?? settings.get("modelRoles.default" as "modelRoles.smol");
+				const resolved = resolveModelRoleValue(roleValue, registry.getAvailable(), { modelRegistry: registry });
+				const model = resolved.model;
+				if (!model) { runtime.ctx.showStatus("mprune: no model configured (set modelRoles.prune)."); return; }
+
+				const toolResults = unprunedEntries.map(e => {
+					const msg = e.message as { toolCallId: string; toolName: string; content: unknown; prunedAt?: number };
+					const textParts: string[] = [];
+					if (typeof msg.content === "string") { textParts.push(msg.content); }
+					else if (Array.isArray(msg.content)) {
+						for (const b of msg.content as Array<{ type: string; text?: string }>) {
+							if (b.type === "text" && b.text) textParts.push(b.text);
+						}
+					}
+					const content = textParts.join("\n");
+					return { toolCallId: msg.toolCallId, toolName: msg.toolName, content, charCount: content.length, prunedAt: msg.prunedAt };
+				});
+				const batch = { turnIndex: -1, toolResults };
+				const serialized = serializeBatchForSummarizer(batch);
+				const response = await completeSimple(
+					model,
+					{
+						systemPrompt: buildSummarizerPrompt(),
+						messages: [{ role: "user", content: [{ type: "text", text: serialized }], timestamp: Date.now() }],
+					},
+				{ },
+				);
+				if (response.stopReason === "error" || !response.content) {
+					runtime.ctx.showStatus("mprune: summarizer returned no content.");
+					return;
+				}
+				const summary = response.content
+					.filter((c: { type: string }) => c.type === "text")
+					.map((c: { type: string; text?: string }) => c.text ?? "")
+					.join("");
+				runtime.ctx.chatContainer.addChild(new Text(`mprune summary:\n${summary}`, 1, 0));
+				runtime.ctx.chatContainer.addChild(new Spacer(1));
+				runtime.ctx.ui.requestRender();
+				const prunedAt = Date.now();
+				for (const entry of unprunedEntries) {
+					(entry.message as { prunedAt?: number }).prunedAt = prunedAt;
+				}
+				await (runtime.ctx.sessionManager as any).rewriteEntries();
+				runtime.ctx.showStatus(`mprune: pruned ${unprunedEntries.length} tool result(s).`);
+			} catch (err) {
+				runtime.ctx.showStatus(`mprune: error — ${String(err)}`);
+			}
+			break;
+		}
+		case "stats": {
+			try {
+				const agentDir = getAgentDir();
+				const lifetime = loadPersistentStats(agentDir);
+				const session = getMpruneSessionStats(runtime.ctx.sessionManager) ?? {
+					tokensSavedTrim: 0, tokensSavedBatch: 0, tokensSavedImages: 0,
+					trimEvents: 0, batchFlushes: 0, imagesPruned: 0,
+				};
+				const lines = buildStatsLines(session, lifetime);
+				runtime.ctx.chatContainer.addChild(new Spacer(1));
+				runtime.ctx.chatContainer.addChild(new DynamicBorder());
+				runtime.ctx.chatContainer.addChild(new Text("mprune stats", 1, 0));
+				runtime.ctx.chatContainer.addChild(new Spacer(1));
+				runtime.ctx.chatContainer.addChild(new Text(lines.join("\n"), 1, 0));
+				runtime.ctx.chatContainer.addChild(new DynamicBorder());
+				runtime.ctx.ui.requestRender();
+			} catch (err) {
+				runtime.ctx.showStatus(`mprune stats: error — ${String(err)}`);
+			}
+			break;
+		}
+		case "status": {
+			const prunedCount = entries.filter(e =>
+				e.type === "message" && (e.message as { prunedAt?: number }).prunedAt !== undefined,
+			).length;
+			const keepTurns = settings.get("mprune.images.keepTurns" as SettingPath);
+			const softTrimChars = settings.get("mprune.trim.softTrimChars" as SettingPath);
+			runtime.ctx.showStatus(
+				`mprune: enabled=${String(enabled)}, images.keepTurns=${keepTurns}, trim.softTrimChars=${softTrimChars}, ${prunedCount} entries pruned`,
+			);
+			break;
+		}
+		default:
+			runtime.ctx.showStatus("Usage: /mprune [flush|stats|status]");
 	}
 };
 const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<void> => {
@@ -1358,6 +1477,19 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 			{ name: "project",     description: "Switch back to per-project-tagged scope" },
 		],
 		handle: mmemoryHandler,
+	},
+
+	{
+		name: "mprune",
+		description: "Dynamic context pruning: flush summarization or show status",
+		inlineHint: "[flush|stats|status]",
+		allowArgs: true,
+		subcommands: [
+			{ name: "flush",  description: "Summarize and prune unpruned tool results (default)" },
+			{ name: "stats",  description: "Show per-session and lifetime token savings" },
+			{ name: "status", description: "Show mprune config and pruned entry count" },
+		],
+		handle: mpruneHandler,
 	},
 
 ];
