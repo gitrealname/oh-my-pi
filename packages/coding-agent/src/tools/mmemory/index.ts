@@ -27,21 +27,7 @@ import type { Settings } from "../../config/settings";
 import { settings } from "../../config/settings";
 import { MmemoryServerClient } from "./server-client";
 import mmemoryServerPy from "./mmemory_server.py" with { type: "text" };
-import mmemoryBm25Py    from "./mmemory_bm25.py"   with { type: "text" };
-import mmemoryVacuumPy  from "./mmemory_vacuum.py"  with { type: "text" };
 import { resolveTimeFilter } from "./time-filter";
-import { formatBlock, createSidecar, sidecarPath, callWithRole } from "../../utils/m-utils";
-import embeddedConsolidationPrompt from "../../sidecars/mme-consolidation.prompt.md" with { type: "text" };
-const resolveConsolidationPrompt = createSidecar(sidecarPath("mme-consolidation.prompt.md"), embeddedConsolidationPrompt);
-import embeddedRecallPreamble from "../../sidecars/mme-recall-preamble.prompt.md" with { type: "text" };
-// Only the first line is the system-prompt passive-background instruction.
-// Lines after the --- separator are tool-call guidance (belongs in tool description only).
-const resolveRecallPreamble = createSidecar(sidecarPath("mme-recall-preamble.prompt.md"), embeddedRecallPreamble);
-function getRecallPreamble(): string {
-	const full = resolveRecallPreamble();
-	const firstLine = full.split("\n")[0].trim();
-	return firstLine;
-}
 
 import type { ModelRegistry } from "../../config/model-registry";
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -90,6 +76,13 @@ export interface MmemoryConfig {
 		fileLimit: number;
 		maxChars: number;
 	};
+}
+
+/** Normalize a filesystem path to a stable project label.
+ *  Replaces backslashes with forward slashes; strips drive colon.
+ *  `D:\.ai` → `D/.ai`, `C:\repos\carity2` → `C/repos/carity2` */
+function normalizeCwd(p: string): string {
+	return p.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1");
 }
 
 /** Normalize a filesystem path to a stable project label.
@@ -165,6 +158,8 @@ export interface MmemoryPaths {
 	chunksPath: string;       // storageRoot/chunks.json  (durable store)
 	vectorsPath: string;      // storageRoot/vectors.safetensors
 	vectorsMetaPath: string;  // storageRoot/vectors.meta.json
+	factsPath: string;        // projectDir/facts.json  (Phase 3)
+	observationsPath: string; // projectDir/observations.json  (Phase 3)
 	mentalModelsDir: string;  // projectDir/mental_models  (Phase 3)
 }
 
@@ -176,6 +171,8 @@ export function resolvePaths(config: MmemoryConfig): MmemoryPaths {
 		chunksPath: path.join(projectDir, "chunks.json"),
 		vectorsPath: path.join(projectDir, "vectors.safetensors"),
 		vectorsMetaPath: path.join(projectDir, "vectors.meta.json"),
+		factsPath: path.join(projectDir, "facts.json"),
+		observationsPath: path.join(projectDir, "observations.json"),
 		mentalModelsDir: path.join(projectDir, "mental_models"),
 	};
 }
@@ -493,7 +490,6 @@ export async function executeMemoryRecall(
 	config: MmemoryConfig,
 	registry?: import("../config/model-registry").ModelRegistry,
 	settings?: import("../config/settings").Settings,
-	mode?: "session" | "query",
 ): Promise<RecallResult> {
 	const EMPTY: RecallResult = { text: "", observations: [], referencedFiles: [], resultCount: 0 };
 	const effectiveMode = mode ?? "query";
@@ -501,6 +497,32 @@ export async function executeMemoryRecall(
 	logger.debug(`[mmemory] executeMemoryRecall: mode=${effectiveMode} scope=${scope ?? "default"} query="${query.slice(0,60)}..."`, { source: "mmemory" });
 	const paths = resolvePaths(config);
 	const client = await getOrCreateServerClient(config);
+
+	// LLM time-filter: detect "yesterday", "last week", etc. and convert to timestamps
+	const timeFilter = registry
+		? await resolveTimeFilter(query, config, registry, settings)
+		: { query };
+	const resolvedQuery = timeFilter.query;
+
+	// Resolve effective scope → project filter
+	const effectiveScope = scope ?? config.scoping;
+	const projectLabel = config.projectLabel;
+	const scopeFilter: Record<string, unknown> =
+		effectiveScope === null || effectiveScope === "global"
+			? {}
+			: effectiveScope === "per-project"
+				? { project: projectLabel }
+				: { project: effectiveScope };  // named project
+
+	const filter: Record<string, unknown> = {
+		...scopeFilter,
+		// agent_tag filter — omitted on global scope so cross-agent recall works
+		...(effectiveScope !== null && effectiveScope !== "global" && config.agentTag !== "default"
+			? { agent_tag: config.agentTag }
+			: {}),
+		...(timeFilter.ts_after  !== undefined ? { ts_after:  timeFilter.ts_after  } : {}),
+		...(timeFilter.ts_before !== undefined ? { ts_before: timeFilter.ts_before } : {}),
+	};
 
 	// LLM time-filter: only applies to "query" mode (session inject has no user query)
 	const timeFilter = (effectiveMode === "query" && registry)
@@ -532,9 +554,8 @@ export async function executeMemoryRecall(
 		query: resolvedQuery,
 		project_dir: paths.projectDir,
 		filter,
-		limit: config.recall.limit * 3,
-		recency_weight: config.recall.recencyWeight,
-		mode: effectiveMode,
+		limit: config.recallLimit * 3,
+		recency_weight: config.recencyWeight,
 	};
 
 	let rawResults: any[];
@@ -542,10 +563,10 @@ export async function executeMemoryRecall(
 		const response = await Promise.race([
 			client.query("recall", recallArgs),
 			new Promise<never>((_, reject) =>
-				setTimeout(() => reject(new Error("recall timeout")), config.recall.deadlineMs),
+				setTimeout(() => reject(new Error("recall timeout")), config.recallDeadlineMs),
 			),
 		]);
-		rawResults = ((response as any)?.results ?? []).slice(0, config.recall.limit);
+		results = ((response as any)?.results ?? []).slice(0, config.recallLimit);
 	} catch (err) {
 		return {
 			...EMPTY,

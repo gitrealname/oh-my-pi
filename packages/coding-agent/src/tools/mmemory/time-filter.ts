@@ -38,16 +38,18 @@ export interface TimeFilter {
 	ts_after?: number;
 	/** End of time window — Unix seconds, inclusive. Undefined = no upper bound. */
 	ts_before?: number;
-	/** Source type filter — "session" | "file" | "observation" | undefined (all sources). */
-	source?: "session" | "file" | "observation";
 }
 
+/** Regex that detects a likely time reference in a query — gates the LLM call. */
+const TIME_HINT_RE =
+	/\b(ago|recent(?:ly)?|yesterd(?:ay)?|today|last\s+(?:week|month|year|day)|this\s+(?:week|month|year)|in\s+the\s+last\s+\d+|since\s+\d|\d+\s+(?:day|week|month|year)s?\s+ago)\b/i;
+
 /**
- * Resolve a recall query via LLM temporal parser.
+ * Resolve a recall query: detect time hints and, when present, call the LLM
+ * to extract `ts_after`/`ts_before` bounds and strip the time expression from
+ * the query text.
  *
- * The LLM handles detection: if no time reference is present it returns
- * the original query unchanged with null timestamps — no client-side
- * regex gate needed. Falls back to the original query on any error.
+ * Falls back to the original query (no filter) on any error.
  */
 export async function resolveTimeFilter(
 	query: string,
@@ -55,7 +57,11 @@ export async function resolveTimeFilter(
 	registry: ModelRegistry,
 	settings?: import("../../config/settings").Settings,
 ): Promise<TimeFilter> {
-	logger.debug(`[mmemory] time-filter: query="${query}"`, { source: "mmemory" });
+	logger.debug(`[mmemory] time-filter entry: query="${query}" hasRegistry=${!!registry} hasSettings=${!!settings}`, { source: "mmemory" });
+	if (!TIME_HINT_RE.test(query)) {
+		return { query };
+	}
+
 	const available = registry.getAvailable();
 	if (!available.length) {
 		return { query };
@@ -83,17 +89,15 @@ export async function resolveTimeFilter(
 			query?: string;
 			ts_after?: number | null;
 			ts_before?: number | null;
-			source?: string | null;
 		};
-		const validSources = ["session", "file", "observation"] as const;
+
 		const result: TimeFilter = {
 			query:     typeof parsed.query === "string" && parsed.query.trim() ? parsed.query.trim() : query,
 			ts_after:  typeof parsed.ts_after  === "number" ? parsed.ts_after  : undefined,
 			ts_before: typeof parsed.ts_before === "number" ? parsed.ts_before : undefined,
-			source:    validSources.includes(parsed.source as any) ? parsed.source as TimeFilter["source"] : undefined,
 		};
 		logger.debug(
-			`[mmemory] time-filter: "${query}" -> query="${result.query}" ts_after=${result.ts_after ?? "none"} ts_before=${result.ts_before ?? "none"} source=${result.source ?? "all"}`,
+			`[mmemory] time-filter: "${query}" → query="${result.query}" ts_after=${result.ts_after ?? "none"} ts_before=${result.ts_before ?? "none"}`,
 			{ source: "mmemory" },
 		);
 		return result;

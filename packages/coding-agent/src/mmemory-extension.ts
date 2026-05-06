@@ -20,6 +20,10 @@ import { settings } from "./config/settings";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "./extensibility/extensions";
 import type { ReadonlySessionManager } from "./session/session-manager";
+import { completeSimple, validateToolCall } from "@oh-my-pi/pi-ai";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
+import { Type } from "@sinclair/typebox";
+import { resolveRoleModel } from "./utils/m-utils";
 import {
 	STRIP_TAGS_REGEX,
 	buildConsolidateFn,
@@ -36,6 +40,7 @@ import {
 	sessionFilename,
 	truncateRecallQuery,
 } from "./tools/mmemory/index";
+import { getRecallScope } from "./tools/mmemory/session-scope";
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -218,6 +223,14 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 	return { transcript: result, pairsFound, userSkipped };
 }
 
+async function extractFromTranscript(
+	transcript: string,
+	config: import("./tools/mmemory/index").MmemoryConfig,
+	ctx: ExtensionContext,
+): Promise<void> {
+	const registry = ctx.modelRegistry;
+	const model = resolveRoleModel(config.modelRole, registry, settings, ["memory"]);
+	if (!model) return;
 
 
 async function retainSession(
@@ -250,50 +263,10 @@ async function retainSession(
 	const filePath = path.join(state.queueDir, filename);
 
 	const projectLabel = state.config.projectLabel;
-
-	// Collect file paths from tool calls in this session's messages.
-	// read_files: paths passed to read() / search() / find()
-	// modified_files: paths written by edit() / write() / notebook()
-	// written_files: paths created fresh by write()
-	const readFiles  = new Set<string>();
-	const modFiles   = new Set<string>();
-	const writtenFiles = new Set<string>();
-	for (const msg of messages) {
-		if (msg.role !== "assistant") continue;
-		const parts = Array.isArray(msg.content) ? msg.content as import("@oh-my-pi/pi-ai").ToolCall[] : [];
-		for (const part of parts) {
-			if (part.type !== "toolCall") continue;
-			const name = part.name;
-			const args = part.arguments ?? {};
-		const rawP  = (args["path"] as string | undefined)?.replace(/\\/g, "/") ?? "";
-		if (!rawP || rawP.startsWith("http") || rawP.includes("*")) continue;
-		// Resolve to absolute path — plan requires absolute paths in file chunks.
-		const cwd = ctx?.sessionManager.getCwd().replace(/\\/g, "/") ?? "";
-		const p   = (rawP.startsWith("/") || /^[a-zA-Z]:/.test(rawP))
-			? rawP
-			: cwd ? `${cwd}/${rawP}` : rawP;
-		// Skip directories — only track actual files. Client has full fs context.
-		try { if (fs.statSync(p).isDirectory()) continue; } catch { /* not on disk yet or inaccessible — keep */ }
-			if (name === "read" || name === "search" || name === "find") {
-				readFiles.add(p);
-			} else if (name === "edit" || name === "notebook" || name === "ast_edit") {
-				modFiles.add(p);
-			} else if (name === "write") {
-				writtenFiles.add(p);
-				modFiles.add(p);
-			}
-		}
-	}
-	const fmFiles = (arr: Set<string>) =>
-		arr.size ? ` [${[...arr].map(p => `"${p}"`).join(", ")}]` : " []";
-	const frontmatter =
-		`---\nproject: ${projectLabel}\nagent_tag: ${state.config.agentTag}\nsource: session\n` +
-		`session_id: ${state.sessionId}\nts: ${Math.floor(state.sessionStartTime.getTime() / 1000)}\n` +
-		`read_files:${fmFiles(readFiles)}\nmodified_files:${fmFiles(modFiles)}\nwritten_files:${fmFiles(writtenFiles)}\n---\n\n`;
-	const noteSection = note ? `\n\n**Note:** ${note}` : "";
+	const frontmatter = `---\nproject: ${projectLabel}\nagent_tag: ${state.config.agentTag}\nsource: session\nsession_id: ${state.sessionId}\nts: ${Math.floor(state.sessionStartTime.getTime() / 1000)}\n---\n\n`;
 	fs.writeFileSync(
 		filePath,
-		`${frontmatter}# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}${noteSection}`,
+		`${frontmatter}# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}`,
 		"utf-8",
 	);
 	// DEBUG (cleanup when stable): log queue file written
@@ -462,12 +435,7 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			return;
 		}
 		sessionMap.set(ctx.sessionManager, state);
-		logger.debug(
-			`[mmemory] session_start: session=${state.sessionId} storageRoot=${state.config.storageRoot}` +
-			` retainEvery=${state.config.retainEveryNTurns} autoRetain=${state.config.autoRetain}` +
-			` consolidationMinTurns=${state.config.consolidationMinTurns} pollInterval=${state.config.consolidationPollIntervalMinutes}min`,
-			{ source: "mmemory" },
-		);
+		logger.debug(`[mmemory] session started: ${state.sessionId} storageRoot=${state.config.storageRoot} extractionMode=${state.config.extractionMode} retainEvery=${state.config.retainEveryNTurns}`, { source: "mmemory" });
 	});
 
 	// DEBUG (cleanup when stable): every turn entry — tracks injection, recall, and system prompt modification
@@ -497,7 +465,7 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			const query = truncateRecallQuery(rawQuery, prompt, state.config.recallMaxQueryChars);
 			logger.debug(`[mmemory] first-turn recall: query=${query.slice(0, 80)}...`, { source: "mmemory" });
 			const result = await executeMemoryRecall(
-				query, undefined, state.config,
+				query, getRecallScope(ctx.sessionManager), state.config, ctx.modelRegistry, settings,
 			).catch((e) => {
 				logger.debug(`[mmemory] recall failed: ${e}`, { source: "mmemory" });
 				// Reset flag so next turn retries — server may not have been ready yet.

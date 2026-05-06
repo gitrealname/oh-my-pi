@@ -215,46 +215,25 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			break;
 		}
 		case "view": {
-			// Use the session-start snapshot — same content the agent was injected with.
-			// Falls back to fresh query only if recall hasn't fired yet (server still starting).
-			const snapshot = getMmemorySessionSnippet(runtime.ctx);
-			const snippet = snapshot
-				?? formatRecallForSystemPrompt(
-						await executeMemoryRecall("recent context", undefined, config, runtime.ctx.session.modelRegistry, settings, "session"),
-					);
-			if (!snippet) { runtime.ctx.showStatus("mmemory: no memories loaded."); break; }
-			runtime.ctx.showStatus("mmemory: showing session-start snapshot.");
-			showMPanel(runtime.ctx, "Memory Recall Snapshot", snippet);
+			const viewResult = await executeMemoryRecall("recent context", undefined, config, runtime.ctx.session.modelRegistry, settings);
+			const snippet = formatRecallForSystemPrompt(viewResult);
+			runtime.ctx.showStatus(snippet ? "mmemory: showing recall snippet." : "mmemory: no memories loaded.");
+			if (snippet) {
+				await runtime.ctx.session.agent.prompt(`[Current memory recall snippet]\n\n${snippet}`);
+			}
 			break;
 		}
 		case "status": {
 			const mmPaths = resolvePaths(config);
 			const enabled = settings.get("mmemory.enabled" as SettingPath);
+			const hasChunks = existsSync(mmPaths.chunksPath);
+			const chunkCount = hasChunks
+				? (() => { try { return (JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as unknown[]).length; } catch { return "?"; } })()
+				: 0;
 			const proj = config.projectLabel;
 			const scope = scopeLabel(runtime.ctx.sessionManager, proj);
-			// Parse chunks.json once for all derived stats
-			type Chunk = { source?: string; ts?: number; end_ts?: number; date?: string };
-			let chunks: Chunk[] = [];
-			if (existsSync(mmPaths.chunksPath)) {
-				try { chunks = JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as Chunk[]; } catch { /* unreadable */ }
-			}
-			const projChunks = chunks; // storageRoot already scopes to this project
-			const chunkCount = projChunks.length;
-			// Last consolidation: max end_ts of observation chunks
-			const obsChunks = projChunks.filter(c => c.source === "observation");
-			const lastObsEndTs = obsChunks.length > 0 ? Math.max(...obsChunks.map(c => c.end_ts ?? 0)) : 0;
-			const lastObsDate = obsChunks.find(c => (c.end_ts ?? 0) === lastObsEndTs)?.date;
-			const consolidationInfo = obsChunks.length > 0
-				? `last=${lastObsDate ?? new Date(lastObsEndTs * 1000).toLocaleDateString()} (${obsChunks.length} obs)`
-				: "never";
-			// Sessions pending consolidation: session chunks with ts > lastObsEndTs
-			const sessionChunks = projChunks.filter(c => c.source === "session");
-			const pendingSessions = sessionChunks.filter(c => (c.ts ?? 0) > lastObsEndTs).length;
-			const minTurns = config.consolidationMinTurns;
-			const pendingInfo = `pending=${pendingSessions}/${minTurns}`;
 			runtime.ctx.showStatus(
-				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, ` +
-				`consolidation=${consolidationInfo}, ${pendingInfo}, path=${mmPaths.projectDir}`,
+				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, path=${mmPaths.projectDir}`,
 			);
 			break;
 		}

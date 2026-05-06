@@ -94,13 +94,13 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 
 	"mmemory.scoping": {
 		type: "enum" as const,
-		values: ["per-project", "per-project-tagged", "global"] as const,
-		default: "per-project" as "per-project" | "per-project-tagged" | "global",
+		values: ["per-project", "global"] as const,
+		default: "per-project" as "per-project" | "global",
 		ui: {
 			tab: "tools" as const,
 			label: "MMemory: Default recall scope",
 			description:
-				"per-project — project filter only. per-project-tagged — project + agent tag filter. global — no filter. Overridable per-session with /mmemory / or /mmemory .",
+				"per-project — recall filters to chunks from this project (default). global — no project filter. Overridable per-session with /mmemory / or /mmemory .",
 		},
 	},
 
@@ -378,7 +378,7 @@ export interface MmemorySettings {
 	timeFilterModelRole: string | undefined;
 	retainMission: string | undefined;
 	extractionMode: "verbatim" | "structured";
-	scoping: "per-project" | "per-project-tagged" | "global";
+	scoping: "per-project" | "global";
 	retainEveryNTurns: number;
 	retainContextTurns: number;
 	deduplicationThreshold: number;

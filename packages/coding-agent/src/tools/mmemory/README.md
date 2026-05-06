@@ -13,13 +13,11 @@ with `BAAI/bge-small-en-v1.5` (~25 MB model, first-run download only).
 ## Architecture
 
 ```
-Extension (TypeScript)                    Python server (TCP, port 49200)
-──────────────────────────────            ─────────────────────────────────────
-session_start → get_injection_snapshot ─→  returns sessions + obs + files blocks
-before_agent_start (per turn) → same   ─→  obs fallback when anchor covers all
-agent_end → retain → build             ─→  _handle_build  → embed + store
-/mmemory recall / reflect               ─→  _handle_recall → BM25 + cosine
-vacuum (background)                     ─→  _handle_vacuum → purge stale chunks
+Extension (TypeScript)                Python server (TCP, port 49200)
+──────────────────────────────        ─────────────────────────────────
+before_agent_start → recall  ──────→  _handle_recall  → BM25 + cosine
+agent_end → retain           ──────→  _handle_build   → embed + store
+/mmemory flush               ──────→  _handle_build   (manual trigger)
 ```
 
 One Python server process handles all projects. It starts on first use,
@@ -31,12 +29,14 @@ idles for 10 minutes, then self-terminates. The next query restarts it.
 
 ```
 mmemory.storageRoot/
-  chunks.json              durable store: session + file + observation chunks
-  vectors.safetensors      embeddings (BAAI/bge-small-en-v1.5, 384 dims); rebuildable
-  vectors.meta.json        {model, count} for rebuild validation
-  queue/                   transient .md files written by extension; empty after build
-  vacuum-state.json        {last_vacuum_ts} written by vacuum on completion
-  mmemory-server.log       Python server stderr
+  chunks.json          all session chunks; metadata: project, source, ts, session_id
+  vectors.safetensors  embedding index (BAAI/bge-small-en-v1.5, 384 dims)
+  vectors.meta.json    model name + chunk count for rebuild validation
+  queue/               transient .md files written by extension; deleted after build
+  facts.json           structured extraction (Phase 3)
+  observations.json    consolidated facts (Phase 3)
+  mental_models/       seeded session summaries (Phase 3)
+  mmemory-server.log   Python server stderr
   mmemory-server-<port>.pid  server PID (written by server, deleted on clean exit)
 ```
 
@@ -45,25 +45,22 @@ Queue files carry YAML frontmatter:
 ```
 ---
 project: <normalized cwd, e.g. D/.ai>
-source: session | file | observation
+agent_tag: default
+source: session
+session_id: <id>
 ts: <unix seconds>
-read_files: []        # absolute paths; session source only
-modified_files: []    # absolute paths; session source only
-written_files: []     # absolute paths; session source only
 ---
 
-<transcript content>
+# Memory — YYYY-MM-DD
+...
 ```
-
-File chunks (`source: file`) use `path:` and `action: read|write|modified` frontmatter
-instead of transcript content. `agent_tag` and `session_id` are not written to queue files.
 
 Project label is auto-derived from the normalized working directory:
   `D:\.ai` → `D/.ai`, `C:\repos\carity2` → `C/repos/carity2`
 Not configurable. Use `agentTag` to isolate memories within the same project.
 
-The server reads frontmatter fields as chunk metadata for filtering. Source-specific
-fields (read_files/modified_files/written_files) are parsed into per-path file chunks.
+The server strips the frontmatter before chunking and stores the fields as
+chunk metadata, enabling filtered recall.
 
 ---
 
@@ -72,62 +69,36 @@ fields (read_files/modified_files/written_files) are parsed into per-path file c
 ```yaml
 mmemory:
   enabled: true
-  storageRoot: ~/mmemory          # full path; project label auto-derived from cwd
 
-  # LLM roles
-  modelRole: memory               # recall synthesis, reflect; requires cheap/fast model
-  timeFilterModelRole: ~          # time-hint LLM; falls back to modelRole when null
-  consolidateModelRole: memory    # consolidation LLM
+  # Full path to the storage root. All data is stored here.
+  storageRoot: ~/mmemory
 
-  # Retention
-  retainMission: ""               # context injected into every queue file
-  extractionMode: verbatim        # verbatim = turn-boundary transcripts (current)
-  retainEveryNTurns: 3
-  retainContextTurns: 3
-  autoRetain: true
-
-  # Scoping
-  agentTag: default
-  scoping: per-project            # per-project | global
+  # Model role for LLM calls (fact extraction, reflect synthesis, consolidation).
+  # Any model with >= 32k context window works. Cheap/fast preferred.
+  modelRoles:
+    memory: <provider/model>
 
   # Recall
-  recall:
-    limit: 10
-    deadlineMs: 10000
-    maxQueryChars: 2000
-    recencyWeight: 0.3
-    fileLimit: 20
-    includeReadFiles: false
-    observationLimit: 10
+  recallMaxQueryChars: 2000   # max chars composed from recent turns for query
+  recallTopK: 5               # results injected into system prompt
 
-  # Injection snapshot (system prompt)
-  injection:
-    sessionLimit: 5
-    observationLimit: 3
-    fileLimit: 5
-    maxChars: 8000
+  # Retain
+  retainEveryNTurns: 1        # write queue file after every N agent turns
+  retainMission: ""           # optional context included in every queue file
 
-  # Consolidation
-  consolidationMinTurns: 10
-  consolidationMaxTurns: 50
-  consolidationPollIntervalMinutes: 5
-  consolidationMaxObservationChars: 400
-
-  # Vacuum
-  vacuum:
-    enabled: true
-    intervalHours: 24
-    sessionMaxAgeDays: 365
-    observationMaxAgeDays: 90
-    fileMaxAgeDays: 180
+  # Scoping
+  agentTag: default           # isolates memories by agent identity within same project
+                              # global scope (/mmemory /) bypasses this filter
+                              # existing chunks without this field default to "default"
 
   # Server
   serverPort: 49200
   serverIdleTimeoutMinutes: 10
-  serverLogFile: ~                # null = <storageRoot>/mmemory-server.log
+  # serverLogFile: ~          # default: <storageRoot>/mmemory-server.log
 
-  maxTranscriptChars: 0
-  deduplicationThreshold: 0.92
+  # Phase 3
+  extractionMode: none        # none | llm
+  maxRawFacts: 100
 ```
 
 ---
@@ -143,7 +114,9 @@ mmemory:
 /mmemory clear [--from D] [--to D]  delete chunks by time range
 /mmemory clear --session <id>       delete chunks from one session
 /mmemory enqueue <text>             manually add text to the queue
-# (Phase 3 slash commands removed — consolidate/mm are not yet implemented)
+/mmemory consolidate                merge facts.json → observations.json (Phase 3)
+/mmemory mm list                    list mental models
+/mmemory mm regenerate              regenerate all mental models
 /mmemory status                     show scope, chunk count, enabled, path
 
 # Scope switching (session-sticky)
@@ -165,7 +138,7 @@ Scope set via `/mmemory /`, `.`, or `<name>` persists for the session.
 {
   "project":   "D/.ai",
   "agent_tag": "default",
-  "source":    ["session", "file", "observation"],
+  "source":    ["session", "document"],
   "ts_after":  1746000000,
   "ts_before": 1747000000
 }
@@ -192,16 +165,11 @@ The embedded version is restored if the local copy is older than the binary buil
 
 | File | Purpose |
 |---|---|
-| `mmemory_server.py` | Python TCP server: build/recall/vacuum/consolidate/get_injection_snapshot |
-| `mmemory_vacuum.py` | VacuumWorker: reads chunks, returns surviving paths (no I/O side-effects) |
+| `mmemory_server.py` | Python TCP server: embed, build, recall, BM25, singleton guard |
 | `server-client.ts` | TypeScript TCP client: spawn, ping, query, drain |
-| `index.ts` | `loadMmemoryConfig`, `resolvePaths`, `executeMemoryRecall/Build/Consolidate` |
-| `mmemory-backend.ts` | `MemoryBackend` impl: start, beforeAgentStartPrompt, buildDeveloperInstructions |
-| `time-filter.ts` | LLM temporal query parser; returns `TimeFilter` with ts_after/ts_before/source |
-| `retain-tool.ts` | `mmemory_retain` LLM-callable tool |
-| `recall-tool.ts` | `mmemory_recall` LLM-callable tool |
-| `reflect-tool.ts` | `mmemory_reflect` LLM-callable tool |
-| `../../mmemory-extension.ts` | Extension: event handlers, slash command, session retain |
+| `index.ts` | `loadMmemoryConfig`, `resolvePaths`, `executeMemoryRecall/Build` |
+| `../../mmemory-extension.ts` | Extension factory: registers event handlers, slash command |
+
 ---
 
 ## Singleton guard (server)
@@ -219,7 +187,7 @@ Three-layer guard prevents multiple server instances when two OMP windows start 
 On the first build after upgrading from an older layout (`storageRoot/index/`),
 the server automatically migrates existing chunks to the flat layout:
 
-- Reads `index/chunks.json`, backfills metadata (project, source, ts from filename)
+- Reads `index/chunks.json`, backfills metadata (project, source, ts from filename, session_id)
 - Writes `chunks.json` atomically
 - Copies `index/vectors.safetensors` → `vectors.safetensors`
 - Deletes `index/`

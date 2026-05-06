@@ -205,13 +205,11 @@ cloud embedding API. Uses `BAAI/bge-small-en-v1.5` (~25 MB, first-run download).
 - Server starts on first use, self-terminates after 10 min idle, restarts transparently
 - Single flat store: `mmemory.storageRoot/chunks.json` + `vectors.safetensors`
 - Queue files (`storageRoot/queue/*.md`) staged by extension, processed by server
-- Age-based vacuum (`mmemory_vacuum.py`) purges stale chunks by source type; runs in background thread after build
-- Five agent tools: `mmemory` (gateway, user-triggered), `mmemory_recall`, `mmemory_retain`, `mmemory_reflect`, `mmemory_consolidate`
 
 **Chunk metadata dimensions** (all stored per chunk, all filterable):
-- `project` — normalized working directory path (e.g. `my-project`)
+- `project` — normalized working directory path (e.g. `D/.ai`)
 - `agent_tag` — agent identity within a project (default: `"default"`)
-- `source` — `"session"` (retained summaries) | `"fact"` (extracted facts) | `"observation"` (consolidated insights) | `"file"` (file path index, one entry per unique path)
+- `source` — `"session"` for retained memories, `"document"` for indexed content
 - `ts` — Unix seconds, derived from queue filename at ingest time
 - `session_id` — which session produced this chunk
 
@@ -230,23 +228,14 @@ before the semantic search. Prompt is sidecar-overridable (see §12).
 **Slash commands:** `/mmemory recall|retain|reflect|view|clear|status|enqueue|consolidate|mm`
 
 Files:
-- `packages/coding-agent/src/mmemory-extension.ts` — extension lifecycle
-- `packages/coding-agent/src/tools/mmemory/index.ts` — server client, executeMemory* functions
-- `packages/coding-agent/src/tools/mmemory/mmemory_server.py` — Python TCP server: BM25+semantic recall, build, vacuum, embed
-- `packages/coding-agent/src/tools/mmemory/mmemory_bm25.py` — shared BM25 module (tokenize, index, search)
-- `packages/coding-agent/src/tools/mmemory/mmemory_vacuum.py` — VacuumWorker: age-based chunk purge
-- `packages/coding-agent/src/tools/mmemory/tool.ts` — mmemory gateway tool (user-triggered dispatch)
-- `packages/coding-agent/src/tools/mmemory/recall-tool.ts` — mmemory_recall tool
-- `packages/coding-agent/src/tools/mmemory/retain-tool.ts` — mmemory_retain tool
-- `packages/coding-agent/src/tools/mmemory/reflect-tool.ts` — mmemory_reflect tool
-- `packages/coding-agent/src/tools/mmemory/consolidate-tool.ts` — mmemory_consolidate tool
-- `packages/coding-agent/src/sidecars/mme-gateway.tool-desc.md` — gateway trigger conditions
-- `packages/coding-agent/src/sidecars/mme-recall.tool-desc.md` — recall tool description
-- `packages/coding-agent/src/sidecars/mme-retain.tool-desc.md` — retain tool description
-- `packages/coding-agent/src/sidecars/mme-reflect.tool-desc.md` — reflect tool description
-- `packages/coding-agent/src/sidecars/mme-consolidate.tool-desc.md` — consolidate tool description
-- `packages/coding-agent/src/sidecars/mme-time-filter.prompt.md` — time-filter LLM prompt
-- `packages/coding-agent/src/sidecars/mme-recall-preamble.prompt.md` — recall source-filter taxonomy
+- `packages/coding-agent/src/mmemory-extension.ts` — extension factory
+- `packages/coding-agent/src/tools/mmemory/` — server client, tools, time-filter
+- `packages/coding-agent/src/tools/mmemory/mmemory_server.py` — Python TCP server
+- `packages/coding-agent/src/sidecars/mme-time-filter.prompt.md` — time-filter LLM prompt (sidecar)
+- `packages/coding-agent/src/sidecars/mme-recall.tool-desc.md` — recall tool description (sidecar)
+- `packages/coding-agent/src/sidecars/mme-retain.tool-desc.md` — retain tool description (sidecar)
+- `packages/coding-agent/src/sidecars/mme-reflect.tool-desc.md` — reflect tool description (sidecar)
+- `packages/coding-agent/src/sidecars/mme-gateway.tool-desc.md` — .memory gateway description (sidecar)
 
 See [docs/mmemory.md](docs/mmemory.md) for full documentation.
 

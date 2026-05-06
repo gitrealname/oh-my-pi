@@ -3,6 +3,7 @@ import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { Type } from "@sinclair/typebox";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
+import { executeMemoryReflect, loadMmemoryConfig } from ".";
 import embeddedReflectDesc from "../../sidecars/mme-reflect.tool-desc.md" with { type: "text" };
 import { createSidecar, sidecarPath } from "../../utils/m-utils";
 const resolveDesc = createSidecar(sidecarPath("mme-reflect.tool-desc.md"), embeddedReflectDesc);
