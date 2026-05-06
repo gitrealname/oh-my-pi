@@ -3,6 +3,9 @@ import { Type } from "@sinclair/typebox";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
 import { executeMemoryRetain, loadMmemoryConfig } from ".";
+import embeddedRetainDesc from "../../sidecars/mme-retain.tool-desc.md" with { type: "text" };
+import { createSidecar, sidecarPath } from "../../utils/m-utils";
+const resolveDesc = createSidecar(sidecarPath("mme-retain.tool-desc.md"), embeddedRetainDesc);
 
 const schema = Type.Object({
 	content: Type.String({
@@ -16,9 +19,7 @@ export class MmemoryRetainTool implements AgentTool<typeof schema> {
 	readonly name = "mmemory_retain";
 	readonly label = "Memory: Retain";
 	readonly parameters = schema;
-	readonly description =
-		"Store important information in project memory for future sessions. " +
-		"Use for technical decisions, API contracts, constraints, error patterns, and conventions.";
+	readonly description = resolveDesc();
 
 	constructor(private readonly session: ToolSession) {}
 

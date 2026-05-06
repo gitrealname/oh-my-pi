@@ -23,7 +23,7 @@
  */
 import { getAgentDir, logger } from "@oh-my-pi/pi-utils";
 import { completeSimple } from "@oh-my-pi/pi-ai";
-import { resolveModelRoleValue } from "../../config/model-resolver";
+import { resolveRoleModel } from "../../utils/m-utils";
 import { settings } from "../../config/settings";
 import { captureBatch, serializeBatchForSummarizer, type PruneBatch } from "../../session/compaction/mprune-batch";
 import { findAgedImages, makePlaceholder } from "../../session/compaction/mprune-images";
@@ -102,13 +102,8 @@ async function summarizeBatches(
 	ctx: ExtensionContext,
 ): Promise<string | null> {
 	const registry = ctx.modelRegistry;
-	const roleValue =
-		settings.get("modelRoles.prune" as "modelRoles.smol") ??
-		settings.get("modelRoles.smol") ??
-		settings.get("modelRoles.default" as "modelRoles.smol");
-	logger.debug("[mprune] resolving prune model", { roleValue });
-	const resolved = resolveModelRoleValue(roleValue, registry.getAvailable(), { modelRegistry: registry });
-	const model = resolved.model;
+	const model = resolveRoleModel(undefined, registry, settings, ["prune"]);
+	logger.debug("[mprune] resolving prune model", { model: model?.id });
 	if (!model) {
 		logger.warn("[mprune] no model resolved (prune/smol/default all unset or unresolvable)");
 		return null;
