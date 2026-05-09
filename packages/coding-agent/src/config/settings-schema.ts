@@ -1151,16 +1151,17 @@ export const SETTINGS_SCHEMA = {
 	// the local backend; see config/settings.ts migration for details.
 	"memory.backend": {
 		type: "enum",
-		values: ["off", "local", "hindsight"] as const,
+		values: ["off", "local", "hindsight", "mmemory"] as const,
 		default: "off",
 		ui: {
 			tab: "memory",
 			label: "Memory Backend",
 			description: "Off, local memory pipeline, or Hindsight remote memory",
 			options: [
-				{ value: "off", label: "Off", description: "No memory subsystem runs" },
-				{ value: "local", label: "Local", description: "Local rollout summarisation pipeline (memory_summary.md)" },
-				{ value: "hindsight", label: "Hindsight", description: "Vectorize Hindsight remote memory service" },
+				{ value: "off",      label: "Off",       description: "No memory subsystem runs" },
+				{ value: "local",    label: "Local",     description: "Local rollout summarisation pipeline (memory_summary.md)" },
+				{ value: "hindsight",label: "Hindsight", description: "Vectorize Hindsight remote memory service" },
+				{ value: "mmemory",  label: "Mmemory",   description: "Local semantic memory with BM25 + embeddings (mmemory)" },
 			],
 		},
 	},

@@ -2,6 +2,7 @@ import type { Settings } from "../config/settings";
 import { hindsightBackend } from "../hindsight";
 import { localBackend } from "./local-backend";
 import { offBackend } from "./off-backend";
+import { mmemoryBackend } from "./mmemory-backend";
 import type { MemoryBackend } from "./types";
 
 /**
@@ -20,5 +21,6 @@ export function resolveMemoryBackend(settings: Settings): MemoryBackend {
 	const id = settings.get("memory.backend");
 	if (id === "hindsight") return hindsightBackend;
 	if (id === "local") return localBackend;
+	if (id === "mmemory") return mmemoryBackend;
 	return offBackend;
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """mmemory recall server.
 
-Inspired by Hindsight (https://github.com/vectorize-io/hindsight) by Vectorize — Apache 2.0.
-The 5-dimension fact extraction schema (what/when/where/who/why), scoping model, and
-retain_mission concept are derived from Hindsight's design.
+Inspired by Hindsight (https://github.com/vectorize-io/hindsight) by Vectorize — MIT License.
+The retain/recall/reflect API naming, bank_id→project scoping model, retain_mission concept,
+and async consolidation pattern are derived from Hindsight. Fact schema simplified to
+{fact, entities, date} vs Hindsight's 5-dimension what/when/where/who/why extraction.
 
 TCP socket server, line-delimited JSON protocol (localhost only).
 Holds the fastembed model in memory for fast repeated recall.
@@ -13,21 +14,21 @@ stderr is redirected to --log-file; nothing is written to stdout.
 
 Storage layout (managed by this server):
     project_dir/
-      queue/                 transient .md files; deleted after build
-      index/
-        chunks.json          DURABLE STORE — full chunk texts, append-only
-        vectors.safetensors  rebuildable from chunks.json
-        vectors.meta.json    {model, count} for rebuild validation
+      queue/                 transient .md files; deleted after build (queue-only ingress)
+      chunks.json            DURABLE STORE — full chunk texts + source:"file" entries
+      vectors.safetensors    rebuildable from chunks.json
 
 Build contract:
     1. Read all queue/*.md, parse into turn-boundary chunks
     2. Filter chunks whose hash already exists in chunks.json (skip)
+    2b. Upsert source:"file" chunks from session file arrays
     3. Embed new chunks, append to chunks.json, extend vectors
     4. Delete processed .md files
     5. Invalidate in-memory cache
+    6. Trigger vacuum if interval elapsed
 
 Protocol:
-    Request:  {"action": "ping|recall|build|rebuild|dedup_check|shutdown", ...}\\n
+    Request:  {"action": "ping|recall|build|rebuild|dedup_check|bm25|vacuum|embed|shutdown", ...}\\n
     Response: {"status": "ok", ...}\\n
 
 Actions:
@@ -36,7 +37,10 @@ Actions:
     build         Background build: queue → chunks.json + vectors, delete .md files.
     rebuild       Force full re-embed of all chunks in chunks.json (model change etc.).
     dedup_check   Check cosine similarity for a text against existing vectors.
+    bm25          Pure BM25 search over chunks (no embedding required).
+    vacuum        Age-based purge of stale chunks and vectors.
     shutdown      Graceful stop.
+    embed         Batch embed texts via the loaded fastembed model; allows semantic_server to delegate embedding.
 
 Usage:
     python mmemory_server.py --port 49200           # fixed port (required)
@@ -45,6 +49,7 @@ Usage:
 """
 
 import collections
+import traceback
 import hashlib
 import json
 import math
@@ -60,6 +65,7 @@ from pathlib import Path
 
 import numpy as np
 
+from mmemory_bm25 import tokenize, build_bm25_index, bm25_search  # noqa: F401
 DEFAULT_TIMEOUT = 10  # minutes
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 MODEL_CACHE = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".cache"))) / "fastembed"
@@ -155,55 +161,6 @@ def date_from_filename(filename: str) -> date | None:
     return None
 
 
-# ── BM25 ─────────────────────────────────────────────────────────────────────
-
-def tokenize(text: str) -> list[str]:
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
-    return [t.lower() for t in re.sub(r"[^a-zA-Z0-9]", " ", text).split() if len(t) > 1]
-
-
-def build_bm25_index(chunks: list[dict]) -> dict:
-    k1, b = 1.5, 0.75
-    N = len(chunks)
-    if N == 0:
-        return {"N": 0, "df": {}, "doc_tfs": [], "doc_lengths": [], "avg_dl": 1, "k1": k1, "b": b}
-    doc_tfs, doc_lengths = [], []
-    df: dict[str, int] = collections.Counter()  # type: ignore[assignment]
-    for c in chunks:
-        tf: dict[str, int] = collections.Counter(tokenize(c.get("text", "")))  # type: ignore[assignment]
-        doc_tfs.append(tf)
-        doc_lengths.append(sum(tf.values()))
-        for t in tf:
-            df[t] = df.get(t, 0) + 1
-    avg_dl = sum(doc_lengths) / N
-    # H5 fix: require at least 2 docs to share a term before pruning
-    threshold = max(2, N * 0.5)
-    df = {t: c for t, c in df.items() if c < threshold}  # type: ignore[assignment]
-    return {"N": N, "df": df, "doc_tfs": doc_tfs, "doc_lengths": doc_lengths,
-            "avg_dl": avg_dl, "k1": k1, "b": b}
-
-
-def bm25_search(index: dict, query: str, top_k: int = 20) -> list[tuple[int, float]]:
-    k1, b, N, avg_dl = index["k1"], index["b"], index["N"], index["avg_dl"]
-    if N == 0:
-        return []
-    qterms = [t for t in tokenize(query) if t in index["df"]]
-    if not qterms:
-        return []
-    scores = []
-    for i, (tf, dl) in enumerate(zip(index["doc_tfs"], index["doc_lengths"])):
-        score = 0.0
-        for t in qterms:
-            if tf.get(t, 0) == 0:
-                continue
-            idf = math.log((N - index["df"][t] + 0.5) / (index["df"][t] + 0.5) + 1)
-            tf_norm = tf[t] * (k1 + 1) / (tf[t] + k1 * (1 - b + b * dl / avg_dl))
-            score += idf * tf_norm
-        if score > 0:
-            scores.append((i, score))
-    return sorted(scores, key=lambda x: x[1], reverse=True)[:top_k]
-
-
 # ── Cosine + RRF ─────────────────────────────────────────────────────────────
 
 def cosine_similarity(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -233,15 +190,38 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     body = text[end + 5:]
     meta: dict = {}
     for line in fm_text.splitlines():
-        if ":" in line:
-            k, _, v = line.partition(":")
-            meta[k.strip()] = v.strip()
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        # Inline YAML list: [a, b, "c"] or ["a", "b"]
+        if v.startswith("[") and v.endswith("]"):
+            inner = v[1:-1].strip()
+            if inner:
+                meta[k] = [s.strip().strip('"').strip("'") for s in re.split(r',\s*', inner) if s.strip().strip('"').strip("'")]
+            else:
+                meta[k] = []
+        else:
+            meta[k] = v
     return meta, body
+
+def _parse_ts(value) -> int:
+    """Parse a ts value to epoch int. Accepts int, float, or digit-string.
+    Returns int(time.time()) for None, empty, or un-parseable values (ISO strings etc.)."""
+    if value is None or value == "":
+        return int(time.time())
+    try:
+        return int(float(str(value)))
+    except (ValueError, TypeError):
+        return int(time.time())
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
 class MmemoryServer:
     def __init__(self, port: int, timeout_minutes: int, pid_file: "Path | None" = None) -> None:
+        try: os.nice(10)
+        except AttributeError: pass
         self.port = port
         self.timeout = timeout_minutes * 60
         self.pid_file = pid_file
@@ -254,14 +234,14 @@ class MmemoryServer:
         self._vectors_cache: dict[str, np.ndarray] = {}
         self._bm25_cache: dict[str, dict] = {}
 
-        self._build_lock = threading.Lock()
+        self._build_locks: dict[str, threading.Lock] = {}
         # Coalescing: project dirs that arrived while a build was in flight
         self._pending_build: set[str] = set()
+        self._pending_build_lock = threading.Lock()  # protects set mutation — prevents lost wakeups
         # All project dirs seen since startup — reported in ping so clients can
         # fire build for any that have orphaned queue files after a crash/restart.
         self._known_project_dirs: set[str] = set()
         self._model_lock  = threading.Lock()
-
 
     # ── Singleton election ────────────────────────────────────────────────────
 
@@ -340,7 +320,6 @@ class MmemoryServer:
             "queue":        p / "queue",
             "chunks":       p / "chunks.json",
             "vectors":      p / "vectors.safetensors",
-            "vectors_meta": p / "vectors.meta.json",
         }
 
     # ── Cache helpers ────────────────────────────────────────────────────────
@@ -369,7 +348,7 @@ class MmemoryServer:
             tmp = p / "chunks.tmp.json"
             tmp.write_text(json.dumps(old_chunks, indent=2))
             tmp.replace(p / "chunks.json")
-            for name in ("vectors.safetensors", "vectors.meta.json"):
+            for name in ("vectors.safetensors",):
                 src = legacy_dir / name
                 if src.exists():
                     shutil.copy2(str(src), str(p / name))
@@ -378,7 +357,7 @@ class MmemoryServer:
             print(f"[mmemory] Migrated {len(old_chunks)} chunks from legacy index/ layout.",
                   file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"[mmemory] Migration failed (continuing): {e}", file=sys.stderr, flush=True)
+            print(f"EXCEPTION: [mmemory] Migration failed: {e}\n" + traceback.format_exc(), file=sys.stderr, flush=True)
 
     def _get_chunks(self, chunks_path: str) -> list[dict]:
         if chunks_path in self._chunks_cache:
@@ -412,7 +391,7 @@ class MmemoryServer:
             )
             sys.exit(1)
         except Exception as e:
-            print(f"[mmemory] Failed to load vectors: {e}", file=sys.stderr, flush=True)
+            print(f"EXCEPTION: [mmemory] Failed to load vectors: {e}\n" + traceback.format_exc(), file=sys.stderr, flush=True)
             return None
 
     def _get_bm25(self, chunks_path: str) -> dict:
@@ -457,7 +436,6 @@ class MmemoryServer:
         return {"status": "ok", "message": "shutting down"}
 
     def _handle_recall(self, req: dict) -> dict:
-        self._load_model()
         query: str = req.get("query", "")
         project_dir: str = req.get("project_dir", "")
         limit: int = req.get("limit", 10)
@@ -465,28 +443,85 @@ class MmemoryServer:
         scope: str = req.get("scope", "per-project")
         project: str = req.get("project", "")
         filter_params: dict = req.get("filter", {})
+        mode: str = req.get("mode", "query")  # "session" | "query"
 
-        if not query or not project_dir:
-            return {"error": "query and project_dir required"}
+        if not project_dir:
+            return {"error": "project_dir required"}
+        if mode != "session" and not query:
+            return {"error": "query required for mode=query"}
         self._known_project_dirs.add(project_dir)
+
         # One-shot migration: legacy index/ layout → flat layout.
-        # Background thread — recall is time-constrained; the file copy can take
-        # several seconds for large safetensors files. Return empty this call;
-        # next recall will find the migrated data.
         if (Path(project_dir) / "index" / "chunks.json").exists() and \
                 not (Path(project_dir) / "chunks.json").exists():
             threading.Thread(target=self._migrate_legacy, args=(project_dir,), daemon=False).start()
             return {"results": [], "count": 0, "note": "migrating legacy layout — retry in a moment"}
         dirs = self._dirs(project_dir)
 
-        # Drain orphaned queue files (e.g. left by a previous crash) without
-        # blocking the recall response. A coalesced build fires if needed.
+        # Drain orphaned queue files without blocking.
         queue_dir = dirs["queue"]
-        if queue_dir.exists() and not self._build_lock.locked() and any(queue_dir.glob("*.md")):
+        if queue_dir.exists() and not self._build_locks.setdefault(project_dir, threading.Lock()).locked() and any(queue_dir.glob("*.md")):
             self._handle_build({"action": "build", "project_dir": project_dir})
         chunks_path = str(dirs["chunks"])
         vectors_path = str(dirs["vectors"])
 
+        chunks = self._get_chunks(chunks_path)
+
+        def _matches_filter(chunk: dict, f: dict) -> bool:
+            if f.get("project") and chunk.get("project") != f["project"]:
+                return False
+            src = f.get("source")
+            if src:
+                chunk_src = chunk.get("source", "session")
+                sources = src if isinstance(src, list) else [src]
+                if chunk_src not in sources:
+                    return False
+            if f.get("ts_after") and chunk.get("ts", 0) < int(f["ts_after"]):
+                return False
+            if f.get("ts_before") and chunk.get("ts", 0) > int(f["ts_before"]):
+                return False
+            if f.get("agent_tag") and chunk.get("agent_tag", "default") != f["agent_tag"]:
+                return False
+            return True
+
+        def _build_result(chunk: dict, score: float) -> dict:
+            """Assemble a result entry with all fields the client needs."""
+            r: dict = {
+                "text": chunk.get("text", ""),
+                "source": chunk.get("source", "session"),
+                "ts": chunk.get("ts", 0),
+                "score": score,
+                "when": chunk.get("when"),
+            }
+            # File metadata — present only on session chunks written by retainSession
+            for field in ("read_files", "modified_files", "written_files"):
+                v = chunk.get(field)
+                if v is not None:
+                    r[field] = v
+            # File chunk metadata
+            for field in ("path", "action", "end_ts", "date", "entities"):
+                v = chunk.get(field)
+                if v is not None:
+                    r[field] = v
+            return r
+
+        # ── Session mode: time-ordered, no BM25/vector ─────────────────────────
+        if mode == "session":
+            # Filter to session + observation sources; apply project/agent filter
+            session_filter = dict(filter_params)
+            if "source" not in session_filter:
+                session_filter["source"] = ["session", "observation"]
+            candidates = [
+                c for c in chunks
+                if _matches_filter(c, session_filter)
+            ]
+            # Sort by ts DESC (most recent first), take top limit
+            candidates.sort(key=lambda c: c.get("ts", 0), reverse=True)
+            results = [_build_result(c, 1.0) for c in candidates[:limit]]
+            return {"results": results, "count": len(results), "query": query, "mode": "session"}
+
+        # ── Query mode: BM25 + semantic + recency ──────────────────────────────
+        self._load_model()
         query_emb = np.array(list(self.model.embed([query]))[0], dtype=np.float32)
 
         sem_results: list[tuple[int, float]] = []
@@ -510,24 +545,6 @@ class MmemoryServer:
         t1.join(); t2.join()
 
         merged = rrf_merge(sem_results, bm25_results)
-        chunks = self._get_chunks(chunks_path)
-
-        def _matches_filter(chunk: dict, f: dict) -> bool:
-            if f.get("project") and chunk.get("project") != f["project"]:
-                return False
-            src = f.get("source")
-            if src:
-                chunk_src = chunk.get("source", "session")
-                sources = src if isinstance(src, list) else [src]
-                if chunk_src not in sources:
-                    return False
-            if f.get("ts_after") and chunk.get("ts", 0) < int(f["ts_after"]):
-                return False
-            if f.get("ts_before") and chunk.get("ts", 0) > int(f["ts_before"]):
-                return False
-            if f.get("agent_tag") and chunk.get("agent_tag", "default") != f["agent_tag"]:
-                return False
-            return True
 
         if filter_params:
             merged = [(i, s) for i, s in merged if i < len(chunks) and _matches_filter(chunks[i], filter_params)]
@@ -547,53 +564,60 @@ class MmemoryServer:
 
             chunk_path = chunk.get("path", "")
             file_date = date_from_filename(chunk_path)
-            score = (rrf_score * math.exp(-max(0, (today - file_date).days) / 30 * recency_weight)
-                     if file_date else rrf_score)
+            # Recency decay applies to session chunks only; obs/facts rank by relevance
+            if chunk.get("source", "session") == "session" and file_date:
+                source_type = chunk.get('source', 'session')
+                max_age = req.get('vacuum_config', {}).get('max_age_days', {}).get(source_type, 365)
+                half_life = max(30, max_age // 4)
+                score = rrf_score * math.exp(-max(0, (today - file_date).days) / half_life * recency_weight)
+            else:
+                score = rrf_score
 
             if scope in ("per-project", "per-project-tagged"):
                 if project and project.lower() not in chunk_path.lower():
                     continue
 
-            results.append({"text": text, "path": chunk_path, "score": score, "when": chunk.get("when")})
+            results.append(_build_result(chunk, score))
             if len(results) >= limit:
                 break
 
         results.sort(key=lambda r: r["score"], reverse=True)
-        return {"results": results[:limit], "query": query}
+        return {"results": results[:limit], "query": query, "mode": "query"}
 
     def _handle_build(self, req: dict) -> dict:
         """Fire-and-forget build with coalescing."""
         project_dir: str = req.get("project_dir", "")
         dedup_threshold: float = float(req.get("dedup_threshold", 0.92))
         force_rebuild: bool = req.get("force_rebuild", False)
+        vacuum_config: dict = req.get("vacuum_config", {})
 
         if not project_dir:
             return {"error": "project_dir required"}
 
+        if vacuum_config:
+            self._vacuum_config = vacuum_config
+
         self._known_project_dirs.add(project_dir)
-        if self._build_lock.locked():
-            self._pending_build.add(project_dir)
-            return {"status": "accepted", "note": "coalesced"}
+        with self._pending_build_lock:
+            if self._build_locks.setdefault(project_dir, threading.Lock()).locked():
+                self._pending_build.add(project_dir)
+                return {"status": "accepted", "note": "coalesced"}
 
         def _do() -> None:
-            with self._build_lock:
-                try:
-                    os.nice(10)
-                except AttributeError:
-                    pass
+            with self._build_locks.setdefault(project_dir, threading.Lock()):
                 self._run_build(project_dir, dedup_threshold, force_rebuild)
                 self._invalidate(project_dir)
 
-            # Drain any builds that arrived while this one ran
-            while self._pending_build:
-                pending = self._pending_build.copy()
-                self._pending_build.clear()
+            # Drain any builds that arrived while this one ran.
+            # Loop until set is empty — new items may arrive between iterations.
+            while True:
+                with self._pending_build_lock:
+                    if not self._pending_build:
+                        break
+                    pending = self._pending_build.copy()
+                    self._pending_build.clear()
                 for pdir in pending:
-                    with self._build_lock:
-                        try:
-                            os.nice(10)
-                        except AttributeError:
-                            pass
+                    with self._build_locks.setdefault(pdir, threading.Lock()):
                         self._run_build(pdir, dedup_threshold, False)
                         self._invalidate(pdir)
 
@@ -623,29 +647,20 @@ class MmemoryServer:
         queue_dir = dirs["queue"]
         chunks_path = dirs["chunks"]
         vectors_path = dirs["vectors"]
-        vectors_meta_path = dirs["vectors_meta"]
 
         # ── 1. Load existing state ────────────────────────────────────────────
         existing_chunks: list[dict] = []
         if chunks_path.exists() and not force_rebuild:
             try:
                 existing_chunks = json.loads(chunks_path.read_text())
+                now_ts = int(time.time())
+                for c in existing_chunks:
+                    if not c.get('ts'):
+                        c['ts'] = now_ts  # heal legacy chunks missing ts
             except Exception:
                 pass
 
         existing_hashes: set[str] = {c["hash"] for c in existing_chunks}
-
-        # Check model consistency — if model changed, re-embed everything
-        old_model = ""
-        if vectors_meta_path.exists():
-            try:
-                old_model = json.loads(vectors_meta_path.read_text()).get("model", "")
-            except Exception:
-                pass
-        if old_model and old_model != MODEL_NAME:
-            print(f"[mmemory] Model changed ({old_model} → {MODEL_NAME}), full re-embed.", file=sys.stderr, flush=True)
-            existing_hashes = set()  # force re-embed of all existing chunks
-
         # ── 2. Collect new chunks from queue ──────────────────────────────────
         queue_files = sorted(queue_dir.glob("*.md")) if queue_dir.exists() else []
         new_raw_chunks: list[dict] = []
@@ -653,27 +668,112 @@ class MmemoryServer:
             try:
                 raw = md_file.read_text(encoding="utf-8", errors="replace")
                 fm, text = _parse_frontmatter(raw)
-                chunks = chunk_by_turns(text, str(md_file))
-                for c in chunks:
-                    c["project"]    = fm.get("project",    Path(project_dir).name)
-                    c["source"]     = fm.get("source",     "session")
-                    c["session_id"] = fm.get("session_id", None)
-                    c["ts"]         = int(fm.get("ts", time.time()))
-                    c["agent_tag"]  = fm.get("agent_tag",  "default")
-                new_raw_chunks.extend(chunks)
+                source = fm.get("source", "session")
+                if source == "session":
+                    chunks = chunk_by_turns(text, str(md_file))
+                    for c in chunks:
+                        c["project"]    = fm.get("project",    Path(project_dir).name)
+                        c["source"]     = source
+                        c["session_id"] = fm.get("session_id", None)
+                        c["ts"]         = _parse_ts(fm.get("ts"))
+                        c["end_ts"]     = c["ts"]
+                        c["agent_tag"]  = fm.get("agent_tag",  "default")
+                        # Persist file arrays so step 2b can re-derive file chunks on rebuild
+                        for _f in ("read_files", "modified_files", "written_files"):
+                            if fm.get(_f) is not None:
+                                c[_f] = fm[_f]
+                    new_raw_chunks.extend(chunks)
+                else:
+                    # observation: plain body, one chunk per file
+                    if source not in ('session', 'observation'):
+                        continue
+                    body = text.strip()
+                    if body:
+                        h = hashlib.sha256(body.encode()).hexdigest()[:16]
+                        new_raw_chunks.append({
+                            "hash":       h,
+                            "text":       body,
+                            "path":       str(md_file),
+                            "source":     source,
+                            "project":    fm.get("project", Path(project_dir).name),
+                            "session_id": fm.get("session_id", None),
+                            "ts":         _parse_ts(fm.get("ts")),
+                            "end_ts":     _parse_ts(fm.get("end_ts") or fm.get("ts")),
+                            "agent_tag":  fm.get("agent_tag", "default"),
+                            "entities":   fm.get("entities", []),
+                            "date":       fm.get("date", ""),
+                        })
             except Exception as e:
-                print(f"[mmemory] Failed to read {md_file.name}: {e}", file=sys.stderr, flush=True)
+                print(f"EXCEPTION: [mmemory] Failed to read {md_file.name}: {e}\n" + traceback.format_exc(), file=sys.stderr, flush=True)
 
+
+        # ── 2b. Upsert source:"file" chunks from session file arrays ──────────────
+        # One chunk per unique path; update ts if path already exists in index.
+        file_chunks_by_path: dict[str, dict] = {
+            c['path']: c for c in existing_chunks if c.get('source') == 'file'
+        }
+        for c in existing_chunks + new_raw_chunks:
+            if c.get('source', 'session') != 'session':
+                continue
+            ts = c.get('ts', int(time.time()))
+            # Collect all three sets for this session chunk
+            m_files = set(c.get('modified_files') or [])
+            w_files = set(c.get('written_files')  or [])
+            r_files = set(c.get('read_files')     or [])
+            # Combine: W + R = M;  M + <any> = M
+            all_paths = m_files | w_files | r_files
+            for fpath in all_paths:
+                in_m = fpath in m_files
+                in_w = fpath in w_files
+                in_r = fpath in r_files
+                if in_m or (in_w and in_r):
+                    action = 'modified'
+                elif in_w:
+                    action = 'written'
+                else:
+                    action = 'read'
+                basename = Path(fpath).name
+                h        = hashlib.md5(f'file:{fpath}'.encode()).hexdigest()
+                existing = file_chunks_by_path.get(fpath)
+                if existing is None or ts > existing.get('ts', 0):
+                    file_chunks_by_path[fpath] = {
+                        'hash':      h,
+                        'text':      f'{basename} \u2014 {action}',
+                        'action':    action,
+                        'source':    'file',
+                        'path':      fpath,
+                        'project':   c.get('project', Path(project_dir).name),
+                        'ts':        ts,
+                        'end_ts':    ts,
+                    }
+        # Remove stale file chunks from existing; will be replaced by file_chunks_by_path values
+        existing_chunks = [c for c in existing_chunks if c.get('source') != 'file']
+        existing_hashes = {c['hash'] for c in existing_chunks}
+        new_raw_chunks.extend(file_chunks_by_path.values())
         # ── 3. Filter to truly new chunks ─────────────────────────────────────
         new_chunks_by_hash = [c for c in new_raw_chunks if c["hash"] not in existing_hashes]
-        chunks_to_add = [c for c in new_chunks_by_hash if len(c["text"].split()) >= MIN_CHUNK_WORDS]
+        # Observation and fact chunks are intentionally short — bypass the word-count floor.
+        chunks_to_add = [
+            c for c in new_chunks_by_hash
+            if c.get("source", "session") not in ("session",) or len(c["text"].split()) >= MIN_CHUNK_WORDS
+        ]
         low_content_dropped = len(new_chunks_by_hash) - len(chunks_to_add)
         if low_content_dropped:
-            print(f"[mmemory] Dropped {low_content_dropped} low-content chunk(s) (< {MIN_CHUNK_WORDS} words).",
+            print(f"[mmemory] Dropped {low_content_dropped} low-content session chunk(s) (< {MIN_CHUNK_WORDS} words).",
                   file=sys.stderr, flush=True)
 
         if not chunks_to_add:
-            # Nothing new to embed; still delete processed files
+            # Nothing new to embed; still delete processed files and persist any healed ts values
+            try:
+                stored = json.loads(chunks_path.read_text()) if chunks_path.exists() else []
+                needs_write = any(not c.get("ts") for c in stored)
+                if needs_write:
+                    tmp = chunks_path.with_suffix(".tmp.json")
+                    tmp.write_text(json.dumps(existing_chunks, indent=2))
+                    tmp.replace(chunks_path)
+                    self._invalidate(project_dir)
+            except Exception:
+                pass
             for md_file in queue_files:
                 try:
                     md_file.unlink()
@@ -696,7 +796,7 @@ class MmemoryServer:
         new_vecs = np.vstack(new_parts) if len(new_parts) > 1 else new_parts[0]
 
         # ── 5. Load existing vectors and extend ───────────────────────────────
-        if existing_chunks and vectors_path.exists() and not force_rebuild and not (old_model and old_model != MODEL_NAME):
+        if existing_chunks and vectors_path.exists() and not force_rebuild:
             try:
                 old_vecs = load_file(str(vectors_path))["vectors"]
                 all_vecs = np.vstack([old_vecs, new_vecs])
@@ -712,7 +812,7 @@ class MmemoryServer:
                     self.last_activity = time.time()
                 all_vecs = np.vstack(re_parts) if len(re_parts) > 1 else re_parts[0]
         else:
-            # Cases: force_rebuild, model changed, or vectors file missing.
+            # Cases: force_rebuild or vectors file missing/absent.
             # In every case we must re-embed existing chunks — zero vectors produce
             # garbage cosine scores and must never be written to the index.
             all_chunks = existing_chunks + chunks_to_add
@@ -737,12 +837,7 @@ class MmemoryServer:
         tmp_vectors.replace(vectors_path)
 
         self.last_activity = time.time()  # build complete; reset idle window
-        # meta: model name + count for rebuild validation
-        vectors_meta_path.write_text(json.dumps({
-            "model": MODEL_NAME,
-            "count": len(all_chunks),
-            "built": datetime.now().isoformat(),
-        }, indent=2))
+        self.last_activity = time.time()  # build complete; reset idle window
 
         # ── 7. Delete processed queue files ───────────────────────────────────
         for md_file in queue_files:
@@ -756,6 +851,143 @@ class MmemoryServer:
             f"({len(chunks_to_add)} new, {len(queue_files)} queue file(s) deleted).",
             file=sys.stderr, flush=True,
         )
+
+        # ── Trigger vacuum if interval elapsed ───────────────────────────────────
+        vcfg = getattr(self, '_vacuum_config', {})
+        if vcfg.get('enabled', False):
+            interval_hours = vcfg.get('interval_hours', 24)
+            vacuum_state_path = Path(project_dir) / 'vacuum-state.json'
+            last_vacuum = 0
+            if vacuum_state_path.exists():
+                try:
+                    last_vacuum = json.loads(vacuum_state_path.read_text()).get('last_vacuum_ts', 0)
+                except Exception:
+                    pass
+            if (time.time() - last_vacuum) > interval_hours * 3600:
+                self._handle_vacuum({'project_dir': project_dir})
+
+        return {
+            "status": "ok",
+            "new_chunks": len(chunks_to_add),
+            "total_chunks": len(all_chunks),
+            "deduped": len(new_raw_chunks) - len(chunks_to_add),
+            "queue_deleted": len(queue_files),
+        }
+    def _handle_vacuum(self, req: dict) -> dict:
+        project_dir = req.get('project_dir', '')
+        if not project_dir:
+            return {'error': 'project_dir required'}
+        # Only one vacuum thread per project at a time
+        attr = f'_vacuum_thread_{hashlib.md5(project_dir.encode()).hexdigest()[:8]}'
+        existing_thread = getattr(self, attr, None)
+        if existing_thread and existing_thread.is_alive():
+            return {'status': 'already_running'}
+        t = threading.Thread(target=self._run_vacuum, args=(project_dir, attr), daemon=True)
+        setattr(self, attr, t)
+        t.start()
+        return {'status': 'accepted'}
+
+    def _run_vacuum(self, project_dir: str, thread_attr: str) -> None:
+        try:
+            from mmemory_vacuum import VacuumWorker  # type: ignore
+        except ImportError:
+            print('[mmemory] VacuumWorker not available — vacuum skipped', file=sys.stderr, flush=True)
+            return
+        dirs = self._dirs(project_dir)
+        tmp_dir = Path(project_dir) / 'tmp'
+        tmp_dir.mkdir(exist_ok=True)
+        # Clean stale tmp files older than 1 hour
+        for f in tmp_dir.glob('*'):
+            try:
+                if time.time() - f.stat().st_mtime > 3600: f.unlink()
+            except Exception: pass
+        vcfg = getattr(self, '_vacuum_config', {})
+        # Snapshot the hashes present BEFORE the worker runs. This is the baseline used
+        # to detect genuinely new chunks added by concurrent builds during worker.run().
+        # (Using the vacuum output to detect new arrivals is wrong: dropped chunks would
+        # also appear "absent" from the output and get merged back in, defeating the purge.)
+        pre_vacuum_hashes: set[str] = set()
+        if dirs['chunks'].exists():
+            try:
+                pre_vacuum_hashes = {c['hash'] for c in json.loads(dirs['chunks'].read_text())}
+            except Exception:
+                pass
+        # Run the worker outside the lock — it reads from live files but never writes to them.
+        worker = VacuumWorker(dirs['chunks'], dirs['vectors'], tmp_dir, vcfg)
+        try:
+            new_chunks_path, new_vecs_path = worker.run()
+        except Exception as e:
+            print('EXCEPTION: [mmemory] Vacuum failed: ' + str(e) + '\n' + traceback.format_exc(), file=sys.stderr, flush=True)
+            return
+        # Under lock: merge any chunks added by concurrent builds (hash NOT in pre-vacuum set),
+        # then atomically swap. Builds are blocked for the duration of this merge+swap.
+        lock = self._build_locks.setdefault(project_dir, threading.Lock())
+        with lock:
+            # Re-read current DB to capture chunks written while worker.run() was executing
+            current_main: list[dict] = []
+            if dirs['chunks'].exists():
+                try:
+                    current_main = json.loads(dirs['chunks'].read_text())
+                except Exception:
+                    pass
+            # New arrivals: chunks in current DB that were not present when vacuum started.
+            # This excludes chunks vacuum intentionally dropped (they were in pre_vacuum_hashes).
+            new_arrivals = [c for c in current_main if c.get('hash') not in pre_vacuum_hashes]
+            if new_arrivals:
+                new_hashes = {c['hash'] for c in new_arrivals}
+                new_indices = [i for i, c in enumerate(current_main) if c.get('hash') in new_hashes]
+                # Merge vectors for new_arrivals from current main DB vectors.
+                # Guard: only include indices within the vector array bounds (chunks manually
+                # appended to chunks.json without a corresponding embed have no vector row).
+                if new_indices and dirs['vectors'].exists():
+                    try:
+                        from safetensors.numpy import load_file, save_file  # type: ignore
+                        import numpy as np
+                        main_vecs = load_file(str(dirs['vectors']))
+                        main_arr = next(iter(main_vecs.values()))
+                        n_vecs = len(main_arr)
+                        valid_indices = [i for i in new_indices if i < n_vecs]
+                        surviving_vecs = load_file(str(new_vecs_path))
+                        surv_arr = next(iter(surviving_vecs.values()))
+                        if valid_indices:
+                            new_rows = main_arr[np.array(valid_indices)]
+                            combined = np.concatenate([surv_arr, new_rows], axis=0)
+                            save_file({'embeddings': combined}, str(new_vecs_path))
+                        # Chunks without vectors (valid_indices empty / partial) will be
+                        # re-embedded on the next build triggered by _invalidate.
+                    except Exception as ve:
+                        print('EXCEPTION: [mmemory] Vacuum vector merge failed: ' + str(ve) + '\n' + traceback.format_exc(), file=sys.stderr, flush=True)
+                try:
+                    surviving = json.loads(new_chunks_path.read_text())
+                    new_chunks_path.write_text(json.dumps(surviving + new_arrivals))
+                except Exception as ce:
+                    print('EXCEPTION: [mmemory] Vacuum chunk merge failed: ' + str(ce) + '\n' + traceback.format_exc(), file=sys.stderr, flush=True)
+            os.replace(new_chunks_path, dirs['chunks'])
+            os.replace(new_vecs_path, dirs['vectors'])
+            # Tiny window between the two os.replace calls where a cache-miss recall
+            # could see new chunks + stale vectors. Acceptable at this scale.
+            self._invalidate(project_dir)
+        # Write vacuum-state.json after lock release (pure metadata, not a live DB file)
+        vacuum_state_path = Path(project_dir) / 'vacuum-state.json'
+        try:
+            vacuum_state_path.write_text(json.dumps({'last_vacuum_ts': int(time.time())}))
+        except Exception: pass
+        print(f'[mmemory] Vacuum complete for {Path(project_dir).name}', file=sys.stderr, flush=True)
+        setattr(self, thread_attr, None)
+
+    def _handle_bm25(self, req: dict) -> dict:
+        project_dir = req.get('project_dir', '')
+        query = req.get('query', '')
+        limit = req.get('limit', 10)
+        if not project_dir or not query:
+            return {'error': 'project_dir and query required'}
+        dirs = self._dirs(project_dir)
+        chunks = self._get_chunks(str(dirs['chunks']))
+        idx = self._get_bm25(str(dirs['chunks']))
+        raw = bm25_search(idx, query, limit * 2)
+        results = [{'text': chunks[i].get('text', ''), 'source': chunks[i].get('source', 'session'),
+                    'ts': chunks[i].get('ts', 0), 'score': s} for i, s in raw if i < len(chunks)]
+        return {'results': results[:limit], 'query': query}
 
     def _handle_dedup_check(self, req: dict) -> dict:
         self._load_model()
@@ -791,10 +1023,9 @@ class MmemoryServer:
     def _handle_clear(self, req: dict) -> dict:
         """Remove chunks matching a date range or session ID from chunks.json.
 
-        Runs under _build_lock so it cannot race with an in-flight build.
-        Deletes vectors.safetensors and vectors.meta.json after pruning so the
-        index re-syncs with the trimmed chunks.json on the next build.
-
+        Runs under the per-project build lock so it cannot race with an in-flight build.
+        Deletes vectors.safetensors after pruning so the index re-syncs with the
+        trimmed chunks.json on the next build.
         Request fields:
           project_dir   required
           from_date     optional  YYYY-MM-DD  remove chunks on or after this date
@@ -811,11 +1042,10 @@ class MmemoryServer:
         if not from_date and not to_date and not session_id:
             return {"error": "from_date, to_date, or session_id required"}
 
-        with self._build_lock:
+        with self._build_locks.setdefault(project_dir, threading.Lock()):
             dirs = self._dirs(project_dir)
             chunks_path = dirs["chunks"]
             vectors_path = dirs["vectors"]
-            vectors_meta_path = dirs["vectors_meta"]
 
             if not chunks_path.exists():
                 return {"status": "ok", "deleted": 0, "remaining": 0}
@@ -849,7 +1079,6 @@ class MmemoryServer:
                 tmp.replace(chunks_path)
                 # Vectors are now out of sync — remove so they rebuild on next recall
                 vectors_path.unlink(missing_ok=True)
-                vectors_meta_path.unlink(missing_ok=True)
                 self._invalidate(project_dir)
                 print(
                     f"[mmemory] Clear: removed {deleted} chunk(s), {len(keep)} remain.",
@@ -858,7 +1087,150 @@ class MmemoryServer:
 
             return {"status": "ok", "deleted": deleted, "remaining": len(keep)}
 
+
+    def _handle_get_consolidation_chunks(self, req: dict) -> dict:
+        """Return unprocessed session chunks for consolidation.
+
+        Returns session chunks with ts > max(observation.end_ts).
+        If count >= threshold, returns chunk texts+timestamps for LLM consolidation.
+        If count < threshold, returns empty list with count.
+
+        Request fields:
+          project_dir  required
+          threshold    required  int  min unprocessed turns to trigger
+          max_turns    optional  int  cap on returned chunks (default 50)
+        """
+        project_dir: str = req.get('project_dir', '')
+        threshold: int = int(req.get('threshold', 10))
+        max_turns: int = int(req.get('max_turns', 50))
+
+        if not project_dir:
+            return {'error': 'project_dir required'}
+
+        dirs = self._dirs(project_dir)
+        chunks = self._get_chunks(str(dirs['chunks']))
+
+        # Compute watermark: max end_ts across observation chunks
+        obs_chunks = [c for c in chunks if c.get('source') == 'observation']
+        last_obs_end_ts = max((c.get('end_ts', c.get('ts', 0)) for c in obs_chunks), default=0)
+
+        # Get unprocessed session chunks (ts > watermark)
+        unprocessed = [
+            c for c in chunks
+            if c.get('source') == 'session' and c.get('ts', 0) > last_obs_end_ts
+        ]
+        count = len(unprocessed)
+
+        if count < threshold:
+            return {'chunks': [], 'count': count, 'watermark': last_obs_end_ts}
+
+        # Cap and sort by ts ascending (oldest first for LLM context)
+        unprocessed.sort(key=lambda c: c.get('ts', 0))
+        capped = unprocessed[:max_turns]
+
+        return {
+            'chunks': [
+                {
+                    'text': c.get('text', ''),
+                    'ts': c.get('ts', 0),
+                    'end_ts': c.get('end_ts', c.get('ts', 0)),
+                    'path': c.get('path', ''),
+                }
+                for c in capped
+            ],
+            'count': count,
+            'start_ts': capped[0].get('ts', 0),
+            'end_ts': capped[-1].get('ts', 0),
+            'watermark': last_obs_end_ts,
+        }
     # ── Request dispatcher ────────────────────────────────────────────────────
+
+    def _handle_injection_snapshot(self, req: dict) -> dict:
+        """Return a structured snapshot for system prompt injection.
+
+        Algorithm:
+          1. sessions      = project chunks, source=session, ORDER ts DESC LIMIT session_limit → reversed
+          2. anchor_ts     = min(ts) across sessions, or 0 if none
+          3. observations  = source=observation, end_ts < anchor_ts (STRICT), ORDER end_ts DESC LIMIT obs_limit → reversed
+          4. files         = source=file, ORDER ts DESC LIMIT file_limit → reversed
+          5. Safety net: if total chars > max_chars, drop newest sessions only
+             (observations and files are NEVER dropped)
+        """
+        project_dir     = req.get("project_dir", "")
+        project         = req.get("project", "")
+        session_limit   = int(req.get("session_limit",   5))
+        obs_limit       = int(req.get("observation_limit", 3))
+        file_limit      = int(req.get("file_limit",  5))
+        max_chars       = int(req.get("max_chars",  8000))
+
+        dirs   = self._dirs(project_dir)
+        all_chunks = self._get_chunks(str(dirs["chunks"]))
+
+        # Filter to project if specified
+        if project:
+            all_chunks = [c for c in all_chunks if c.get("project") == project]
+
+        def _fmt(c: dict) -> dict:
+            """Return the fields relevant for injection."""
+            out: dict = {"text": c.get("text", ""), "ts": c.get("ts", 0)}
+            if c.get("end_ts") is not None: out["end_ts"] = c["end_ts"]
+            if c.get("path"):               out["path"]   = c["path"]
+            if c.get("date"):               out["date"]   = c["date"]
+            if c.get("action"):             out["action"]  = c["action"]
+            return out
+
+        # Step 1 — sessions
+        sess_chunks = sorted(
+            [c for c in all_chunks if c.get("source") == "session"],
+            key=lambda c: c.get("ts", 0), reverse=True
+        )[:session_limit]
+        sess_chunks = list(reversed(sess_chunks))  # oldest→newest
+
+        # Step 2 — anchor
+        anchor_ts = min((c.get("ts", 0) for c in sess_chunks), default=0)
+
+        # Step 3 — observations (strict boundary)
+        # Include obs whose end_ts predates the session window (dedup: obs already
+        # summarised those sessions so showing them again wastes tokens).
+        # Fallback: if the strict filter returns nothing, the DB may be small (all sessions
+        # in window). Only fall back when obs actually overlap with the session ts range
+        # — i.e. obs.end_ts <= max(session.ts). This avoids including future observations
+        # that simply haven't been reached yet.
+        all_obs = [c for c in all_chunks if c.get("source") == "observation"]
+        obs_chunks = sorted(
+            [c for c in all_obs if c.get("end_ts", 0) < anchor_ts],
+            key=lambda c: c.get("end_ts", 0), reverse=True
+        )[:obs_limit]
+        if not obs_chunks and all_obs and sess_chunks:
+            max_sess_ts = max(c.get("ts", 0) for c in sess_chunks)
+            # Obs that overlap with the session ts range (end_ts within [anchor_ts, max_sess_ts])
+            overlapping = [c for c in all_obs if anchor_ts <= c.get("end_ts", 0) <= max_sess_ts]
+            if overlapping:
+                # Window covers all sessions — include K most recent overlapping obs
+                obs_chunks = sorted(overlapping, key=lambda c: c.get("end_ts", 0), reverse=True)[:obs_limit]
+        obs_chunks = list(reversed(obs_chunks))  # oldest→newest
+
+        # Step 4 — files
+        file_chunks = sorted(
+            [c for c in all_chunks if c.get("source") == "file"],
+            key=lambda c: c.get("ts", 0), reverse=True
+        )[:file_limit]
+        file_chunks = list(reversed(file_chunks))  # oldest→newest
+
+        # Step 5 — safety net: drop newest sessions only
+        total = sum(len(c.get("text", "")) for c in sess_chunks + obs_chunks + file_chunks)
+        while total > max_chars and sess_chunks:
+            dropped = sess_chunks.pop()  # drop newest (last after reversal)
+            total  -= len(dropped.get("text", ""))
+
+        return {
+            "status":       "ok",
+            "sessions":     [_fmt(c) for c in sess_chunks],
+            "observations": [_fmt(c) for c in obs_chunks],
+            "files":        [_fmt(c) for c in file_chunks],
+            "anchor_ts":    anchor_ts,
+        }
+
 
     def _handle_request(self, data: str) -> dict:
         try:
@@ -876,6 +1248,10 @@ class MmemoryServer:
             "clear":        self._handle_clear,
             "dedup_check":  self._handle_dedup_check,
             "embed":        self._handle_embed,
+            "bm25":         self._handle_bm25,
+            "vacuum":                    self._handle_vacuum,
+            "get_consolidation_chunks":  self._handle_get_consolidation_chunks,
+            "get_injection_snapshot":    self._handle_injection_snapshot,
         }.get(action)
         if not handler:
             return {"error": f"unknown action: {action}"}
@@ -884,7 +1260,9 @@ class MmemoryServer:
         try:
             return handler(req)
         except Exception as e:
-            return {"error": str(e)}
+            tb = traceback.format_exc()
+            print(f"EXCEPTION: [mmemory] request handler: {e}\n{tb}", file=sys.stderr, flush=True)
+            return {"error": str(e), "traceback": tb}
 
     # ── Client connection ─────────────────────────────────────────────────────
 
@@ -915,6 +1293,13 @@ class MmemoryServer:
     def _idle_watchdog(self) -> None:
         while self.running:
             time.sleep(5)
+            # Don't terminate while any vacuum thread is running
+            for attr in dir(self):
+                if attr.startswith('_vacuum_thread_'):
+                    t = getattr(self, attr, None)
+                    if t and t.is_alive():
+                        self.last_activity = time.time()  # reset idle timer
+                        break
             if time.time() - self.last_activity > self.timeout:
                 print(f"[mmemory] Idle timeout ({self.timeout}s). Shutting down.", file=sys.stderr, flush=True)
                 self.running = False

@@ -9,7 +9,7 @@
  * Responsibilities:
  *   - Auto-recall on first agent turn (inject <memories> into system prompt)
  *   - Auto-retain on agent_end (every N turns) — suppressed for subagents (taskDepth > 0)
- *   - .memory prefix → inject <memory_mode> directive
+ *   - .memory / .mem / memory triggers → LLM resolves via mme-*.tool-desc.md (no hardcoded prefix)
  *   - session.compacting → inject recall snippet into compaction context
  *   - Server lifecycle (shared via getOrCreateServerClient in tools/mmemory/index.ts)
  */
@@ -20,25 +20,22 @@ import { settings } from "./config/settings";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "./extensibility/extensions";
 import type { ReadonlySessionManager } from "./session/session-manager";
-import { completeSimple, validateToolCall } from "@oh-my-pi/pi-ai";
-import type { ToolCall } from "@oh-my-pi/pi-ai";
-import { Type } from "@sinclair/typebox";
-import { resolveRoleModel } from "./utils/m-utils";
 import {
 	STRIP_TAGS_REGEX,
+	buildConsolidateFn,
 	composeRecallQuery,
 	disposeServerClient,
 	executeMemoryBuild,
-	executeMemoryExtract,
+	executeMemoryConsolidate,
 	executeMemoryRecall,
 	formatRecallForSystemPrompt,
+	getOrCreateServerClient,
 	loadMentalModels,
 	loadMmemoryConfig,
 	resolvePaths,
 	sessionFilename,
 	truncateRecallQuery,
 } from "./tools/mmemory/index";
-import { getRecallScope } from "./tools/mmemory/session-scope";
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -49,9 +46,13 @@ interface MmemorySessionState {
 	readonly sessionStartTime: Date;
 	lastRecallSnippet: string | undefined;
 	mentalModelsSnippet: string | undefined;
-	hasRecalledForFirstTurn: boolean;
 	lastRetainedTurn: number;
 	turnCount: number;
+	consolidationPending: boolean;
+	lastConsolidationTs: number;
+	lastConsolidationPollAt: number;
+	/** Chunks fetched by maybePollConsolidation, waiting for agent_end to execute LLM call. */
+	pendingConsolidationChunks: unknown[] | null;
 }
 
 function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
@@ -125,9 +126,12 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 		sessionStartTime,
 		lastRecallSnippet: undefined,
 		mentalModelsSnippet: undefined,
-		hasRecalledForFirstTurn: false,
 		lastRetainedTurn: 0,
 		turnCount: 0,
+		consolidationPending: false,
+		lastConsolidationTs: 0,
+		lastConsolidationPollAt: 0,
+		pendingConsolidationChunks: null,
 	};
 }
 
@@ -169,14 +173,23 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 		const userText = rawUser.replace(STRIP_TAGS_REGEX, "").trim();
 		if (!userText) continue;
 
-		const rawAsst = Array.isArray(aMsg.content)
-			? (aMsg.content as { type: string; text?: string }[])
-				.filter(c => c.type === "text")
-				.map(c => c.text ?? "")
-				.join(" ")
-			: String(aMsg.content ?? "");
-		const assistantText = rawAsst.replace(STRIP_TAGS_REGEX, "").trim();
-
+	// Include assistant text and tool calls; exclude tool results (user-role messages).
+	// Follows the same pattern as compaction/utils.ts summariseMessages.
+	const textParts: string[] = [];
+	const toolCallParts: string[] = [];
+	for (const block of (aMsg.content as { type: string; text?: string; name?: string; arguments?: Record<string, unknown> }[])) {
+		if (block.type === "text" && block.text) {
+			textParts.push(block.text);
+		} else if (block.type === "toolCall" && block.name) {
+			// Compact format: name(firstPathArg) or name() — enough to know what ran.
+			const args = block.arguments ?? {};
+			const firstVal = Object.values(args)[0];
+			const argStr = typeof firstVal === "string" ? firstVal.slice(0, 80) : "";
+			toolCallParts.push(`→ ${block.name}(${argStr})`);
+		}
+	}
+	const rawAsst = [...textParts, ...(toolCallParts.length ? [toolCallParts.join(", ")] : [])].join("\n");
+	const assistantText = rawAsst.replace(STRIP_TAGS_REGEX, "").trim();
 		pairs.unshift({ user: userText, assistant: assistantText });
 	}
 
@@ -205,79 +218,17 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 	return { transcript: result, pairsFound, userSkipped };
 }
 
-async function extractFromTranscript(
-	transcript: string,
-	config: import("./tools/mmemory/index").MmemoryConfig,
-	ctx: ExtensionContext,
-): Promise<void> {
-	const registry = ctx.modelRegistry;
-	const model = resolveRoleModel(config.modelRole, registry, settings, ["memory"]);
-	if (!model) return;
 
-	// Use a tool call to force structured output — plain text prompts let the model
-	// return code blocks, prose preambles, or empty arrays instead of valid JSON.
-	const ExtractionTool = {
-		name: "store_facts",
-		description: "Store durable facts extracted from the conversation.",
-		parameters: Type.Object({
-			facts: Type.Array(
-				Type.Object({
-					fact:     Type.String({ description: "One concise sentence stating a durable fact." }),
-					entities: Type.Array(Type.String(), { description: "Key names, paths, or concepts." }),
-					date:     Type.String({ description: "YYYY-MM-DD — use today if unknown." }),
-				}),
-			),
-		}),
-	};
-
-	const systemPrompt =
-		`You are a precise knowledge extractor. ` +
-		`Extract durable technical facts from the conversation transcript: decisions made, bugs fixed, ` +
-		`config values, constraints, and conventions that will be useful in future sessions. ` +
-		`Omit transient details, resolved errors, and anything not useful across sessions. ` +
-		`If nothing durable is present, call store_facts with an empty array.`;
-
-	const userPrompt = transcript.length > 8000 ? transcript.slice(0, 8000) : transcript;
-
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt,
-			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
-			tools: [ExtractionTool],
-		},
-		{ apiKey, maxTokens: 1024 },
-	);
-
-	if (response.stopReason === "error" || !response.content) return;
-
-	// Extract the tool call — fall back to text parsing if the model didn't use the tool.
-	const toolCall = response.content.find(
-		(c: { type: string }) => c.type === "toolCall",
-	) as ToolCall | undefined;
-
-	await executeMemoryExtract(config, async () => {
-		if (toolCall?.name === "store_facts") {
-			try {
-				const validated = validateToolCall([ExtractionTool], toolCall) as { facts: unknown[] };
-				return JSON.stringify(validated.facts);
-			} catch {
-				// fall through to text parse
-			}
-		}
-		// Fallback: model responded with text — try to extract JSON from it
-		return (response.content ?? [])
-			.filter((c: { type: string; text?: string }) => c.type === "text")
-			.map((c: { type: string; text?: string }) => c.text ?? "")
-			.join("");
-	});
-}
 
 async function retainSession(
 	state: MmemorySessionState,
 	messages: { role: string; content: unknown }[],
 	ctx: ExtensionContext | null,
+	note?: string,
 ): Promise<void> {
+	// DEBUG (cleanup when stable): log every retain attempt
+	logger.debug(`[mmemory] retainSession: session=${state.sessionId} messages=${messages.length} note=${note ? "yes" : "no"}`, { source: "mmemory" });
+
 	const userCount = messages.filter(m => m.role === "user").length;
 	logger.debug(
 		`[mmemory] buildTranscript: total=${messages.length} user=${userCount} contextTurns=${state.config.retainContextTurns} maxChars=${state.config.maxTranscriptChars}`,
@@ -299,21 +250,60 @@ async function retainSession(
 	const filePath = path.join(state.queueDir, filename);
 
 	const projectLabel = state.config.projectLabel;
-	const frontmatter = `---\nproject: ${projectLabel}\nagent_tag: ${state.config.agentTag}\nsource: session\nsession_id: ${state.sessionId}\nts: ${Math.floor(state.sessionStartTime.getTime() / 1000)}\n---\n\n`;
+
+	// Collect file paths from tool calls in this session's messages.
+	// read_files: paths passed to read() / search() / find()
+	// modified_files: paths written by edit() / write() / notebook()
+	// written_files: paths created fresh by write()
+	const readFiles  = new Set<string>();
+	const modFiles   = new Set<string>();
+	const writtenFiles = new Set<string>();
+	for (const msg of messages) {
+		if (msg.role !== "assistant") continue;
+		const parts = Array.isArray(msg.content) ? msg.content as import("@oh-my-pi/pi-ai").ToolCall[] : [];
+		for (const part of parts) {
+			if (part.type !== "toolCall") continue;
+			const name = part.name;
+			const args = part.arguments ?? {};
+		const rawP  = (args["path"] as string | undefined)?.replace(/\\/g, "/") ?? "";
+		if (!rawP || rawP.startsWith("http") || rawP.includes("*")) continue;
+		// Resolve to absolute path — plan requires absolute paths in file chunks.
+		const cwd = ctx?.sessionManager.getCwd().replace(/\\/g, "/") ?? "";
+		const p   = (rawP.startsWith("/") || /^[a-zA-Z]:/.test(rawP))
+			? rawP
+			: cwd ? `${cwd}/${rawP}` : rawP;
+		// Skip directories — only track actual files. Client has full fs context.
+		try { if (fs.statSync(p).isDirectory()) continue; } catch { /* not on disk yet or inaccessible — keep */ }
+			if (name === "read" || name === "search" || name === "find") {
+				readFiles.add(p);
+			} else if (name === "edit" || name === "notebook" || name === "ast_edit") {
+				modFiles.add(p);
+			} else if (name === "write") {
+				writtenFiles.add(p);
+				modFiles.add(p);
+			}
+		}
+	}
+	const fmFiles = (arr: Set<string>) =>
+		arr.size ? ` [${[...arr].map(p => `"${p}"`).join(", ")}]` : " []";
+	const frontmatter =
+		`---\nproject: ${projectLabel}\nagent_tag: ${state.config.agentTag}\nsource: session\n` +
+		`session_id: ${state.sessionId}\nts: ${Math.floor(state.sessionStartTime.getTime() / 1000)}\n` +
+		`read_files:${fmFiles(readFiles)}\nmodified_files:${fmFiles(modFiles)}\nwritten_files:${fmFiles(writtenFiles)}\n---\n\n`;
+	const noteSection = note ? `\n\n**Note:** ${note}` : "";
 	fs.writeFileSync(
 		filePath,
-		`${frontmatter}# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}`,
+		`${frontmatter}# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}${noteSection}`,
 		"utf-8",
 	);
+	// DEBUG (cleanup when stable): log queue file written
+	logger.debug(`[mmemory] retainSession: wrote queue file=${filename} transcriptLen=${transcript.length}`, { source: "mmemory" });
 	logger.debug(`[mmemory] queue file written: ${filename} (${transcript.length} chars)`, { source: "mmemory" });
-	if (state.config.extractionMode === "structured" && ctx) {
-		logger.debug("[mmemory] scheduling structured extraction", { source: "mmemory" });
-		void extractFromTranscript(transcript, state.config, ctx).catch(e => logger.debug(`[mmemory] extraction failed: ${e}`, { source: "mmemory" }));
-	}
+
 
 	// Server reads queue/*.md, embeds new chunks, deletes processed .md files
 	logger.debug("[mmemory] scheduling build", { source: "mmemory" });
-	void executeMemoryBuild(state.config).catch(e => logger.warn(`[mmemory] build failed: ${e}`, { source: "mmemory" }));
+	void executeMemoryBuild(state.config).catch(e => logger.error(`EXCEPTION: [mmemory] build failed: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" }));
 }
 
 // ── Extension factory ─────────────────────────────────────────────────────────
@@ -340,6 +330,29 @@ export function getMmemorySessionConfig(
 	return sessionMap.get(ctx.sessionManager)?.config ?? null;
 }
 
+/**
+ * Returns the recall snippet that was injected at session start (the snapshot
+ * the agent is currently reasoning with). Used by /mmemory view so the panel
+ * always shows exactly what was injected — not a fresh re-query that picks up
+ * chunks added mid-session.
+ *
+ * Returns undefined if recall hasn't fired yet (server still starting) or if
+ * the session is not tracked (subagent / mmemory disabled).
+ */
+export function getMmemorySessionSnippet(
+	ctx: import("./extensibility/extensions").ExtensionContext,
+): string | undefined {
+	return sessionMap.get(ctx.sessionManager)?.lastRecallSnippet;
+}
+
+
+/** Returns the live mmemory session state for a session manager, or undefined. */
+export function getMmemorySessionState(
+	sessionManager: import("./session/session-manager").SessionManager,
+): MmemorySessionState | undefined {
+	return sessionMap.get(sessionManager);
+}
+
 
 // ── Mental models cache invalidation ─────────────────────────────────────────
 //
@@ -352,110 +365,167 @@ export function invalidateMentalModelsCache(projectDir: string): void {
 	pendingMentalModelReload.add(projectDir);
 }
 
+/**
+ * Force an unconditional retain from a slash command or other external caller.
+ * Bypasses the retainEveryNTurns gate. Resets lastRetainedTurn so the periodic
+ * timer restarts from this point. No-ops if autoRetain is disabled or the session
+ * has no messages.
+ */
+export async function executeManualRetain(
+	ctx: import("./extensibility/extensions").ExtensionContext,
+	note?: string,
+): Promise<{ written: boolean; reason?: string }> {
+	const state = sessionMap.get(ctx.sessionManager);
+	if (!state) return { written: false, reason: "no mmemory session" };
+	if (!state.config.autoRetain) return { written: false, reason: "autoRetain disabled" };
+	const messages = ctx.sessionManager
+		.getEntries()
+		.filter((e): e is import("./session/session-manager").SessionMessageEntry => e.type === "message")
+		.map(e => e.message as { role: string; content: unknown });
+	if (messages.length === 0) return { written: false, reason: "no messages" };
+	state.lastRetainedTurn = state.turnCount;
+	logger.debug(`[mmemory] manual retain: session=${state.sessionId} messages=${messages.length}`, { source: "mmemory" });
+	await retainSession(state, messages, ctx, note);
+	return { written: true };
+}
+
 export function createMmemoryExtension(api: ExtensionAPI): void {
 	api.setLabel("mmemory");
 
+/**
+ * Fire the consolidation poll unconditionally. Checks the server for enough
+ * unprocessed session chunks, calls executeMemoryConsolidate if threshold met.
+ * Always updates lastConsolidationPollAt so repeated calls within the same
+ * interval are cheap no-ops. Safe to call from session_start or agent_end.
+ */
+/**
+ * Phase 1: fetch unprocessed chunks from server and stash on state.
+ * Safe to call at session_start — no LLM key needed.
+ * No-ops if called within the poll interval.
+ */
+function maybePollConsolidation(state: MmemorySessionState, _ctx: ExtensionContext): void {
+	const now = Date.now();
+	// DEBUG (cleanup when stable): log every poll call including skipped ones
+	const _elapsed = now - (state.lastConsolidationPollAt ?? 0);
+	const _interval = state.config.consolidationPollIntervalMinutes * 60 * 1000;
+	logger.debug(`[mmemory] maybePollConsolidation: elapsed=${Math.round(_elapsed/1000)}s interval=${Math.round(_interval/1000)}s willSkip=${_elapsed <= _interval}`, { source: "mmemory" });
+
+	if (now - (state.lastConsolidationPollAt ?? 0) <= state.config.consolidationPollIntervalMinutes * 60 * 1000) return;
+	state.lastConsolidationPollAt = now;
+	void getOrCreateServerClient(state.config).then(async (client) => {
+		const resp = await client.query("get_consolidation_chunks", {
+			project_dir: state.config.storageRoot,
+			threshold:   state.config.consolidationMinTurns,
+			max_turns:   state.config.consolidationMaxTurns,
+		}) as any;
+		if (resp?.chunks?.length) {
+			state.pendingConsolidationChunks = resp.chunks;
+			logger.debug(`[mmemory] consolidation: ${resp.chunks.length} chunks queued for next agent_end`, { source: "mmemory" });
+		} else {
+			logger.debug(`[mmemory] maybePollConsolidation: server returned no chunks count=${resp?.count ?? 0} watermark=${resp?.watermark ?? 0} threshold=${state.config.consolidationMinTurns}`, { source: "mmemory" });
+		}
+	}).catch(e => logger.error(`EXCEPTION: [mmemory] consolidation poll error: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" }));
+}
+
+/**
+ * Phase 2: execute the LLM consolidation call with the chunks stashed by maybePollConsolidation.
+ * Called at agent_end where modelRegistry has a live API key.
+ * Clears pendingConsolidationChunks regardless of outcome.
+ */
+async function drainPendingConsolidation(state: MmemorySessionState, ctx: ExtensionContext): Promise<void> {
+	const chunks = state.pendingConsolidationChunks;
+	if (!chunks?.length) {
+		logger.debug(`[mmemory] drain: no pending chunks`, { source: "mmemory" });
+		return;
+	}
+	state.pendingConsolidationChunks = null;
+	logger.debug(`[mmemory] drain: executing consolidation for ${chunks.length} chunks`, { source: "mmemory" });
+	try {
+		const fn = buildConsolidateFn(state.config, ctx.modelRegistry, undefined);
+		const result = await executeMemoryConsolidate(chunks as any, state.config, fn);
+		const msg = `[mmemory] drain: consolidation complete — obs=${result.observationCount} skipped=${result.skipped} msg=${result.message}`;
+		if (result.observationCount === 0 && !result.skipped) {
+			logger.warn(msg, { source: "mmemory" });
+		} else {
+			logger.debug(msg, { source: "mmemory" });
+		}
+	} catch (e) {
+		logger.error(`EXCEPTION: [mmemory] drain: consolidation error: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" });
+	}
+}
+
+	// DEBUG (cleanup when stable): log every session_start — tracks session identity, config, and what fires on load
 	api.on("session_start", (_event, ctx) => {
 		const state = createSessionState(ctx);
-		if (!state) return;
+		if (!state) {
+			logger.debug("[mmemory] session_start: no state created (mmemory disabled?)", { source: "mmemory" });
+			return;
+		}
 		sessionMap.set(ctx.sessionManager, state);
-		logger.debug(`[mmemory] session started: ${state.sessionId} storageRoot=${state.config.storageRoot} extractionMode=${state.config.extractionMode} retainEvery=${state.config.retainEveryNTurns}`, { source: "mmemory" });
+		logger.debug(
+			`[mmemory] session_start: session=${state.sessionId} storageRoot=${state.config.storageRoot}` +
+			` retainEvery=${state.config.retainEveryNTurns} autoRetain=${state.config.autoRetain}` +
+			` consolidationMinTurns=${state.config.consolidationMinTurns} pollInterval=${state.config.consolidationPollIntervalMinutes}min`,
+			{ source: "mmemory" },
+		);
 	});
 
+	// DEBUG (cleanup when stable): every turn entry — tracks injection, recall, and system prompt modification
 	api.on("before_agent_start", async (event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
-		if (!state) return undefined;
-
-		state.turnCount++;
-		const prompt = (event as { prompt?: string }).prompt ?? "";
-		const systemPrompt = (event as { systemPrompt?: string }).systemPrompt ?? "";
-
-		// .memory prefix — inject memory_mode directive
-		if (prompt.startsWith(".memory ")) {
-			const query = prompt.slice(".memory ".length).trim();
-			return {
-				systemPrompt:
-					systemPrompt.trimEnd() +
-					"\n\n<memory_mode>\n" +
-					"Direct memory request. Use mmemory_recall, mmemory_retain, or mmemory_reflect " +
-					"immediately based on the user's intent.\n" +
-					`Query: ${query}\n` +
-					"</memory_mode>",
-			};
+		if (!state) {
+			logger.debug("[mmemory] before_agent_start: no state in sessionMap — injection skipped", { source: "mmemory" });
+			return undefined;
 		}
-
-		// Lazy-load mental models on first turn; reload when invalidated by /mmemory mm regenerate
+		state.turnCount++;
+		// DEBUG (cleanup when stable): log turn count
+		logger.debug(`[mmemory] before_agent_start: turn=${state.turnCount}`, { source: "mmemory" });
+		// Mental models: lazy-load once, reload on invalidation
 		const mmProjectDir = resolvePaths(state.config).projectDir;
-		const needsReload = pendingMentalModelReload.has(mmProjectDir);
+		const needsReload  = pendingMentalModelReload.has(mmProjectDir);
 		if (state.mentalModelsSnippet === undefined || needsReload) {
 			if (needsReload) pendingMentalModelReload.delete(mmProjectDir);
 			state.mentalModelsSnippet = await loadMentalModels(state.config).catch(() => "");
+			logger.debug(`[mmemory] before_agent_start: mental models len=${state.mentalModelsSnippet?.length ?? 0}`, { source: "mmemory" });
 		}
-
-		// First turn: recall and cache snippet for subsequent turns
-		if (!state.hasRecalledForFirstTurn) {
-			state.hasRecalledForFirstTurn = true;
-			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
-			const rawQuery = composeRecallQuery(prompt, messages, state.config.retainContextTurns);
-			const query = truncateRecallQuery(rawQuery, prompt, state.config.recallMaxQueryChars);
-			logger.debug(`[mmemory] first-turn recall: query=${query.slice(0, 80)}...`, { source: "mmemory" });
-			const result = await executeMemoryRecall(
-				query, getRecallScope(ctx.sessionManager), state.config, ctx.modelRegistry, settings,
-			).catch((e) => {
-				logger.debug(`[mmemory] recall failed: ${e}`, { source: "mmemory" });
-				// Reset flag so next turn retries — server may not have been ready yet.
-				state.hasRecalledForFirstTurn = false;
-				return null;
-			});
-			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
-			if (snippet) {
-				state.lastRecallSnippet = snippet;
-				logger.debug(`[mmemory] recall injected: ${result?.resultCount} results`, { source: "mmemory" });
-			} else {
-				logger.debug("[mmemory] recall: no results to inject", { source: "mmemory" });
-			}
-		}
-
-		// Inject mental models on every turn (after lazy-load ensures they're available)
-		const mmBlock = state.mentalModelsSnippet
-			? `<mental_models>\n${state.mentalModelsSnippet}\n</mental_models>`
-			: undefined;
-
-		if (state.lastRecallSnippet || mmBlock) {
-			let extra = systemPrompt.trimEnd();
-			if (state.lastRecallSnippet) extra += "\n\n" + state.lastRecallSnippet;
-			if (mmBlock) extra += "\n\n" + mmBlock;
-			return { systemPrompt: extra };
-		}
-
 		return undefined;
 	});
 
-	api.on("agent_end", async (event, ctx) => {
+	// DEBUG (cleanup when stable): every turn exit — tracks retain cadence and consolidation drain
+	api.on("agent_end", async (_event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
-		if (!state?.config.autoRetain) return;
+		if (!state) {
+			logger.debug("[mmemory] agent_end: no state — skipping", { source: "mmemory" });
+			return;
+		}
 		const due = state.turnCount - state.lastRetainedTurn >= state.config.retainEveryNTurns;
-		logger.debug(`[mmemory] agent_end: turn=${state.turnCount} lastRetained=${state.lastRetainedTurn} every=${state.config.retainEveryNTurns} due=${due}`, { source: "mmemory" });
-		if (!due) return;
+		logger.debug(
+			`[mmemory] agent_end: turn=${state.turnCount} lastRetained=${state.lastRetainedTurn}` +
+			` every=${state.config.retainEveryNTurns} due=${due}` +
+			` pendingConsolidChunks=${state.pendingConsolidationChunks?.length ?? "null"}`,
+			{ source: "mmemory" },
+		);
 
-		// agent_end only carries messages added this turn (new assistant + tool results).
-		// We need the full conversation history to build a meaningful transcript.
-		const messages = ctx.sessionManager
-			.getEntries()
-			.filter((e): e is import("./session/session-manager").SessionMessageEntry => e.type === "message")
-			.map(e => e.message as { role: string; content: unknown });
-		state.lastRetainedTurn = state.turnCount;
-		logger.debug(`[mmemory] retain firing: session=${state.sessionId} messages=${messages.length}`, { source: "mmemory" });
-		void retainSession(state, messages, ctx).catch((e) => {
-			logger.warn(`[mmemory] retain failed: ${e}`, { source: "mmemory" });
-		});
+		if (due && state.config.autoRetain) {
+			const messages = ctx.sessionManager
+				.getEntries()
+				.filter((e): e is import("./session/session-manager").SessionMessageEntry => e.type === "message")
+				.map(e => e.message as { role: string; content: unknown });
+			state.lastRetainedTurn = state.turnCount;
+			logger.debug(`[mmemory] agent_end: retain firing session=${state.sessionId} messages=${messages.length}`, { source: "mmemory" });
+			void retainSession(state, messages, ctx).catch((e) => {
+				logger.error(`EXCEPTION: [mmemory] agent_end: retain failed: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" });
+			});
+		}
+
+		void drainPendingConsolidation(state, ctx).then(() => maybePollConsolidation(state, ctx));
 	});
-
 	api.on("session.compacting", async (event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) return undefined;
-
 		const messages: AgentMessage[] = event.messages ?? [];
+		// DEBUG (cleanup when stable): log compaction recall trigger
+		logger.debug(`[mmemory] session.compacting: messages=${messages.length}`, { source: "mmemory" });
 		const firstUser = messages.find(m => m.role === "user");
 		const rawPrompt = firstUser
 			? (Array.isArray(firstUser.content)
@@ -471,16 +541,20 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 			messages as { role: string; content: unknown }[],
 			state.config.retainContextTurns,
 		);
-		const query = truncateRecallQuery(rawQuery, rawPrompt, state.config.recallMaxQueryChars);
+		const query = truncateRecallQuery(rawQuery, rawPrompt, state.config.recall.maxQueryChars);
 
 		const result = await executeMemoryRecall(query, undefined, state.config).catch(() => null);
 		const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
+		// DEBUG (cleanup when stable): log compaction recall result
+		logger.debug(`[mmemory] session.compacting: recall result=${snippet ? "yes len=" + snippet.length : "no snippet"}`, { source: "mmemory" });
 		return snippet ? { context: [snippet] } : undefined;
 	});
 
 	api.on("session_shutdown", async (_event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) return;
+		// DEBUG (cleanup when stable): log every shutdown
+		logger.debug(`[mmemory] session_shutdown: session=${state.sessionId} turnCount=${state.turnCount} lastRetained=${state.lastRetainedTurn}`, { source: "mmemory" });
 		// P4-3: retain on shutdown to capture content since the last periodic retain.
 		// Only fires if autoRetain is on and there's been at least one turn since last retain.
 		if (state.config.autoRetain && state.turnCount > state.lastRetainedTurn) {
@@ -490,8 +564,10 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 				.map(e => e.message as { role: string; content: unknown });
 			logger.debug(`[mmemory] shutdown retain: session=${state.sessionId} turns_since_last=${state.turnCount - state.lastRetainedTurn}`, { source: "mmemory" });
 			await retainSession(state, messages, ctx).catch(e =>
-				logger.warn(`[mmemory] shutdown retain failed: ${e}`, { source: "mmemory" }),
+				logger.error(`EXCEPTION: [mmemory] shutdown retain failed: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" }),
 			);
+		} else {
+			logger.debug(`[mmemory] session_shutdown: retain skipped — no new turns or autoRetain disabled`, { source: "mmemory" });
 		}
 		disposeServerClient(state.config);
 		sessionMap.delete(ctx.sessionManager);

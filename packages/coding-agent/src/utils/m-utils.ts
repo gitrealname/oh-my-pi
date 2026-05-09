@@ -113,7 +113,10 @@
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { completeSimple, type CompleteSimpleOptions } from "@oh-my-pi/pi-ai";
+import { Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { getAgentDir, logger } from "@oh-my-pi/pi-utils";
+import { DynamicBorder } from "../modes/components/dynamic-border";
+import { getMarkdownTheme, theme } from "../modes/theme/theme";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -154,14 +157,20 @@ export function createSidecar(sidecarPath: string, embedded: string): () => stri
 	let cached: string | undefined;
 	return function resolve(): string {
 		if (cached !== undefined) return cached;
+		// Attempt to load from the user-editable sidecar file.
+		let fromFile: string | undefined;
 		try {
 			const { mtimeMs } = statSync(sidecarPath);
 			if (mtimeMs >= BUILD_TIME.getTime()) {
-				cached = readFileSync(sidecarPath, "utf-8");
-				return cached;
+				fromFile = readFileSync(sidecarPath, "utf-8");
 			}
 		} catch {
-			// Missing or unreadable — fall through to flush
+			// Missing or unreadable — fall through to embedded
+		}
+		if (fromFile !== undefined) {
+			if (!fromFile) throw new Error(`[createSidecar] sidecar file is empty: ${sidecarPath}`);
+			cached = fromFile;
+			return cached;
 		}
 		// Embedded is newer (or file missing): write so user can edit from latest
 		try {
@@ -170,6 +179,7 @@ export function createSidecar(sidecarPath: string, embedded: string): () => stri
 		} catch {
 			// Write failed (read-only install) — serve from memory silently
 		}
+		if (!embedded) throw new Error(`[createSidecar] embedded fallback is empty: ${sidecarPath}`);
 		cached = embedded;
 		return cached;
 	};
@@ -250,4 +260,55 @@ export async function callWithRole(
 		}
 		return null;
 	}
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. formatBlock
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Render a tagged XML block for system prompt injection.
+ *
+ * Returns an empty string when `lines` is empty — never emits an empty tag pair.
+ * Callers compose sibling blocks by concatenating non-empty results.
+ *
+ * @param tag   XML tag name (no angle brackets), e.g. "memories"
+ * @param lines Content lines; each is written verbatim, one per line.
+ *
+ * @example
+ *   formatBlock("memories", ["• fact one", "• fact two"])
+ *   // → "<memories>\n• fact one\n• fact two\n</memories>"
+ */
+export function formatBlock(tag: string, lines: string[]): string {
+	if (lines.length === 0) return "";
+	return `<${tag}>\n${lines.join("\n")}\n</${tag}>`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5. showMPanel
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Render a titled markdown panel into the chat container, excluded from LLM context.
+ * Equivalent to the `!!` command pattern — visible to the user, never sent to the model.
+ *
+ * Keeps core UI imports (Markdown, DynamicBorder, theme) inside "m" space so that
+ * slash command handlers don't need to import core UI machinery directly.
+ *
+ * @param ctx    InteractiveModeContext from the slash command runtime
+ * @param title  Accent-coloured header line (e.g. "Memory Recall Snapshot")
+ * @param markdown  Markdown body to render
+ */
+export function showMPanel(
+	ctx: { chatContainer: { addChild: (c: unknown) => void }; ui: { requestRender: () => void } },
+	title: string,
+	markdown: string,
+): void {
+	ctx.chatContainer.addChild(new Spacer(1));
+	ctx.chatContainer.addChild(new DynamicBorder());
+	ctx.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", title)), 1, 0));
+	ctx.chatContainer.addChild(new Spacer(1));
+	ctx.chatContainer.addChild(new Markdown(markdown.trim(), 1, 1, getMarkdownTheme()));
+	ctx.chatContainer.addChild(new DynamicBorder());
+	ctx.ui.requestRender();
 }

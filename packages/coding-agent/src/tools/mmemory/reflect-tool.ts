@@ -1,9 +1,8 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { untilAborted } from "@oh-my-pi/pi-utils";
+import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { Type } from "@sinclair/typebox";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
-import { executeMemoryReflect, loadMmemoryConfig } from ".";
 import embeddedReflectDesc from "../../sidecars/mme-reflect.tool-desc.md" with { type: "text" };
 import { createSidecar, sidecarPath } from "../../utils/m-utils";
 const resolveDesc = createSidecar(sidecarPath("mme-reflect.tool-desc.md"), embeddedReflectDesc);
@@ -37,18 +36,9 @@ export class MmemoryReflectTool implements AgentTool<typeof schema> {
 	async execute(
 		_toolCallId: string,
 		{ query, scope }: { query: string; scope?: string },
-		signal?: AbortSignal,
 	): Promise<AgentToolResult> {
-		return untilAborted(signal, async () => {
-			// TODO(wiring): use getMmemorySessionConfig(this.session.ctx) here once ToolSession
-			// exposes a `ctx: ExtensionContext` field — avoids re-reading settings on every call.
-			// See mmemory-extension.ts getMmemorySessionConfig for the ready-made accessor.
-			const config = loadMmemoryConfig(this.session.settings, this.session.cwd);
-			if (!config) {
-				return toolResult().text("Memory system is not enabled.").done();
-			}
-			const result = await executeMemoryReflect(query, scope, config);
-			return toolResult().text(result.text).done();
-		});
+		const slashCmd = `/mmemory reflect ${query}${scope ? ` --scope ${scope}` : ""}`.trim();
+		this.session.eventBus?.emit(SCHEDULE_SLASH_CHANNEL, slashCmd);
+		return toolResult().text("↩").done();
 	}
 }

@@ -94,13 +94,13 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 
 	"mmemory.scoping": {
 		type: "enum" as const,
-		values: ["per-project", "global"] as const,
-		default: "per-project" as "per-project" | "global",
+		values: ["per-project", "per-project-tagged", "global"] as const,
+		default: "per-project" as "per-project" | "per-project-tagged" | "global",
 		ui: {
 			tab: "tools" as const,
 			label: "MMemory: Default recall scope",
 			description:
-				"per-project — recall filters to chunks from this project (default). global — no project filter. Overridable per-session with /mmemory / or /mmemory .",
+				"per-project — project filter only. per-project-tagged — project + agent tag filter. global — no filter. Overridable per-session with /mmemory / or /mmemory .",
 		},
 	},
 
@@ -124,7 +124,7 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 		},
 	},
 
-	"mmemory.recallMaxQueryChars": {
+	"mmemory.recall.maxQueryChars": {
 		type: "number" as const,
 		default: 2000,
 		ui: {
@@ -134,7 +134,7 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 		},
 	},
 
-	"mmemory.recallLimit": {
+	"mmemory.recall.limit": {
 		type: "number" as const,
 		default: 10,
 		ui: {
@@ -144,7 +144,7 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 		},
 	},
 
-	"mmemory.recallDeadlineMs": {
+	"mmemory.recall.deadlineMs": {
 		type: "number" as const,
 		default: 10000,
 		ui: {
@@ -154,7 +154,7 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 		},
 	},
 
-	"mmemory.recencyWeight": {
+	"mmemory.recall.recencyWeight": {
 		type: "number" as const,
 		default: 0.3,
 		ui: {
@@ -165,6 +165,105 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 		},
 	},
 
+	"mmemory.recall.fileLimit": {
+		type: "number" as const,
+		default: 20,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Recall file limit",
+			description: "Max paths injected into <referenced_files>; sorted ts ASC (most recent last).",
+		},
+	},
+
+	"mmemory.recall.includeReadFiles": {
+		type: "boolean" as const,
+		default: false,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Include read-only files",
+			description: "Include read-only files alongside modified/written in <referenced_files>. Default: false.",
+		},
+	},
+
+	"mmemory.recall.observationLimit": {
+		type: "number" as const,
+		default: 10,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Observation limit",
+			description: "Max observations injected into <observations>. 0 = disabled.",
+		},
+	},
+
+	"mmemory.injection.sessionLimit": {
+		type: "number" as const,
+		default: 5,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Injection session limit",
+			description: "Max session chunks injected into system prompt via get_injection_snapshot. Newest N retained.",
+		},
+	},
+
+	"mmemory.injection.observationLimit": {
+		type: "number" as const,
+		default: 3,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Injection observation limit",
+			description: "Max observations injected. Selected as the K nearest before the session window (end_ts < oldest session ts).",
+		},
+	},
+
+	"mmemory.injection.fileLimit": {
+		type: "number" as const,
+		default: 5,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Injection file limit",
+			description: "Max file chunks injected into <referenced_files>. Newest M retained. Never dropped by max_chars.",
+		},
+	},
+
+	"mmemory.injection.maxChars": {
+		type: "number" as const,
+		default: 8000,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Injection max chars",
+			description: "Total character budget for injection snapshot. If exceeded, newest session chunks are dropped first. Files and observations are never dropped.",
+		},
+	},
+	"mmemory.vacuum.enabled": {
+		type: "boolean" as const,
+		default: true,
+		ui: { tab: "tools" as const, label: "MMemory: Vacuum enabled",
+			  description: "Enable periodic age-based purge of stale chunks and vectors." },
+	},
+	"mmemory.vacuum.intervalHours": {
+		type: "number" as const,
+		default: 24,
+		ui: { tab: "tools" as const, label: "MMemory: Vacuum interval (hours)",
+			  description: "Minimum hours between automatic vacuum runs." },
+	},
+	"mmemory.vacuum.sessionMaxAgeDays": {
+		type: "number" as const,
+		default: 365,
+		ui: { tab: "tools" as const, label: "MMemory: Session max age (days)",
+			  description: "Purge source:session chunks older than this." },
+	},
+	"mmemory.vacuum.observationMaxAgeDays": {
+		type: "number" as const,
+		default: 90,
+		ui: { tab: "tools" as const, label: "MMemory: Observation max age (days)",
+			  description: "Purge source:observation chunks older than this." },
+	},
+	"mmemory.vacuum.fileMaxAgeDays": {
+		type: "number" as const,
+		default: 180,
+		ui: { tab: "tools" as const, label: "MMemory: File max age (days)",
+			  description: "Purge source:file chunks older than this." },
+	},
 	"mmemory.deduplicationThreshold": {
 		type: "number" as const,
 		default: 0.92,
@@ -207,14 +306,43 @@ export const MMEMORY_SCHEMA_ENTRIES = {
 		},
 	},
 
-	"mmemory.maxRawFacts": {
+	"mmemory.consolidationMinTurns": {
 		type: "number" as const,
-		default: 100,
+		default: 10,
 		ui: {
 			tab: "tools" as const,
-			label: "MMemory: Max raw facts",
-			description:
-				"facts.json entries before /mmemory consolidate is offered. Only relevant in structured mode.",
+			label: "MMemory: Consolidation min turns",
+			description: "Min unprocessed turn chunks before auto-consolidation fires",
+		},
+	},
+
+	"mmemory.consolidationMaxTurns": {
+		type: "number" as const,
+		default: 50,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Consolidation max turns",
+			description: "Max turn chunks passed to LLM per consolidation run",
+		},
+	},
+
+	"mmemory.consolidationPollIntervalMinutes": {
+		type: "number" as const,
+		default: 5,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Consolidation poll interval (minutes)",
+			description: "How often (minutes) to poll server for consolidation eligibility after each retain",
+		},
+	},
+
+	"mmemory.consolidationMaxObservationChars": {
+		type: "number" as const,
+		default: 400,
+		ui: {
+			tab: "tools" as const,
+			label: "MMemory: Consolidation max observation chars",
+			description: "Max characters for the observation text produced per consolidation call. Passed into the LLM prompt — the model self-limits.",
 		},
 	},
 
@@ -250,18 +378,35 @@ export interface MmemorySettings {
 	timeFilterModelRole: string | undefined;
 	retainMission: string | undefined;
 	extractionMode: "verbatim" | "structured";
-	scoping: "per-project" | "global";
+	scoping: "per-project" | "per-project-tagged" | "global";
 	retainEveryNTurns: number;
 	retainContextTurns: number;
-	recallMaxQueryChars: number;
-	recallLimit: number;
-	recallDeadlineMs: number;
-	recencyWeight: number;
 	deduplicationThreshold: number;
 	serverIdleTimeoutMinutes: number;
 	serverPort: number;
 	serverLogFile: string | undefined;
 	autoRetain: boolean;
 	maxTranscriptChars: number;
-	maxRawFacts: number;
+	consolidationMinTurns: number;
+	consolidationMaxTurns: number;
+	consolidationPollIntervalMinutes: number;
+	agentTag: string;
+	recall: {
+		maxQueryChars: number;
+		limit: number;
+		deadlineMs: number;
+		recencyWeight: number;
+		fileLimit: number;
+		includeReadFiles: boolean;
+		observationLimit: number;
+		factsLimit: number;
+	};
+	vacuum: {
+		enabled: boolean;
+		intervalHours: number;
+		sessionMaxAgeDays: number;
+		observationMaxAgeDays: number;
+		factMaxAgeDays: number;
+		fileMaxAgeDays: number;
+	};
 }

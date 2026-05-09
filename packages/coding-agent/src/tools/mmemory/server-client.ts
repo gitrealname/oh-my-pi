@@ -37,7 +37,7 @@ export class MmemoryServerClient {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	private proc: any = null;
 	private startPromise: Promise<void> | null = null;
-
+	private broken = false;
 	constructor(
 		private readonly serverScriptPath: string,
 		private readonly port: number,
@@ -48,7 +48,8 @@ export class MmemoryServerClient {
 
 	// ── public ──────────────────────────────────────────────────────────────
 
-	async query(action: string, args: Record<string, unknown> = {}): Promise<unknown> {
+	async query(action: string, args: Record<string, unknown> = {}): Promise<unknown | null> {
+		if (this.broken) return null;
 		await this.#ensureRunning();
 		return this.#rawQuery({ action, ...args });
 	}
@@ -79,9 +80,15 @@ export class MmemoryServerClient {
 			}
 		}
 		if (this.startPromise) return this.startPromise;
-		this.startPromise = this.#start().finally(() => {
-			this.startPromise = null;
-		});
+		this.startPromise = this.#start()
+			.catch((err: unknown) => {
+				this.broken = true;
+				console.warn("[mmemory] server failed to start — recall disabled for this session");
+				throw err;
+			})
+			.finally(() => {
+				this.startPromise = null;
+			});
 		return this.startPromise;
 	}
 
