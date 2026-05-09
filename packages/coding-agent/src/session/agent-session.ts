@@ -565,6 +565,8 @@ export class AgentSession {
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
+	/** Opaque state slot for the mmemory MemoryBackend. Avoids circular import. */
+	#mmemoryBackendState: unknown = undefined;
 
 	#startPowerAssertion(): void {
 		if (process.platform !== "darwin") {
@@ -707,11 +709,18 @@ export class AgentSession {
 	getHindsightSessionState(): HindsightSessionState | undefined {
 		return this.#hindsightSessionState;
 	}
-
 	setHindsightSessionState(state: HindsightSessionState | undefined): HindsightSessionState | undefined {
 		const previous = this.#hindsightSessionState;
 		this.#hindsightSessionState = state;
 		return previous;
+	}
+
+	getMmemoryBackendState(): unknown {
+		return this.#mmemoryBackendState;
+	}
+
+	setMmemoryBackendState(state: unknown): void {
+		this.#mmemoryBackendState = state;
 	}
 
 	/** TTSR manager for time-traveling stream rules */

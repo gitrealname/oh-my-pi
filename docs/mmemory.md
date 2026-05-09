@@ -6,6 +6,7 @@ memories into the system prompt at the start of each session.
 
 **No external service, no API keys, no cost beyond the embedding model download.**
 All data stays on disk under a configurable `storageRoot`.
+
 ---
 
 ## Enabling mmemory
@@ -40,9 +41,9 @@ Python server reads queue/*.md
   → deletes processed .md files from queue/
        ↓
 Next session starts
-  → extension queries server: parallel BM25 + cosine similarity
-  → RRF merge + recency boost
-  → top results injected as <memories> block into system prompt
+  → extension calls get_injection_snapshot (deterministic time-ordered snapshot)
+  → injects sessions(N) + observations(K) + files(M) as passive background blocks
+  → user-driven recall uses parallel BM25 + cosine similarity → RRF merge + recency boost
 ```
 
 The Python server starts lazily on first recall query and self-terminates after
@@ -56,14 +57,9 @@ visible console window.
 ```
 storageRoot/                    e.g. D:/.ai/knowledge/projects/omp_memory/
   queue/                        ← .md files arrive here; always empty after a build
-  chunks.json                   ← DURABLE STORE: full text of all indexed chunks
+  chunks.json                   ← DURABLE STORE: all chunks (session + file + observation)
   vectors.safetensors           ← rebuildable from chunks.json
-  vectors.meta.json             ← {model, count} for rebuild validation
-  mental_models/                ← Phase 3: auto-generated summaries
-  facts.json                    ← Phase 3: extracted facts
-  observations.json             ← Phase 3: consolidation output
   .gitignore                    ← * (all memory data private)
-  kb_config.yaml                ← auto-generated: type: external, handler: mmemory
 ```
 
 Project label is auto-derived from the normalized working directory:
@@ -77,18 +73,19 @@ Each `.md` file written to `queue/` includes YAML frontmatter:
 ```yaml
 ---
 project: D/.ai
-agent_tag: default
-source: session | retain_tool
-session_id: <uuid>
-ts: 2026-05-05T12:34:56.000Z
+source: session           # session | file | observation
+ts: <unix-seconds>
+read_files: []
+modified_files: []
+written_files: []
 ---
 <transcript content>
 ```
 
 ### Chunk metadata
 
-Each chunk stored in `chunks.json` carries the same fields (`project`, `agent_tag`, `source`,
-`session_id`, `ts`) used for filtering during recall.
+Each chunk stored in `chunks.json` carries fields (`project`, `agent_tag`, `source`,
+`ts`) used for filtering during recall.
 
 ### Recall filters
 
@@ -98,15 +95,16 @@ Each chunk stored in `chunks.json` carries the same fields (`project`, `agent_ta
 |---|---|---|
 | `project` | string | Restrict to chunks from a specific project label |
 | `agent_tag` | string | Restrict to chunks from a specific agent tag |
-| `source` | string | Restrict to `session` or `retain_tool` chunks |
+| `source` | string | Restrict to `session`, `file`, or `observation` chunks |
 | `ts_after` | number | Unix seconds — exclude chunks older than this timestamp |
 | `ts_before` | number | Unix seconds — exclude chunks newer than this timestamp |
 
 The time-filter system prompt is written to disk on first run and can be customised:
-  Compiled : <binary-dir>/prompts/mmemory-time-filter.md
-  Dev      : ~/.omp/agent-work/prompts/mmemory-time-filter.md
+  Compiled : `<binary-dir>/mme-time-filter.prompt.md`
+  User override: `~/.omp/mme-time-filter.prompt.md`
 Edit the local copy to adapt time expressions for different languages or conventions.
 The binary version is restored if the local copy is older than the build timestamp.
+
 ### Migration
 
 On first build after upgrade, the server automatically migrates the legacy `index/`
@@ -114,7 +112,40 @@ layout to the flat layout. No manual intervention is required.
 
 `chunks.json` is the durable store. If `vectors.safetensors` is lost, run
 `/mmemory rebuild` to re-embed from `chunks.json`. If `chunks.json` is lost,
-memories are gone — it is the primary record.
+memories are gone — it is the primary artifact.
+
+---
+
+## Injection Architecture
+
+On session start, the extension calls `get_injection_snapshot` — a deterministic
+time-ordered snapshot, not a search operation:
+
+```
+get_injection_snapshot request:
+  sessions:      N most recent session chunks  (injection.sessionLimit, default 5)
+  observations:  K observations before session window  (injection.observationLimit, default 3)
+  files:         M most recently modified file chunks  (injection.fileLimit, default 5)
+  max_chars:     total character budget  (injection.maxChars, default 8000)
+
+Safety net: if total > max_chars, newest sessions are dropped first.
+            observations and files are NEVER dropped.
+```
+
+The snapshot is injected into the system prompt as structured blocks:
+
+```
+<observations>   ← synthesized project insights (observation chunks)
+<memories>       ← recent session transcripts
+<referenced_files> ← recently read/modified files
+```
+
+These blocks are treated as **passive background** by default. The agent reads
+them but does not reference or repeat them unless the user asks about something
+in them or they are directly relevant to the current request.
+
+User-driven recall (`.recall`, `.reflect`, slash commands) uses the full ranked
+search pipeline (BM25 + semantic + RRF) and is separate from injection.
 
 ---
 
@@ -123,39 +154,64 @@ memories are gone — it is the primary record.
 ```yaml
 mmemory:
   enabled: true
+  storageRoot: /path/to/storage     # required; full path
 
-  # Storage (machine-specific — set in deployed config, not in template)
-  storageRoot: D:/.ai/knowledge/projects/omp_memory   # full path; project label = auto-derived from cwd
-
-  # LLM roles
-  modelRole: smol                   # reflect synthesis (Phase 2); extraction (Phase 3)
-  timeFilterModelRole: ~           # model role for time-hint LLM preprocessing;
-                                    #   falls back to modelRole. Use a cheap/fast model.
-                                    #   Default: inherits modelRole.
-  consolidateModelRole: smol        # consolidation + mental model seeding (Phase 3)
-                                    # upgrade to a large-context model when Phase 3 is wired
+  # Model roles
+  modelRole: memory                 # embedding + extraction model role
+  consolidateModelRole: memory      # consolidation model role
+  timeFilterModelRole: ~            # time-filter LLM role; null = use modelRole
 
   # Retention
-  retainMission: "Focus on technical decisions, API contracts, constraints, error patterns, and project conventions"
-  extractionMode: verbatim          # verbatim = turn-boundary transcripts (Phase 2)
-                                    # structured = LLM extracts {fact, entities, date} (Phase 3)
-  retainEveryNTurns: 3              # write a memory file every N agent turns
-  retainContextTurns: 0             # 0 = full session; N = last N turns only
+  retainMission: ~                  # mission string passed to extraction prompt
+  extractionMode: verbatim          # verbatim | structured
+  autoRetain: true                  # auto-retain every retainEveryNTurns agent turns
+  retainEveryNTurns: 3              # retain interval (agent turns)
+  retainContextTurns: 3             # turns of prior context included in retain
+  maxTranscriptChars: 0             # 0 = full session; N = last N turns only
 
   # Scoping
-  scoping: per-project             # per-project = this project's queue/ only
+  scoping: per-project              # per-project = this project's queue/ only
                                     # global      = all projects
   agentTag: default                 # isolates memories by agent identity within same project
                                     # global scope (/mmemory /) bypasses this filter
                                     # existing chunks without this field default to "default"
-  # Recall
-  recallLimit: 10                   # max chunks returned
-  recallDeadlineMs: 10000           # abort if server doesn't respond (cold start protection)
-  recencyWeight: 0.3                # exponential decay: score *= exp(-age_days/30 * weight)
-  deduplicationThreshold: 0.92      # cosine similarity above which a new chunk is near-duplicate
 
-  # Server
+  # Injection (system-prompt snapshot at session start)
+  injection:
+    sessionLimit: 5                 # most recent session chunks to inject
+    observationLimit: 3             # observation chunks to inject (before session window)
+    fileLimit: 5                    # most recently modified file chunks to inject
+    maxChars: 8000                  # total character budget; overflow drops newest sessions
+
+  # Recall (user-driven search)
+  recall:
+    limit: 10                       # max chunks returned
+    deadlineMs: 10000               # abort if server doesn't respond (cold start protection)
+    maxQueryChars: 2000             # max chars in composed recall query
+    recencyWeight: 0.3              # exponential decay: score *= exp(-age_days/30 * weight)
+    fileLimit: 20                   # max file chunks considered
+    includeReadFiles: false         # include read-only file chunks in recall
+    observationLimit: 10            # max observation chunks returned
+
+  # Consolidation
+  consolidationMinTurns: 10         # min turns before consolidation is eligible
+  consolidationMaxTurns: 50         # max turns before consolidation is forced
+  consolidationPollIntervalMinutes: 5
+  consolidationMaxObservationChars: 400  # max chars per observation in consolidated output
+
+  # Vacuum
+  vacuum:
+    enabled: true
+    intervalHours: 24
+    sessionMaxAgeDays: 365
+    observationMaxAgeDays: 90
+    fileMaxAgeDays: 180
+
+  # Deduplication and server
+  deduplicationThreshold: 0.92      # cosine similarity above which a new chunk is near-duplicate
   serverIdleTimeoutMinutes: 10      # server self-terminates after N minutes idle
+  serverPort: 49200
+  serverLogFile: ~                  # null = stderr only; path = log to file
 ```
 
 ---
@@ -172,6 +228,7 @@ mmemory:
 | `/mmemory clear --from DATE [--to DATE]` | Remove chunks in date range from `chunks.json` |
 | `/mmemory clear --session ID` | Remove chunks from a specific session |
 | `/mmemory enqueue` | Force a retain cycle now |
+| `/mmemory consolidate [--max-facts N]` | Consolidate observations via LLM |
 
 
 ### Scope switching (session-sticky)
@@ -211,39 +268,30 @@ and how the result flows back into the session.
 
 ---
 
-### 1. Session starts — auto-recall
+### 1. Session starts — auto-injection
 
 **Trigger:** `before_agent_start` fires on the first agent turn.
 
 **What happens:**
 ```
-User types: "Continue the refactor from yesterday."
-
-Extension reads last 3 turns of prior context (retainContextTurns=3)
-  → composeRecallQuery("Continue the refactor from yesterday.", messages, 3)
-  → builds: "Prior context:\nassistant: ...\nuser: ...\n\nContinue the refactor from yesterday."
-  → truncateRecallQuery(..., 2000) — trims oldest context lines if over 2000 chars
-  → query sent to Python server
-
-Python server:
-  1. Embeds query with BAAI/bge-small-en-v1.5
-  2. Parallel: cosine similarity against vectors.safetensors
-                BM25 keyword search against chunks.json
-  3. RRF merge → recency decay → facts.json keyword overlap (1.2×)
-                              → observations.json keyword overlap (1.5×)
-  4. Returns top-10 chunks/facts/observations sorted by score
+Extension calls get_injection_snapshot (deterministic, no search):
+  → returns sessions(5) + observations(3, before session window) + files(5)
+  → total character budget: 8000 chars; overflow drops newest sessions first
 
 Extension injects into system prompt:
+  <observations>
+  [synthesized project insights]
+  </observations>
   <memories>
-  Found 5 relevant memories:
-  • User: What's the status of the auth refactor? Assistant: ... (score: 0.821)
-  • ...
+  [recent session transcripts]
   </memories>
+  <referenced_files>
+  [recently modified/read files]
+  </referenced_files>
 ```
 
-**Slash equivalent:** `/mmemory recall Continue the refactor from yesterday.`
-Difference: slash command prompts the agent with the result as a user message
-(visible in conversation). Auto-recall injects silently into the system prompt.
+**Slash equivalent:** none — injection is deterministic, not query-driven.
+For query-driven recall, use `/mmemory recall <query>` or the `.recall` shortcut.
 
 ---
 
@@ -278,7 +326,7 @@ Difference: `.memory` steers the agent to use the tool in the same turn as the q
 **What happens:**
 ```
 Tool calls executeMemoryRecall("retry policy for outbound HTTP calls", undefined, config)
-  → same Python server pipeline as auto-recall (embed → BM25+semantic → RRF → facts → observations)
+  → Python server: embed → BM25+semantic → RRF → recency decay → observation boost (1.5×)
   → no deadline timeout (tool call blocks until result)
   → result returned as tool output text (visible in conversation)
   → agent can reason over the returned chunks and cite them
@@ -323,7 +371,7 @@ Difference: same processing path, but slash command injects into a new agent tur
 **What happens:**
 ```
 executeMemoryRetain:
-  1. Strips <memories>/<mental_models> tags from content (anti-feedback)
+  1. Strips <memories> tags from content (anti-feedback)
   2. Writes YYYYMMDD-HHMMSS-note-<id>.md to queue/
   3. Fires executeMemoryBuild (background, fire-and-forget)
 
@@ -332,10 +380,6 @@ Python server (background):
   2. Hashes each chunk; skips if already in chunks.json
   3. Embeds new chunks, appends to chunks.json, extends vectors.safetensors
   4. Deletes processed .md files
-
-If extractionMode=structured, extractFromTranscript also fires:
-  5. LLM (modelRole) extracts {fact, entities[], date} JSON from content
-  6. Deduplicates against facts.json, writes atomically
 ```
 
 Note: tool-initiated retains write unique filenames (timestamp-note-id).
@@ -351,7 +395,7 @@ Auto-retain from agent_end uses a fixed filename per session (overwrites on repe
 ```
 state.turnCount - state.lastRetainedTurn >= 3
   → buildTranscript(messages, retainContextTurns=3, maxTranscriptChars=0)
-    → strips <memories>/<mental_models> from every message
+    → strips <memories> from every message
     → formats as **User:** / **Assistant:** pairs separated by ---
     → if maxTranscriptChars > 0: drops oldest turns until fits
   → writes YYYYMMDD-HHMMSS-<sessionId>.md to queue/  (overwrites prior retain file)
@@ -389,26 +433,26 @@ If you want to checkpoint memory before a long session, call
 
 ---
 
-### 8. `/mmemory consolidate` — facts → observations
+### 8. `/mmemory consolidate` — consolidation into observations
 
 **User types:** `/mmemory consolidate`
 
 **What happens:**
 ```
-mmemoryHandler reads config.maxRawFacts (default 100)
-  → loadFacts: reads facts.json → count
-  → if count < threshold: status "only N facts, run more sessions first"
+mmemoryHandler reads consolidation config
+  → counts observation-eligible session chunks
+  → if count < consolidationMinTurns: status "not enough turns yet"
   → if count >= threshold:
-      builds consolidation prompt with all facts as JSON
+      builds consolidation prompt from recent session chunks
       runtime.ctx.session.agent.prompt(consolidationTask)
       agent replies with JSON array of {observation, entities[], date}
-      executeMemoryConsolidate writes observations.json atomically
+      executeMemoryConsolidate writes observation chunks to chunks.json atomically
 
-On next recall: observations rank above facts (1.5×) and above raw chunks.
+On next injection: observations injected ahead of session chunks (bounded by injection.observationLimit).
+On next ranked recall: observations score 1.5× above raw session chunks.
 ```
 
 **Variant:** `/mmemory consolidate --max-facts 20` — lower threshold for testing.
-After consolidation, run `/mmemory mm regenerate` to refresh mental model files.
 
 ## Subagent Behaviour
 
@@ -428,7 +472,7 @@ Phase 2 was completed 2026-05-03 against the `aws-corp` branch.
 | Item | Detail |
 |---|---|
 | Subagent guard | `taskDepth > 0 → null` — subagent transcripts never retained |
-| Anti-feedback stripping | `<memories>` and `<mental_models>` tags stripped before writing |
+| Anti-feedback stripping | `<memories>` tags stripped before writing |
 | Reflect synthesis framing | Returns memories as synthesis prompt for the calling LLM |
 | `/clear` via server lock | Runs under `_build_lock`; no race with in-flight builds |
 | Session dedup — fixed filename | `YYYYMMDD-HHMMSS-<sessionId>.md` overwrites each cycle |
@@ -437,7 +481,7 @@ Phase 2 was completed 2026-05-03 against the `aws-corp` branch.
 | No visible window | `windowsHide: true` on `Bun.spawn` |
 | Background priority | `SetPriorityClass(BELOW_NORMAL)` on Windows; `os.nice(5)` on Unix |
 | Logger integration | Python stderr → `logger.debug/warn` via omp logger |
-|| Privacy `.gitignore` | Written at `storageRoot` on first use |
+| Privacy `.gitignore` | Written at `storageRoot` on first use |
 | Build coalescing | `_pending_build` set; at most 2 sequential builds |
 | H5 BM25 fix | `max(2, N*0.5)` pruning threshold (prevents over-pruning small corpora) |
 | `_run_build` zero-vector fix | `else` branch re-embeds all chunks; zero-padding removed |
@@ -450,28 +494,13 @@ Phase 3 was completed 2026-05-03 against the `aws-corp` branch.
 
 | Item | Detail |
 |---|---|
-| LLM extraction | `executeMemoryExtract` + `loadFacts`; `extractionMode: structured` active; facts merged into recall with 1.2× score |
-| Consolidation | `executeMemoryConsolidate` + `loadObservations`; `/mmemory consolidate [--max-facts N]`; observations merged with 1.5× score |
-| Mental models | `executeMemoryMentalModelSeed`; `/mmemory mm list` / `/mmemory mm regenerate`; `<mental_models>` block injected at session start |
+| LLM extraction | `executeMemoryExtract`; `extractionMode: structured` active; observation chunks merged into recall with 1.5× score |
+| Consolidation | `executeMemoryConsolidate`; `/mmemory consolidate [--max-facts N]`; observation chunks injected at session start |
 | Recall query composition | `composeRecallQuery` + `truncateRecallQuery` ported from Hindsight; `retainContextTurns` default 3 |
 | Assistant truncation removal | `maxTranscriptChars: 0` (unlimited); config key drops oldest turns first when > 0 |
 | Dual-system unification | `getMmemorySessionConfig(ctx)` exported; full tool wiring deferred (ToolSession has no `ctx` field) |
+| Injection snapshot | `get_injection_snapshot` replaces ranked recall at session start; deterministic time-ordered |
 
-**New config keys (Phase 3):**
-
-| Key | Default | Description |
-|---|---|---|
-| `maxRawFacts` | `100` | Facts threshold before `/mmemory consolidate` offers to run |
-| `recallMaxQueryChars` | `2000` | Max chars in composed recall query; oldest context dropped first |
-| `maxTranscriptChars` | `0` | Max chars in retained transcript; `0` = unlimited |
-
-**New slash commands:**
-
-| Command | Description |
-|---|---|
-| `/mmemory consolidate [--max-facts N]` | Consolidate `facts.json` → `observations.json` via LLM |
-| `/mmemory mm list` | List `mental_models/*.md` files with last-modified times |
-| `/mmemory mm regenerate` | Re-run all three seed passes (user-preferences, project-conventions, project-decisions) |
 ---
 
 ## Troubleshooting

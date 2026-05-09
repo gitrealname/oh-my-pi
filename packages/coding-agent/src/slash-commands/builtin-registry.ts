@@ -3,8 +3,9 @@ import * as path from "node:path";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { hasMReviewHtml, openMReviewSession } from "../tools/mreview/index";
-import { invalidateMentalModelsCache } from "../mmemory-extension";
+import { getMmemorySessionSnippet, invalidateMentalModelsCache, executeManualRetain } from "../mmemory-extension";
 import {
+	buildConsolidateFn,
 	executeMemoryBuild,
 	executeMemoryConsolidate,
 	executeMemoryMentalModelSeed,
@@ -12,7 +13,6 @@ import {
 	executeMemoryReflect,
 	formatRecallForSystemPrompt,
 	getOrCreateServerClient,
-	loadFacts,
 	loadMentalModels,
 	loadMmemoryConfig,
 	resolvePaths,
@@ -23,6 +23,7 @@ import { resolveModelRoleValue } from "../config/model-resolver";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { Spacer, Text } from "@oh-my-pi/pi-tui";
 import { DynamicBorder } from "../modes/components/dynamic-border";
+import { showMPanel } from "../utils/m-utils";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
@@ -189,9 +190,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.showStatus(result.resultCount > 0
 				? `mmemory: ${result.resultCount} memories found.`
 				: "mmemory: no memories found.");
-			await runtime.ctx.session.agent.prompt(
-				`[Memory recall result for "${query}"]\n\n${result.text}`,
-			);
+			showMPanel(runtime.ctx, `Memory Recall — "${query}"`, result.text || "_No results._");
 			break;
 		}
 		case "reflect": {
@@ -202,35 +201,60 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.showStatus(`mmemory: reflecting on "${query}"...`);
 			const result = await executeMemoryReflect(query, scope, config);
 			runtime.ctx.showStatus(`mmemory: reflect done (${result.resultCount} memories).`);
-			await runtime.ctx.session.agent.prompt(
-				`[Memory reflection on "${query}"]\n\n${result.text}`,
-			);
+			showMPanel(runtime.ctx, `Memory Reflection — "${query}"`, result.text || "_No results._");
 			break;
 		}
 		case "retain": {
-			runtime.ctx.showStatus("mmemory: retain is handled automatically by the extension.");
+			runtime.ctx.showStatus("mmemory: retaining session...");
+			const result = await executeManualRetain(runtime.ctx);
+			if (result.written) {
+				runtime.ctx.showStatus("mmemory: session retained.");
+			} else {
+				runtime.ctx.showStatus(`mmemory: retain skipped — ${result.reason}.`);
+			}
 			break;
 		}
 		case "view": {
-			const viewResult = await executeMemoryRecall("recent context", undefined, config, runtime.ctx.session.modelRegistry, settings);
-			const snippet = formatRecallForSystemPrompt(viewResult);
-			runtime.ctx.showStatus(snippet ? "mmemory: showing recall snippet." : "mmemory: no memories loaded.");
-			if (snippet) {
-				await runtime.ctx.session.agent.prompt(`[Current memory recall snippet]\n\n${snippet}`);
-			}
+			// Use the session-start snapshot — same content the agent was injected with.
+			// Falls back to fresh query only if recall hasn't fired yet (server still starting).
+			const snapshot = getMmemorySessionSnippet(runtime.ctx);
+			const snippet = snapshot
+				?? formatRecallForSystemPrompt(
+						await executeMemoryRecall("recent context", undefined, config, runtime.ctx.session.modelRegistry, settings, "session"),
+					);
+			if (!snippet) { runtime.ctx.showStatus("mmemory: no memories loaded."); break; }
+			runtime.ctx.showStatus("mmemory: showing session-start snapshot.");
+			showMPanel(runtime.ctx, "Memory Recall Snapshot", snippet);
 			break;
 		}
 		case "status": {
 			const mmPaths = resolvePaths(config);
 			const enabled = settings.get("mmemory.enabled" as SettingPath);
-			const hasChunks = existsSync(mmPaths.chunksPath);
-			const chunkCount = hasChunks
-				? (() => { try { return (JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as unknown[]).length; } catch { return "?"; } })()
-				: 0;
 			const proj = config.projectLabel;
 			const scope = scopeLabel(runtime.ctx.sessionManager, proj);
+			// Parse chunks.json once for all derived stats
+			type Chunk = { source?: string; ts?: number; end_ts?: number; date?: string };
+			let chunks: Chunk[] = [];
+			if (existsSync(mmPaths.chunksPath)) {
+				try { chunks = JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as Chunk[]; } catch { /* unreadable */ }
+			}
+			const projChunks = chunks; // storageRoot already scopes to this project
+			const chunkCount = projChunks.length;
+			// Last consolidation: max end_ts of observation chunks
+			const obsChunks = projChunks.filter(c => c.source === "observation");
+			const lastObsEndTs = obsChunks.length > 0 ? Math.max(...obsChunks.map(c => c.end_ts ?? 0)) : 0;
+			const lastObsDate = obsChunks.find(c => (c.end_ts ?? 0) === lastObsEndTs)?.date;
+			const consolidationInfo = obsChunks.length > 0
+				? `last=${lastObsDate ?? new Date(lastObsEndTs * 1000).toLocaleDateString()} (${obsChunks.length} obs)`
+				: "never";
+			// Sessions pending consolidation: session chunks with ts > lastObsEndTs
+			const sessionChunks = projChunks.filter(c => c.source === "session");
+			const pendingSessions = sessionChunks.filter(c => (c.ts ?? 0) > lastObsEndTs).length;
+			const minTurns = config.consolidationMinTurns;
+			const pendingInfo = `pending=${pendingSessions}/${minTurns}`;
 			runtime.ctx.showStatus(
-				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, path=${mmPaths.projectDir}`,
+				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, ` +
+				`consolidation=${consolidationInfo}, ${pendingInfo}, path=${mmPaths.projectDir}`,
 			);
 			break;
 		}
@@ -249,6 +273,15 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			const sessionId = sessionMatch?.[1];
 			const mmPaths   = resolvePaths(config);
 			const rangeDesc = sessionId ? `session ${sessionId}` : `${from ?? "*"} → ${to ?? "*"}`;
+
+			const confirmed = await runtime.ctx.showHookConfirm(
+				"Confirm memory clear",
+				`Delete chunks matching ${rangeDesc}? This cannot be undone.`,
+			);
+			if (!confirmed) {
+				runtime.ctx.showStatus("mmemory clear: cancelled.");
+				break;
+			}
 
 			runtime.ctx.showStatus(`mmemory: clearing ${rangeDesc}...`);
 			try {
@@ -286,26 +319,27 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			break;
 		}
 		case "consolidate": {
-			const maxRawFactsOverride = restStr.match(/--max-facts\s+(\d+)/)?.[1];
-			const effectiveConfig = maxRawFactsOverride
-				? { ...config, maxRawFacts: parseInt(maxRawFactsOverride, 10) }
-				: config;
-			runtime.ctx.showStatus(`mmemory: consolidating (threshold: ${effectiveConfig.maxRawFacts} facts)...`);
+			runtime.ctx.showStatus("mmemory: checking for unprocessed turns...");
 			try {
-				const facts = await loadFacts(config);
-				const systemPrompt = [
-					"You are a precise knowledge consolidator. Merge the raw facts below into a smaller set of higher-level observations.",
-					"Return ONLY a JSON array (no markdown fences, no prose) of objects with exactly these fields:",
-					'{"observation": string (one concise declarative sentence), "entities": string[] (key concepts), "date": string (YYYY-MM-DD)}',
-					"Deduplicate. Merge related facts. Discard resolved ephemeral items. Target: ~20% of input count.",
-				].join(" ");
-				const userPrompt = `Facts (${facts.length} items):\n\n${JSON.stringify(facts, null, 2).slice(0, 15000)}`;
-				const responseText = await callLLMForMemory(effectiveConfig.consolidateModelRole, systemPrompt, userPrompt, runtime);
-				const result = await executeMemoryConsolidate(effectiveConfig, async () => responseText);
+				const client = await getOrCreateServerClient(config);
+				const resp = await client.query("get_consolidation_chunks", {
+					project_dir: config.storageRoot,
+					threshold: 1,
+					max_turns: config.consolidationMaxTurns,
+				}) as any;
+				const chunks: Array<{ text: string; ts: number; end_ts: number; path: string }> =
+					resp?.chunks ?? [];
+				if (chunks.length === 0) {
+					runtime.ctx.showStatus("mmemory: nothing to consolidate.");
+					break;
+				}
+				runtime.ctx.showStatus(`mmemory: consolidating ${chunks.length} turns...`);
+				const consolidateFn = buildConsolidateFn(config, runtime.ctx.session.modelRegistry, settings);
+				const result = await executeMemoryConsolidate(chunks, config, consolidateFn);
 				runtime.ctx.showStatus(
 					result.skipped
-						? result.message
-						: `mmemory: consolidated ${result.factsConsumed} facts into ${result.observationCount} observations.`,
+						? `mmemory: ${result.message}`
+						: `mmemory: consolidated ${chunks.length} turns into ${result.observationCount} observations.`,
 				);
 			} catch (e) {
 				runtime.ctx.showWarning(`mmemory consolidate: ${String(e)}`);

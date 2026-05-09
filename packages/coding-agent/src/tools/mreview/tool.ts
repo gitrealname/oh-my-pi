@@ -6,6 +6,10 @@ import type { ToolSession } from "..";
 import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { toolResult } from "../tool-result";
 
+import embeddedDesc from "../../sidecars/mreview.tool-desc.md" with { type: "text" };
+import { createSidecar, sidecarPath } from "../../utils/m-utils";
+const resolveDesc = createSidecar(sidecarPath("mreview.tool-desc.md"), embeddedDesc);
+
 const schema = Type.Object({
 	file_path: Type.String({ description: "Absolute path to the markdown file to review" }),
 });
@@ -19,18 +23,7 @@ const recentCalls = new Map<string, number>();
 export class MReviewTool implements AgentTool<typeof schema> {
 	name = "mreview" as const;
 	label = "Markdown Review";
-	description =
-		"Review a markdown file with the user in a browser UI with annotation tools and AI chat.\n\n" +
-		"<conditions>\n" +
-		"- User asks to review, discuss, annotate, or comment on a markdown file\n" +
-		"- User types .review\n" +
-		"</conditions>\n\n" +
-		"<critical>\n" +
-		"- file_path is **required** - **MUST NOT** call with an empty argument object {}\n" +
-		"- file_path **MUST** be an absolute path\n" +
-		"- After this tool returns, **do NOT generate any response** - stay completely silent.\n" +
-		"  The TUI handles opening the review UI internally after the turn completes.\n" +
-		"</critical>";
+	description = resolveDesc();
 	parameters = schema;
 	#session: ToolSession;
 

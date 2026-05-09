@@ -1,1 +1,0 @@
-Dispatch a memory operation via the session event bus. Called automatically when the user prefixes a message with `.memory`. Do NOT call this tool directly — use mmemory_recall, mmemory_retain, or mmemory_reflect instead.
