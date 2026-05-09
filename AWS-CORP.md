@@ -211,7 +211,7 @@ cloud embedding API. Uses `BAAI/bge-small-en-v1.5` (~25 MB, first-run download).
 **Chunk metadata dimensions** (all stored per chunk, all filterable):
 - `project` — normalized working directory path (e.g. `my-project`)
 - `agent_tag` — agent identity within a project (default: `"default"`)
-- `source` — `"session"` (retained summaries) | `"fact"` (extracted facts) | `"observation"` (consolidated insights) | `"file"` (file path index, one entry per unique path)
+- `source` — `"session"` (retained summaries) | `"observation"` (consolidated insights) | `"file"` (file path index, one entry per unique path)
 - `ts` — Unix seconds, derived from queue filename at ingest time
 - `session_id` — which session produced this chunk
 
