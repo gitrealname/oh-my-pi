@@ -7,6 +7,7 @@
  *   2. `...SCRIPT_KEYBINDING_CONFIGS` spread at the end of KEYBINDINGS
  */
 
+import type { KeyId } from "@oh-my-pi/pi-tui";
 export interface AppScriptKeybindings {
 	"app.script.1": true;
 	"app.script.2": true;
@@ -24,14 +25,14 @@ export interface AppScriptKeybindings {
  *    "app.script.1": "ctrl+alt+v"
  */
 export const SCRIPT_KEYBINDING_CONFIGS = {
-	"app.script.1":  { defaultKeys: [] as string[], description: "Run script 1" },
-	"app.script.2":  { defaultKeys: [] as string[], description: "Run script 2" },
-	"app.script.3":  { defaultKeys: [] as string[], description: "Run script 3" },
-	"app.script.4":  { defaultKeys: [] as string[], description: "Run script 4" },
-	"app.script.5":  { defaultKeys: [] as string[], description: "Run script 5" },
-	"app.script.6":  { defaultKeys: [] as string[], description: "Run script 6" },
-	"app.script.7":  { defaultKeys: [] as string[], description: "Run script 7" },
-	"app.script.8":  { defaultKeys: [] as string[], description: "Run script 8" },
-	"app.script.9":  { defaultKeys: [] as string[], description: "Run script 9" },
-	"app.script.10": { defaultKeys: [] as string[], description: "Run script 10" },
+	"app.script.1":  { defaultKeys: [] as KeyId[], description: "Run script 1" },
+	"app.script.2":  { defaultKeys: [] as KeyId[], description: "Run script 2" },
+	"app.script.3":  { defaultKeys: [] as KeyId[], description: "Run script 3" },
+	"app.script.4":  { defaultKeys: [] as KeyId[], description: "Run script 4" },
+	"app.script.5":  { defaultKeys: [] as KeyId[], description: "Run script 5" },
+	"app.script.6":  { defaultKeys: [] as KeyId[], description: "Run script 6" },
+	"app.script.7":  { defaultKeys: [] as KeyId[], description: "Run script 7" },
+	"app.script.8":  { defaultKeys: [] as KeyId[], description: "Run script 8" },
+	"app.script.9":  { defaultKeys: [] as KeyId[], description: "Run script 9" },
+	"app.script.10": { defaultKeys: [] as KeyId[], description: "Run script 10" },
 } as const;

@@ -113,7 +113,7 @@ async function summarizeBatches(
 	const response = await completeSimple(
 		model,
 		{
-			systemPrompt: buildSummarizerPrompt(),
+			systemPrompt: [buildSummarizerPrompt()],
 			messages: [{ role: "user", content: [{ type: "text", text: serialized }], timestamp: Date.now() }],
 		},
 	);
@@ -137,10 +137,10 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 			return;
 		}
 		if (ctx.taskDepth > 0) return; // subagent — silent
-		logger.info("[mprune] active", {
+		logger.debug("[mprune] active", {
 			imagesKeepTurns: settings.get("mprune.images.keepTurns"),
 			softTrimChars:   settings.get("mprune.trim.softTrimChars"),
-			pruneModel:      settings.get("modelRoles.prune" as "modelRoles.smol") ?? "(fallback to default)",
+			pruneModel:      settings.getModelRole("prune") ?? "(fallback to default)",
 		});
 	});
 
@@ -223,7 +223,7 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 		}
 
 		api.sendMessage(
-			{ customType: "mprune_summary", content: summary, display: false as unknown as string },
+			{ customType: "mprune_summary", content: summary, display: false },
 			{ deliverAs: "steer" },
 		);
 

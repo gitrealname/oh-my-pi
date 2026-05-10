@@ -41,7 +41,6 @@ import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
-import { NotebookTool } from "./notebook";
 import { MReviewTool } from "./mreview/tool";
 import { MmemoryRecallTool } from "./mmemory/recall-tool";
 import { MmemoryReflectTool } from "./mmemory/reflect-tool";

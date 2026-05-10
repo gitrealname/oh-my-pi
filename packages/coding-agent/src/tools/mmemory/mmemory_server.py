@@ -465,6 +465,7 @@ class MmemoryServer:
         scope: str = req.get("scope", "per-project")
         project: str = req.get("project", "")
         filter_params: dict = req.get("filter", {})
+        mode: str = req.get("mode", "query")
 
         if not project_dir:
             return {"error": "project_dir required"}
@@ -700,10 +701,24 @@ class MmemoryServer:
                 for c in existing_chunks:
                     if not c.get('ts'):
                         c['ts'] = now_ts  # heal legacy chunks missing ts
+                    if 'end_ts' not in c:
+                        c['end_ts'] = c['ts']  # heal legacy chunks missing end_ts
             except Exception:
                 pass
 
         existing_hashes: set[str] = {c["hash"] for c in existing_chunks}
+        def _parse_list(val: object) -> list[str] | None:
+            """Parse a frontmatter value that may be a JSON array string or already a list."""
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return val
+            try:
+                parsed = json.loads(str(val))
+                return parsed if isinstance(parsed, list) else None
+            except Exception:
+                return None
+
         # ── 2. Collect new chunks from queue ──────────────────────────────────
         queue_files = sorted(queue_dir.glob("*.md")) if queue_dir.exists() else []
         new_raw_chunks: list[dict] = []
@@ -711,13 +726,34 @@ class MmemoryServer:
             try:
                 raw = md_file.read_text(encoding="utf-8", errors="replace")
                 fm, text = _parse_frontmatter(raw)
-                chunks = chunk_by_turns(text, str(md_file))
+                source = fm.get("source", "session")
+                if source == "session":
+                    chunks = chunk_by_turns(text, str(md_file))
+                else:
+                    # Observations, facts, and other non-session sources are stored as a
+                    # single chunk — they have no turn-boundary markers.
+                    body = text.strip()
+                    if body:
+                        chunk_hash = hashlib.sha256(body.encode()).hexdigest()[:16]
+                        chunks = [{"text": body, "path": str(md_file), "hash": chunk_hash}]
+                    else:
+                        chunks = []
                 for c in chunks:
                     c["project"]    = fm.get("project",    Path(project_dir).name)
-                    c["source"]     = fm.get("source",     "session")
+                    c["source"]     = source
                     c["session_id"] = fm.get("session_id", None)
                     c["ts"]         = int(fm.get("ts", time.time()))
                     c["agent_tag"]  = fm.get("agent_tag",  "default")
+                    c["end_ts"]     = int(fm.get("end_ts",   c["ts"]))
+                    rf = _parse_list(fm.get("read_files"))
+                    mf = _parse_list(fm.get("modified_files"))
+                    wf = _parse_list(fm.get("written_files"))
+                    if rf is not None:
+                        c["read_files"] = rf
+                    if mf is not None:
+                        c["modified_files"] = mf
+                    if wf is not None:
+                        c["written_files"] = wf
                 new_raw_chunks.extend(chunks)
             except Exception as e:
                 print(f"EXCEPTION: [mmemory] Failed to read {md_file.name}: {e}\n" + traceback.format_exc(), file=sys.stderr, flush=True)

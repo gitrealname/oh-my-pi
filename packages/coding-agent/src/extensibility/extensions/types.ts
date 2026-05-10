@@ -1333,7 +1333,7 @@ export interface ExtensionContextActions {
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
-	getSystemPrompt: () => string;
+	getSystemPrompt: () => string[];
 	executePython?: ExtensionContext["executePython"];
 }
 

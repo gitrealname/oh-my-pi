@@ -169,7 +169,7 @@ export class ExtensionRunner {
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
-	#getSystemPromptFn: () => string = () => "";
+	#getSystemPromptFn: () => string[] = () => [];
 	#executePythonFn: NonNullable<ExtensionContextActions["executePython"]> = (code, options) =>
 		executePython(code, { ...options, cwd: options?.cwd ?? this.cwd });
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -183,6 +183,10 @@ export class ExtensionRunner {
 
 	setTaskDepth(n: number): void {
 		this.#taskDepth = n;
+	}
+
+	getTaskDepth(): number {
+		return this.#taskDepth;
 	}
 
 

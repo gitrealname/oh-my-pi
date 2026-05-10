@@ -9,11 +9,10 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 } from "./model-thinking";
-import { type BedrockOptions, streamBedrock } from "./providers/amazon-bedrock";
+import type { BedrockOptions } from "./providers/amazon-bedrock";
 import { streamAwsCorp } from "./providers/aws-corp";
-import { type AnthropicOptions, streamAnthropic } from "./providers/anthropic";
-import { streamAzureOpenAIResponses } from "./providers/azure-openai-responses";
-import { type CursorOptions, streamCursor } from "./providers/cursor";
+import type { AnthropicOptions } from "./providers/anthropic";
+import type { CursorOptions } from "./providers/cursor";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";

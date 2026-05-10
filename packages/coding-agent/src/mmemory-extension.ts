@@ -56,6 +56,7 @@ interface MmemorySessionState {
 	consolidationPending: boolean;
 	lastConsolidationTs: number;
 	lastConsolidationPollAt: number;
+	hasRecalledForFirstTurn: boolean;
 	/** Chunks fetched by maybePollConsolidation, waiting for agent_end to execute LLM call. */
 	pendingConsolidationChunks: unknown[] | null;
 }
@@ -137,6 +138,7 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 		lastConsolidationTs: 0,
 		lastConsolidationPollAt: 0,
 		pendingConsolidationChunks: null,
+		hasRecalledForFirstTurn: false,
 	};
 }
 
@@ -231,6 +233,7 @@ async function extractFromTranscript(
 	const registry = ctx.modelRegistry;
 	const model = resolveRoleModel(config.modelRole, registry, settings, ["memory"]);
 	if (!model) return;
+}
 
 
 async function retainSession(
@@ -461,8 +464,8 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 		if (!state.hasRecalledForFirstTurn) {
 			state.hasRecalledForFirstTurn = true;
 			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
-			const rawQuery = composeRecallQuery(prompt, messages, state.config.retainContextTurns);
-			const query = truncateRecallQuery(rawQuery, prompt, state.config.recallMaxQueryChars);
+			const rawQuery = composeRecallQuery(event.prompt, messages, state.config.retainContextTurns);
+			const query = truncateRecallQuery(rawQuery, event.prompt, state.config.recall.maxQueryChars);
 			logger.debug(`[mmemory] first-turn recall: query=${query.slice(0, 80)}...`, { source: "mmemory" });
 			const result = await executeMemoryRecall(
 				query, getRecallScope(ctx.sessionManager), state.config, ctx.modelRegistry, settings,
@@ -487,10 +490,10 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			: undefined;
 
 		if (state.lastRecallSnippet || mmBlock) {
-			let extra = systemPrompt.trimEnd();
+			let extra = event.systemPrompt.join("\n").trimEnd();
 			if (state.lastRecallSnippet) extra += "\n\n" + state.lastRecallSnippet;
 			if (mmBlock) extra += "\n\n" + mmBlock;
-			return { systemPrompt: extra };
+			return { systemPrompt: [extra] };
 		}
 
 		return undefined;

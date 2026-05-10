@@ -23,7 +23,6 @@ import { resolveModelRoleValue } from "../config/model-resolver";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { Spacer, Text } from "@oh-my-pi/pi-tui";
 import { DynamicBorder } from "../modes/components/dynamic-border";
-import { showMPanel } from "../utils/m-utils";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
@@ -46,6 +45,7 @@ import {
 } from "../extensibility/plugins/marketplace";
 import type { InteractiveModeContext } from "../modes/types";
 import { parseMarketplaceInstallArgs, parsePluginScopeArgs } from "./marketplace-install-parser";
+import type { SessionMessageEntry } from "../session/session-manager";
 
 function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
@@ -144,7 +144,7 @@ async function callLLMForMemory(
 	const response = await completeSimple(
 		model,
 		{
-			systemPrompt,
+			systemPrompt: [systemPrompt],
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
 		},
 		{ apiKey },
@@ -190,7 +190,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.showStatus(result.resultCount > 0
 				? `mmemory: ${result.resultCount} memories found.`
 				: "mmemory: no memories found.");
-			showMPanel(runtime.ctx, `Memory Recall — "${query}"`, result.text || "_No results._");
+			if (result.text) { runtime.ctx.session.agent.prompt(`[Memory Recall — "${query}"]\n\n${result.text}`); }
 			break;
 		}
 		case "reflect": {
@@ -201,12 +201,12 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 			runtime.ctx.showStatus(`mmemory: reflecting on "${query}"...`);
 			const result = await executeMemoryReflect(query, scope, config);
 			runtime.ctx.showStatus(`mmemory: reflect done (${result.resultCount} memories).`);
-			showMPanel(runtime.ctx, `Memory Reflection — "${query}"`, result.text || "_No results._");
+			if (result.text) { runtime.ctx.session.agent.prompt(`[Memory Reflection — "${query}"]\n\n${result.text}`); }
 			break;
 		}
 		case "retain": {
 			runtime.ctx.showStatus("mmemory: retaining session...");
-			const result = await executeManualRetain(runtime.ctx);
+			const result = await executeManualRetain({ sessionManager: runtime.ctx.sessionManager } as unknown as import("../extensibility/extensions").ExtensionContext);
 			if (result.written) {
 				runtime.ctx.showStatus("mmemory: session retained.");
 			} else {
@@ -409,7 +409,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 				runtime.ctx.showStatus("mprune: not enabled. Set mprune.enabled: true in config.");
 				return;
 			}
-			const unprunedEntries = entries.filter(e => {
+			const unprunedEntries = entries.filter((e): e is SessionMessageEntry => {
 				if (e.type !== "message") return false;
 				const msg = e.message as { role: string; prunedAt?: number };
 				return msg.role === "toolResult" && msg.prunedAt === undefined;
@@ -421,7 +421,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 			runtime.ctx.showStatus(`mprune: summarizing ${unprunedEntries.length} unpruned tool result(s)...`);
 			try {
 				const registry = runtime.ctx.session.modelRegistry;
-				const roleValue = settings.get("modelRoles.prune" as "modelRoles.smol") ?? settings.get("modelRoles.smol") ?? settings.get("modelRoles.default" as "modelRoles.smol");
+				const roleValue = settings.getModelRole("prune") ?? settings.getModelRole("smol") ?? settings.getModelRole("default");
 				const resolved = resolveModelRoleValue(roleValue, registry.getAvailable(), { modelRegistry: registry });
 				const model = resolved.model;
 				if (!model) { runtime.ctx.showStatus("mprune: no model configured (set modelRoles.prune)."); return; }
@@ -443,7 +443,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 				const response = await completeSimple(
 					model,
 					{
-						systemPrompt: buildSummarizerPrompt(),
+						systemPrompt: [buildSummarizerPrompt()],
 						messages: [{ role: "user", content: [{ type: "text", text: serialized }], timestamp: Date.now() }],
 					},
 				{ },

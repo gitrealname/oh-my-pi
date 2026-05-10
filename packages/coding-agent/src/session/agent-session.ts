@@ -3270,6 +3270,7 @@ export class AgentSession {
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
+			taskDepth: 0,
 		};
 	}
 
