@@ -333,57 +333,67 @@ into a `/slash-command` with full model routing, skill injection, and execution 
 
 **Frontmatter fields:**
 
-| Field | Type | Effect |
-|---|---|---|
-| `name` | string | Slash command name (required). `/name` to invoke. |
-| `description` | string | Shown in command list. |
-| `model` | role or model string | Switch model for this command. Restored after. |
-| `thinking` | `low`\|`medium`\|`high`\|`none` | Set thinking level. Restored after. |
-| `skill` | skill name | Inject a skill file into the system prompt. |
-| `chain` | pipeline expression | Run steps sequentially (see chain syntax below). |
-| `loop` | integer | Repeat the template body N times. |
+| Field | Type | Effect | Enforced? |
+|---|---|---|---|
+| `name` | string | Slash command name (required). `/name` to invoke. | — |
+| `description` | string | Shown in `/help`. | — |
+| `role` | role name | Switch model via `modelRoles` config (`slow`, `smol`, `vision`, `qwen`…). Restored after. Unknown role = clean abort. | Yes — API |
+| `model` | provider/model string | Switch to an explicit concrete model (`openrouter/qwen/qwen-2.5-72b-instruct`). No role resolution. Restored after. | Yes — API |
+| `thinking` | `low`\|`medium`\|`high`\|`none` | Set thinking level for this command. Restored after. | Yes — API |
+| `skill` | skill name | Inject skill file body into system prompt as `## Skill: name`. | Yes — sysprompt |
+| `tools` | string list | Restrict active tools to this whitelist for the command. Restored after. | Yes — API |
+| `memory` | `"none"` | Strip `<observations>/<memories>/<referenced_files>` from system prompt for this command turn. | Yes — sysprompt |
+| `chain` | pipeline string | Run commands sequentially: `/cmd1 $@ -> /cmd2 -> /cmd3`. | — |
+| `loop` | integer | Repeat body N times with context from previous iteration. | — |
 
 The template body is rendered with `$@` (all args), `$1`, `$2`, etc. as substitution variables.
 
-**Model routing examples:**
+**Model routing — `role:` vs `model:` (distinct fields):**
 
 ```yaml
-# Use a role name from modelRoles config:
-model: slow         # → settings.modelRoles["slow"] = openrouter/deepseek/deepseek-v3.2
-model: smol         # → settings.modelRoles["smol"] = openrouter/xiaomi/mimo-v2-flash
-model: vision       # → settings.modelRoles["vision"] = google/gemini-2.5-flash
-model: qwen         # → custom role: openrouter/qwen/qwen-2.5-72b-instruct
+# role: — resolved via modelRoles config, no provider string needed
+role: slow         # → settings.modelRoles["slow"] = openrouter/deepseek/deepseek-v3.2
+role: smol         # → settings.modelRoles["smol"] = openrouter/xiaomi/mimo-v2-flash
+role: vision       # → settings.modelRoles["vision"] = google/gemini-2.5-flash
+role: qwen         # → custom role added to config
 
-# Or a concrete model string (3-segment provider paths supported):
+# model: — explicit provider/model string, bypasses role resolution
 model: openrouter/xiaomi/mimo-v2-flash
+model: openrouter/qwen/qwen-2.5-72b-instruct
 model: aws-corp/us.anthropic.claude-sonnet-4-5
+
+# Precedence: role: wins if both specified. Unknown role: clean abort (no fallback).
 ```
 
-**Skill injection example:**
+**Full-featured example:**
 
 ```markdown
 ---
 name: deep-review
-model: slow
-skill: architecture-review
-thinking: high
-description: Thorough code review using architecture context
+role: slow                    # use slow model (deepseek-v3.2)
+thinking: high                # extended thinking
+skill: architecture-review    # inject architecture context into system prompt
+memory: none                  # strip <observations>/<memories> for this command
+tools:                        # only these tools available during this command
+  - read
+  - search
+description: Isolated deep review — no memory contamination, limited tools
 ---
 
 Review this code for correctness, edge cases, and design: $@
 ```
 
-The skill `architecture-review.md` content is injected into the system prompt as
-`## Skill: architecture-review\n\n<skill content>`. Model switches to `slow`, thinking
-sets to `high`, both restore when the command completes.
+**What is controlled (enforced, not instructional):**
+- `role:` / `model:` — model switches and restores via `pi.setModel()`. API-enforced.
+- `thinking:` — thinking level switches and restores via `pi.setThinkingLevel()`. API-enforced.
+- `tools:` — active tool set restricted via `pi.setActiveTools()`. API-enforced.
+- `skill:` — skill content added to system prompt before the turn. System-prompt-enforced.
+- `memory: none` — `<observations>/<memories>/<referenced_files>` filtered from system prompt. System-prompt-enforced.
 
-**Important limitations:**
-- Templates run **in the current session** — mmemory injection, active tools, and
-  session context are all inherited. There is no template-level isolation.
-- To run with isolated memory/tools, use an `AgentDefinition` file (`memory: none`,
-  `tools: [read]`) and invoke via `task agent=<name>`.
-- Template follow-up turns (sent via `pi.sendUserMessage`) are not captured in
-  headless `-p` mode — interactive session required to see template output.
+**What cannot be controlled from template frontmatter:**
+- Session conversation history (visible to model; cannot be cleared per-command)
+- `alwaysApply: true` skills already in system prompt (cannot be removed)
+- Base OMP system prompt (role/contract/rules always present)
 
 **Chain syntax:** Pipe-delimited command sequence:
 ```
