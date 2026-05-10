@@ -21,6 +21,7 @@ export interface MemoryBackendStartOptions {
 	agentDir: string;
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
+	memory?: "none" | "inherit";
 }
 
 export interface MemoryBackend {

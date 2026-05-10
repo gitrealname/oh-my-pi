@@ -77,6 +77,9 @@ export const mmemoryBackend: MemoryBackend = {
 			return;
 		}
 
+		// If the spawning agent definition requested no memory injection, skip entirely
+		if (options.memory === "none") return;
+
 		const state: BackendState = {
 			config,
 			lastRecallSnippet: undefined,

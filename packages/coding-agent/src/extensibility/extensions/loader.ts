@@ -272,7 +272,14 @@ async function loadExtension(
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
-		const module = await import(`omp-legacy-pi-file:${resolvedPath}`);
+		// Try plain import first (pre-compiled .js extensions work in compiled binary).
+		// Fall back to omp-legacy-pi-file: scheme for .ts extensions needing the Pi shim.
+		let module: Record<string, unknown>;
+		try {
+			module = await import(resolvedPath) as Record<string, unknown>;
+		} catch {
+			module = await import(`omp-legacy-pi-file:${resolvedPath}`) as Record<string, unknown>;
+		}
 		const factory = (module.default ?? module) as ExtensionFactory;
 
 		if (typeof factory !== "function") {

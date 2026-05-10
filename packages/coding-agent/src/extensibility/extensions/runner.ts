@@ -429,6 +429,7 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		const ac = new AbortController();
 		return {
 			...this.createContext(),
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -439,6 +440,7 @@ export class ExtensionRunner {
 			switchSession: sessionPath => this.#switchSessionHandler(sessionPath),
 			reload: () => this.#reloadHandler(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
+			signal: ac.signal,
 		};
 	}
 

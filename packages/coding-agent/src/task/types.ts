@@ -196,6 +196,7 @@ export interface AgentDefinition {
 	thinkingLevel?: ThinkingLevel;
 	output?: unknown;
 	blocking?: boolean;
+	memory?: "none" | "inherit";  // none=skip injection, inherit=default behavior
 	source: AgentSource;
 	filePath?: string;
 }

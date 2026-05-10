@@ -244,6 +244,10 @@ export interface ToolSession {
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
+	/** Active skill role bindings: maps tool name → model role.
+	 *  Populated from skills that have both `role` and `tools` frontmatter fields.
+	 *  Tools can check this to prefer a skill-specified role over config defaults. */
+	activeSkillRoles?: Map<string, string>;
 }
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;

@@ -38,7 +38,9 @@ export class MmemoryRecallTool implements AgentTool<typeof schema> {
 		_toolCallId: string,
 		{ query, scope }: { query: string; scope?: string },
 	): Promise<AgentToolResult> {
-		const slashCmd = `/mmemory recall ${query}${scope ? ` --scope ${scope}` : ""}`.trim();
+		const activeRole = this.session.activeSkillRoles?.get(this.name);
+		const roleFlag = activeRole ? ` --role ${activeRole}` : "";
+		const slashCmd = `/mmemory recall ${query}${scope ? ` --scope ${scope}` : ""}${roleFlag}`.trim();
 		this.session.eventBus?.emit(SCHEDULE_SLASH_CHANNEL, slashCmd);
 		return toolResult().text("↩").done();
 	}

@@ -3219,6 +3219,7 @@ export class AgentSession {
 			return this.#extensionRunner.createCommandContext();
 		}
 
+		const ac = new AbortController();
 		return {
 			ui: noOpUIContext,
 			hasUI: false,
@@ -3271,6 +3272,7 @@ export class AgentSession {
 			},
 			getSystemPrompt: () => this.systemPrompt,
 			taskDepth: 0,
+			signal: ac.signal,
 		};
 	}
 

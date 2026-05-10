@@ -429,6 +429,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setFocus(this.editor);
 
+		// Initialize hooks BEFORE enabling input to prevent race condition
+		// where user could type a command before it's registered
+		await this.initHooksAndCustomTools();
+
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
 
@@ -453,9 +457,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
 		this.ui.requestRender(true);
-
-		// Initialize hooks with TUI-based UI context
-		await this.initHooksAndCustomTools();
 
 		// Restore mode from session (e.g. plan mode on resume)
 		await this.#restoreModeFromSession();

@@ -258,6 +258,8 @@ export interface ExtensionContext {
 	): Promise<PythonResult>;
 	/** Task recursion depth. 0 = top-level session; >0 = subagent. */
 	readonly taskDepth: number;
+	/** Navigate to a different point in the session tree (available in command context). */
+	navigateTree?(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 }
 
 /**
@@ -283,6 +285,9 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Navigate to a different point in the session tree. */
 	navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 
+
+	/** AbortSignal for the current command invocation. */
+	signal: AbortSignal;
 	/** Switch to a different session file. */
 	switchSession(sessionPath: string): Promise<{ cancelled: boolean }>;
 
@@ -338,6 +343,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** Short snippet included in the tool prompt section to guide LLM tool selection. */
+	promptSnippet?: string;
 	/** Execute the tool. */
 	execute(
 		toolCallId: string,

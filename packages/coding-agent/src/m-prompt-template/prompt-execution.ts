@@ -1,0 +1,91 @@
+import type { Model } from "@oh-my-pi/pi-ai";
+import { substituteArgs } from "./args.js";
+import { getResolvedModelRef, selectModelCandidate, type RegistryLike, type SelectedModelCandidate } from "./model-selection.js";
+import type { PromptWithModel } from "./prompt-loader.js";
+import { renderTemplateConditionals } from "./template-conditionals.js";
+
+export interface PreparedPromptExecution {
+	selectedModel: SelectedModelCandidate;
+	content: string;
+	warning?: string;
+}
+
+export interface EmptyPromptAbort {
+	message: string;
+	warning?: string;
+}
+
+interface PromptExecutionOptions {
+	inheritedModel?: Model<any>;
+}
+
+export interface RenderedPrompt {
+	content?: string;
+	warning?: string;
+	empty?: string;
+}
+
+export function renderPromptForResolvedModel(
+	prompt: Pick<PromptWithModel, "name" | "content">,
+	args: string[],
+	model: Model<any>,
+): RenderedPrompt {
+	const rendered = renderTemplateConditionals(prompt.content, getResolvedModelRef(model), prompt.name);
+	const content = substituteArgs(rendered.content, args);
+	if (content.trim().length === 0) {
+		return {
+			empty: `Prompt \`${prompt.name}\` rendered to an empty message.`,
+			warning: rendered.error,
+		};
+	}
+	return {
+		content,
+		warning: rendered.error,
+	};
+}
+
+function sameModel(a: Model<any> | undefined, b: Model<any> | undefined): boolean {
+	if (!a || !b) return a === b;
+	return a.provider === b.provider && a.id === b.id;
+}
+
+export async function preparePromptExecution(
+	prompt: Pick<PromptWithModel, "name" | "content" | "models">,
+	args: string[],
+	currentModel: Model<any> | undefined,
+	modelRegistry: RegistryLike,
+	options?: PromptExecutionOptions,
+): Promise<PreparedPromptExecution | EmptyPromptAbort | undefined> {
+	const selectedModel =
+		prompt.models.length === 0
+			? (() => {
+				const hasInheritedModel = options !== undefined && Object.hasOwn(options, "inheritedModel");
+				const inheritedModel = hasInheritedModel ? options.inheritedModel : currentModel;
+				if (!inheritedModel) {
+					return {
+						message: `Prompt \`${prompt.name}\` has no \`model\` configured and there is no active session model to inherit.`,
+					};
+				}
+				return {
+					model: inheritedModel,
+					alreadyActive: sameModel(currentModel, inheritedModel),
+				};
+			})()
+			: await selectModelCandidate(prompt.models, currentModel, modelRegistry);
+	if (!selectedModel) return undefined;
+	if ("message" in selectedModel) return selectedModel;
+
+	const rendered = renderPromptForResolvedModel(prompt, args, selectedModel.model);
+	if (rendered.empty) {
+		return {
+			message: rendered.empty,
+			warning: rendered.warning,
+		};
+	}
+
+	return {
+		selectedModel,
+		content: rendered.content ?? "",
+		warning: rendered.warning,
+	};
+}

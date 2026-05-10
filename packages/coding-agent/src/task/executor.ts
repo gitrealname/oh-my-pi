@@ -998,6 +998,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				mcpManager: options.mcpManager,
 				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 				localProtocolOptions: options.localProtocolOptions,
+			memory: agent.memory,
 			});
 
 			activeSession = session;

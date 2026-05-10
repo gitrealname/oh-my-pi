@@ -27,6 +27,7 @@ import chalk from "chalk";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { createAutoresearchExtension } from "./autoresearch";
 import { createMmemoryExtension } from "./mmemory-extension";
+import { createPromptTemplateExtension } from "./m-prompt-template/activate";
 import { createMpruneExtension } from "./extensibility/extensions/m-prune-extension";
 import { createPromptEngine } from "./prompt-engine";
 import { loadCapability } from "./capability";
@@ -251,6 +252,8 @@ export interface CreateAgentSessionOptions {
 	/** Settings instance. Default: Settings.init({ cwd, agentDir }) */
 	settings?: Settings;
 
+	/** Memory injection mode for subagents. "none" skips injection; "inherit" is the default. */
+	memory?: "none" | "inherit";
 	/** Whether UI is available (enables interactive tools like ask). Default: false */
 	hasUI?: boolean;
 }
@@ -1074,6 +1077,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			asyncJobManager,
 		};
 
+
+		// Populate activeSkillRoles from skills that declare role+tools frontmatter
+		// Skills with role: "slow" and tools: ["recall","reflect"] route those tools to that role
+		const activeSkillRoles = new Map<string, string>();
+		for (const skill of skills as Array<{ frontmatter?: Record<string, unknown> }>) {
+			if (!skill.frontmatter) continue;
+			const role = skill.frontmatter["role"] as string | undefined;
+			const tools = skill.frontmatter["tools"] as string[] | undefined;
+			if (role && Array.isArray(tools)) {
+				for (const toolName of tools) {
+					activeSkillRoles.set(toolName, role);
+				}
+			}
+		}
+		toolSession.activeSkillRoles = activeSkillRoles;
 		// Initialize internal URL router for internal protocols (agent://, artifact://, memory://, skill://, rule://, mcp://, local://)
 		const internalRouter = new InternalUrlRouter();
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
@@ -1189,6 +1207,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		inlineExtensions.push(createPromptEngine);
 		inlineExtensions.push(createMmemoryExtension);
 		inlineExtensions.push(createMpruneExtension);
+		inlineExtensions.push(createPromptTemplateExtension);
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
@@ -1870,6 +1889,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					agentDir,
 					taskDepth,
 					parentHindsightSessionState: options.parentHindsightSessionState,
+					memory: options.memory,
 				}),
 			),
 		);

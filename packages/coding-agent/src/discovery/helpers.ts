@@ -264,7 +264,9 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const thinkingLevel = parseThinkingLevel(rawThinkingLevel);
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
-	return { name, description, tools, spawns, model, output, thinkingLevel, blocking };
+	const memory = frontmatter.memory === "none" ? "none" as const :
+		frontmatter.memory === "inherit" ? "inherit" as const : undefined;
+	return { name, description, tools, spawns, model, output, thinkingLevel, blocking, memory };
 }
 
 async function globIf(
