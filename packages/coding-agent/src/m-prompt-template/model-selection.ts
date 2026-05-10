@@ -3,6 +3,13 @@ import type { ResolvedModelRef } from "./template-conditionals.js";
 
 const PREFERRED_PROVIDERS = ["openai-codex", "anthropic", "aws-corp", "bedrock-converse-stream", "github-copilot", "openrouter"];
 
+// Module-level role resolver — set once at activate time from OMP settings.
+// Translates pi/ role prefixes to concrete model strings before registry lookup.
+let _roleResolver: ((role: string) => string | undefined) | undefined;
+export function setRoleResolver(fn: (role: string) => string | undefined): void {
+	_roleResolver = fn;
+}
+
 export interface SelectedModelCandidate {
 	model: Model<any>;
 	alreadyActive: boolean;
@@ -95,11 +102,16 @@ export async function selectModelCandidate(
 	currentModel: Model<any> | undefined,
 	registry: RegistryLike,
 ): Promise<SelectedModelCandidate | undefined> {
+	// Resolve role names via module-level resolver (set from OMP settings at activate time).
+	// e.g. "slow" -> settings.modelRoles["slow"] -> "openrouter/deepseek/deepseek-v3.2"
+	const resolved = _roleResolver
+		? modelSpecs.map((s) => _roleResolver!(s) ?? s)
+		: modelSpecs;
 	if (currentModel && modelSpecs.some((spec) => modelSpecMatches(spec, currentModel))) {
 		return { model: currentModel, alreadyActive: true };
 	}
 
-	for (const spec of modelSpecs) {
+	for (const spec of resolved) {
 		for (const model of getModelCandidates(spec, registry)) {
 			if (await hasUsableAuth(model, registry)) {
 				return { model, alreadyActive: false };

@@ -252,3 +252,29 @@ export async function callWithRole(
 		return null;
 	}
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. resolveTemplateModelSpec
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve a template model: field value to a concrete model string.
+ *
+ * Handles:
+ *   "slow"                       → settings.modelRoles["slow"] → concrete model string
+ *   "smol"                       → settings.modelRoles["smol"] → concrete model string
+ *   "vision"                     → settings.modelRoles["vision"] → concrete model string
+ *   "openrouter/xiaomi/mimo-v2-flash" → returned as-is (already a concrete provider/model)
+ *   "claude-sonnet-4"            → returned as-is (no modelRoles key found)
+ *
+ * Used by m-prompt-template/model-selection.ts to translate role names from template
+ * frontmatter before doing the model registry lookup.
+ *
+ * @param spec      Value from template model: frontmatter field
+ * @param settings  OMP settings (for modelRoles resolution)
+ * @returns Concrete model string, or the original spec if no resolution found
+ */
+export function resolveTemplateModelSpec(spec: string, settings: Settings): string {
+	const roles = settings.get("modelRoles") as Record<string, string | undefined>;
+	return roles[spec] ?? spec;
+}

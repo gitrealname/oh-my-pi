@@ -212,6 +212,7 @@ export interface ParsedAgentFields {
 	output?: unknown;
 	thinkingLevel?: ThinkingLevel;
 	blocking?: boolean;
+	memory?: "none" | "inherit";
 }
 
 /**
