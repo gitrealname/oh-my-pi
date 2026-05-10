@@ -226,14 +226,26 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 		case "status": {
 			const mmPaths = resolvePaths(config);
 			const enabled = settings.get("mmemory.enabled" as SettingPath);
-			const hasChunks = existsSync(mmPaths.chunksPath);
-			const chunkCount = hasChunks
-				? (() => { try { return (JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as unknown[]).length; } catch { return "?"; } })()
-				: 0;
 			const proj = config.projectLabel;
 			const scope = scopeLabel(runtime.ctx.sessionManager, proj);
+			type Chunk = { source?: string; ts?: number; end_ts?: number; date?: string };
+			let chunks: Chunk[] = [];
+			if (existsSync(mmPaths.chunksPath)) {
+				try { chunks = JSON.parse(readFileSync(mmPaths.chunksPath, "utf-8")) as Chunk[]; } catch { /* unreadable */ }
+			}
+			const chunkCount = chunks.length;
+			const obsChunks = chunks.filter(c => c.source === "observation");
+			const lastObsEndTs = obsChunks.length > 0 ? Math.max(...obsChunks.map(c => c.end_ts ?? 0)) : 0;
+			const lastObsDate = obsChunks.find(c => (c.end_ts ?? 0) === lastObsEndTs)?.date;
+			const consolidationInfo = obsChunks.length > 0
+				? `last=${lastObsDate ?? new Date(lastObsEndTs * 1000).toLocaleDateString()} (${obsChunks.length} obs)`
+				: "never";
+			const sessionChunks = chunks.filter(c => c.source === "session");
+			const pendingSessions = sessionChunks.filter(c => (c.ts ?? 0) > lastObsEndTs).length;
+			const minTurns = config.consolidationMinTurns;
 			runtime.ctx.showStatus(
-				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, path=${mmPaths.projectDir}`,
+				`mmemory: enabled=${String(enabled)}, scope=${scope}, chunks=${chunkCount}, ` +
+				`consolidation=${consolidationInfo}, pending=${pendingSessions}/${minTurns}, path=${mmPaths.projectDir}`,
 			);
 			break;
 		}
