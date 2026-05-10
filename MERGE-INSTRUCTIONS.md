@@ -2,7 +2,9 @@
 
 When merging upstream `main` into `aws-corp`, follow this checklist.
 
-Current merge base: `c533b1820` (v14.6.2)
+Current merge base: `3d5abbbbb` (v14.8.0 — last point before 14.8.1 delta; where aws-corp forked from main)
+Last completed merge: `merge_14.6.3.md` (c533b1820 -> 671caba66)
+In progress: `merge_14.8.1.md` — branch `merge/14.8.1` created from aws-corp tip `0bf85c1ae`
 
 ---
 
@@ -10,9 +12,22 @@ Current merge base: `c533b1820` (v14.6.2)
 
 ```bash
 cd D:\.ai\research\omp\.oh-my-pi
-git fetch origin main
+
+# Fetch upstream
+git fetch origin
 git log --oneline aws-corp..origin/main   # review what changed
-git merge origin/main -m "merge: upstream <version> into aws-corp"
+
+# Suggested: rebase onto main on a dedicated branch (preferred over merge)
+git checkout aws-corp
+git checkout -b merge/<version>
+git rebase origin/main
+# Resolve conflicts (see merge_<version>.md for per-file guidance)
+# Build, test, then fast-forward aws-corp:
+git checkout aws-corp && git merge --ff-only merge/<version>
+git push fork aws-corp
+
+# Alternative: merge commit (simpler but creates noisier history)
+# git merge origin/main -m "merge: upstream <version> into aws-corp"
 ```
 
 ---
@@ -39,6 +54,9 @@ Current known list: `native`, `claude`, `codex`, `gemini`, `agents-md`, `agents`
 `claude-plugins`, `cline`, `cursor`, `windsurf`, `vscode`, `github`, `mcp-json`,
 `opencode`, `ssh-json`, `github-copilot`, `fireworks`.
 
+**Check at merge time:** diff `packages/ai/src/stream.ts` serviceProviderMap and
+`packages/coding-agent/src/discovery/` for new PROVIDER_ID constants.
+
 ### 3. New Slash Commands
 
 **Where:** `packages/coding-agent/src/slash-commands/builtin-registry.ts`.
@@ -61,7 +79,12 @@ Current known list: `native`, `claude`, `codex`, `gemini`, `agents-md`, `agents`
 
 **Action if yes:**
 ```bash
-# Stop omp first (baseline.node locked while running)
+# Use build.cmd (canonical) -- stop omp first
+D:\.ai\research\omp\build.cmd
+D:\.ai\research\omp\deploy.cmd
+D:\.ai\research\omp\bundle.cmd
+
+# Or manually if isolating native-only rebuild:
 TARGET_VARIANT=baseline bun run packages/natives/scripts/build-native.ts
 TARGET_VARIANT=modern   bun run packages/natives/scripts/build-native.ts
 ```
@@ -90,19 +113,31 @@ readable). Verify these still export the same API after merge:
 | `packages/ai/src/providers/aws-corp.ts` | NEW -- SSO/Bedrock provider |
 | `packages/ai/src/providers/amazon-bedrock.ts` | +2 lines: bedrock-converse-stream model type |
 | `packages/coding-agent/src/config/settings-schema.ts` | disabledCommands + mbrowser.enabled settings |
+| `packages/coding-agent/src/config/settings-schema-m-extensions.ts` | NEW -- mmemory settings schema |
 | `packages/coding-agent/src/config/model-registry.ts` | +2 lines: bedrock-converse-stream literals |
-| `packages/coding-agent/src/slash-commands/builtin-registry.ts` | /mtree entry + isCommandEnabled guard |
+| `packages/coding-agent/src/slash-commands/builtin-registry.ts` | /mtree + /mmemory status + isCommandEnabled guard |
 | `packages/coding-agent/src/extensibility/slash-commands.ts` | isCommandEnabled() + filter |
+| `packages/coding-agent/src/extensibility/extensions/types.ts` | +executePython, +taskDepth, systemPrompt string->string[] revert |
+| `packages/coding-agent/src/memory-backend/mmemory-backend.ts` | NEW -- MemoryBackend impl |
+| `packages/coding-agent/src/memory-backend/resolve.ts` | "mmemory" registered |
+| `packages/coding-agent/src/memory-backend/types.ts` | MemoryBackendId union |
+| `packages/coding-agent/src/mmemory-extension.ts` | NEW -- extension event handlers |
+| `packages/coding-agent/src/session/agent-session.ts` | setMmemoryBackendState/getMmemoryBackendState |
+| `packages/coding-agent/src/tools/mmemory/` | NEW -- all mmemory tools + Python server + test suites |
+| `packages/coding-agent/src/tools/index.ts` | mmemory registrations + SETTINGS_SCHEMA fallback; mbrowser registration |
+| `packages/coding-agent/src/sdk.ts` | createPromptEngine import + push |
+| `packages/coding-agent/src/sidecars/mme-*.md` | NEW -- mmemory sidecars (consolidation, injection, recall, reflect, retain, time-filter) |
+| `packages/coding-agent/src/sidecars/mreview.tool-desc.md` | NEW -- mreview sidecar |
+| `packages/coding-agent/src/utils/m-utils.ts` | NEW -- createSidecar, sidecarPath, callWithRole, empty-string guard |
 | `packages/coding-agent/src/modes/interactive-mode.ts` | showMTreeSelector() delegation |
 | `packages/coding-agent/src/modes/controllers/selector-controller.ts` | showMTreeSelector() method |
 | `packages/coding-agent/src/modes/components/tree-peek.ts` | NEW -- TreePeekComponent |
 | `packages/coding-agent/src/modes/components/tree-selector.ts` | getTreeList() exposed |
 | `packages/coding-agent/src/tools/mbrowser.ts` | NEW -- MBrowserTool |
-| `packages/coding-agent/src/tools/index.ts` | mbrowser registration + SETTINGS_SCHEMA fallback |
-| `packages/coding-agent/src/sdk.ts` | createPromptEngine import + push |
 | `packages/coding-agent/src/edit/normalize.ts` | Count-based detectLineEnding |
 | `packages/natives/native/index.js` | detectAvx2Support os.cpus() fallback |
 | `packages/natives/native/embedded-addon.js` | win32-x64 native embed paths |
+| `docs/mmemory.md` | NEW -- user doc |
 | `.gitignore` | /.*  pattern + binaries/ + **/.index.html |
 
 ### Conflict resolution rule
@@ -119,19 +154,22 @@ Never drop our block to accept upstream wholesale.
 bun tsc --noEmit --project packages/coding-agent/tsconfig.json
 bun tsc --noEmit --project packages/ai/tsconfig.json
 
-# 2. Tests (our changed files)
-bun test packages/coding-agent/test/tools/index.test.ts \
-         packages/coding-agent/test/core/python-executor.test.ts \
-         packages/coding-agent/test/tools/search-renderer.test.ts \
-         packages/ai/test/stream.test.ts
+# 2. TypeScript tests (changed files)
+bun test packages/coding-agent/test/core/python-executor.test.ts
+bun test packages/ai/test/stream.test.ts
+# Note: tools/index.test.ts, workspace-tree, tool-discovery, loop-limit tests
+# were deleted upstream -- do not run
 
-# 3. Build binary
-bun.exe build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv ^
-  --define PI_COMPILED=true --root . --external mupdf --target bun-windows-x64-modern ^
-  ./packages/coding-agent/src/cli.ts --outfile packages/coding-agent/binaries/omp-aws-corp.exe
+# 3. mmemory Python tests (must pass 115/115)
+cd packages/coding-agent/src/tools/mmemory
+python3 test_mmemory.py           # 20/20
+python3 test_injection.py         # 14/14
+python3 test_injection_snapshot.py  # 43/43
 
-# 4. Deploy (stop omp first)
-copy packages\coding-agent\binaries\omp-aws-corp.exe %LOCALAPPDATA%\omp\omp.exe
+# 4. Build/deploy/bundle (use canonical scripts)
+D:\.ai\research\omp\build.cmd
+D:\.ai\research\omp\deploy.cmd
+D:\.ai\research\omp\bundle.cmd
 
 # 5. Update version in live configs
 #    Set lastChangelogVersion: "X.Y.Z" in both ~/.omp/agent-work/config.yml
@@ -139,7 +177,7 @@ copy packages\coding-agent\binaries\omp-aws-corp.exe %LOCALAPPDATA%\omp\omp.exe
 
 # 6. Tag and push
 git tag vX.Y.Z-aws-corp
-git push && git push --tags
+git push fork aws-corp && git push fork --tags
 ```
 
 ---
