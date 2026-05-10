@@ -506,3 +506,16 @@ This takes a few seconds — normal.
 **Seeing a Python process in Task Manager:**
 That's the mmemory recall server (`mmemory_server.py`). It runs at BELOW_NORMAL
 priority and self-terminates after `serverIdleTimeoutMinutes` of inactivity.
+
+---
+
+## Integration with Prompt Templates
+
+The `m-prompt-template` system (see `AWS-CORP.md §13`) can invoke mmemory tools
+from within template chains. A template with `skill: architecture-review` will inject
+skill context into the same session that has mmemory active. Both operate on the
+system prompt concurrently — mmemory via `<observations>/<memories>/<referenced_files>`
+blocks, skill context via `## Skill: <name>` section.
+
+For memory-isolated template execution, define an `AgentDefinition` with `memory: none`
+and invoke it from a template body: `task agent=isolated-agent, assignment="$@"`.

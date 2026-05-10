@@ -35,8 +35,8 @@ session actually shrinks after a flush (not just gets a steer message bolted on 
 Fork of [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) with
 enterprise and workflow extensions baked into the binary.
 
-Current base: upstream v14.5.14 (`ae7c4100c`)
-Upstream: `origin/main` → periodically merged into `aws-corp`.
+Current base: upstream v14.8.1 (`d4bb2f3f3`)
+Upstream: `origin/main` → periodically merged into `aws-corp`. Last merge: 2026-05-09.
 See [MERGE-INSTRUCTIONS.md](MERGE-INSTRUCTIONS.md) for merge checklist.
 
 ---
@@ -209,7 +209,7 @@ cloud embedding API. Uses `BAAI/bge-small-en-v1.5` (~25 MB, first-run download).
 **Chunk metadata dimensions** (all stored per chunk, all filterable):
 - `project` — normalized working directory path (e.g. `D/.ai`)
 - `agent_tag` — agent identity within a project (default: `"default"`)
-- `source` — `"session"` for retained memories, `"document"` for indexed content
+- `source` — `"session"` (retained session chunks) | `"file"` (file path index) | `"observation"` (consolidated insights)
 - `ts` — Unix seconds, derived from queue filename at ingest time
 - `session_id` — which session produced this chunk
 
@@ -225,7 +225,7 @@ Natural language time references ("yesterday", "last week", "3 days ago") are
 pre-processed by a cheap LLM call that extracts `ts_after`/`ts_before` bounds
 before the semantic search. Prompt is sidecar-overridable (see §12).
 
-**Slash commands:** `/mmemory recall|retain|reflect|view|clear|status|enqueue|consolidate|mm`
+**Slash commands:** `/mmemory recall|retain|reflect|status|scope`
 
 Files:
 - `packages/coding-agent/src/mmemory-extension.ts` — extension factory
@@ -235,7 +235,6 @@ Files:
 - `packages/coding-agent/src/sidecars/mme-recall.tool-desc.md` — recall tool description (sidecar)
 - `packages/coding-agent/src/sidecars/mme-retain.tool-desc.md` — retain tool description (sidecar)
 - `packages/coding-agent/src/sidecars/mme-reflect.tool-desc.md` — reflect tool description (sidecar)
-- `packages/coding-agent/src/sidecars/mme-gateway.tool-desc.md` — .memory gateway description (sidecar)
 
 See [docs/mmemory.md](docs/mmemory.md) for full documentation.
 
@@ -315,13 +314,105 @@ descriptions. Other agents on the same machine are unaffected.
 | `mme-recall.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
 | `mme-retain.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
 | `mme-reflect.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
-| `mme-gateway.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
+| `mme-consolidation.prompt.md` | mmemory | LLM prompt | `<agentDir>/sidecars/` |
+| `mme-injection-preamble.md` | mmemory | System prompt | `<agentDir>/sidecars/` |
+| `mme-recall-preamble.prompt.md` | mmemory | System prompt | `<agentDir>/sidecars/` |
 | `mprune-summarizer.prompt.md` | mprune | LLM prompt | `<agentDir>/sidecars/` |
 | `mreview-editor.ui.html` | mreview | Browser UI | `<agentDir>/sidecars/` |
 
 ---
 
-### 13. app.script.1-10 (Generic Script Executor)
+### 13. m-prompt-template — Declarative Slash Commands
+
+Source: adapted from [pi-prompt-template-model](https://github.com/nicobailon/pi-prompt-template-model)
+(MIT, Nico Bailon). All `@mariozechner/pi-*` imports rewritten to `@oh-my-pi/pi-*`.
+Copied into binary as `packages/coding-agent/src/m-prompt-template/`.
+
+Turn any `.md` file in `~/.pi/prompts/` (or `~/.pi/agent/prompts/` for global templates)
+into a `/slash-command` with full model routing, skill injection, and execution control.
+
+**Frontmatter fields:**
+
+| Field | Type | Effect |
+|---|---|---|
+| `name` | string | Slash command name (required). `/name` to invoke. |
+| `description` | string | Shown in command list. |
+| `model` | role or model string | Switch model for this command. Restored after. |
+| `thinking` | `low`\|`medium`\|`high`\|`none` | Set thinking level. Restored after. |
+| `skill` | skill name | Inject a skill file into the system prompt. |
+| `chain` | pipeline expression | Run steps sequentially (see chain syntax below). |
+| `loop` | integer | Repeat the template body N times. |
+
+The template body is rendered with `$@` (all args), `$1`, `$2`, etc. as substitution variables.
+
+**Model routing examples:**
+
+```yaml
+# Use a role name from modelRoles config:
+model: slow         # → settings.modelRoles["slow"] = openrouter/deepseek/deepseek-v3.2
+model: smol         # → settings.modelRoles["smol"] = openrouter/xiaomi/mimo-v2-flash
+model: vision       # → settings.modelRoles["vision"] = google/gemini-2.5-flash
+model: qwen         # → custom role: openrouter/qwen/qwen-2.5-72b-instruct
+
+# Or a concrete model string (3-segment provider paths supported):
+model: openrouter/xiaomi/mimo-v2-flash
+model: aws-corp/us.anthropic.claude-sonnet-4-5
+```
+
+**Skill injection example:**
+
+```markdown
+---
+name: deep-review
+model: slow
+skill: architecture-review
+thinking: high
+description: Thorough code review using architecture context
+---
+
+Review this code for correctness, edge cases, and design: $@
+```
+
+The skill `architecture-review.md` content is injected into the system prompt as
+`## Skill: architecture-review\n\n<skill content>`. Model switches to `slow`, thinking
+sets to `high`, both restore when the command completes.
+
+**Important limitations:**
+- Templates run **in the current session** — mmemory injection, active tools, and
+  session context are all inherited. There is no template-level isolation.
+- To run with isolated memory/tools, use an `AgentDefinition` file (`memory: none`,
+  `tools: [read]`) and invoke via `task agent=<name>`.
+- Template follow-up turns (sent via `pi.sendUserMessage`) are not captured in
+  headless `-p` mode — interactive session required to see template output.
+
+**Chain syntax:** Pipe-delimited command sequence:
+```
+chain: /research $@ -> /draft -> /review
+```
+Each step receives the output of the previous step as context.
+
+**Where to put templates:**
+```
+~/.pi/agent/prompts/    ← global (all sessions, all projects)
+~/.pi/prompts/          ← project-local (cwd/.pi/prompts/)
+```
+
+Files:
+- `packages/coding-agent/src/m-prompt-template/index.ts` — main extension (~1770 lines)
+- `packages/coding-agent/src/m-prompt-template/activate.ts` — OMP activation wrapper
+- `packages/coding-agent/src/m-prompt-template/model-selection.ts` — role resolution
+- `packages/coding-agent/src/m-prompt-template/prompt-loader.ts` — template scanning + registration
+- `packages/coding-agent/src/utils/m-utils.ts` — `resolveTemplateModelSpec()` shared utility
+
+Config: templates are auto-discovered — no config key required. To disable:
+```yaml
+disabledCommands:
+  - chain-prompts   # disables the built-in /chain-prompts orchestration command
+```
+
+---
+
+### 14. app.script.1-10 (Generic Script Executor)
 
 Ten keybinding slots (`app.script.1` through `app.script.10`) that execute
 arbitrary shell commands and route their output into the agent session.
@@ -369,6 +460,7 @@ See `research/omp/dist-templates/config-ow.yml` for the fully annotated config.
 | mprune image aging | `mprune.images.keepTurns` | `5` | |
 | MReview command | `mreview.enabled` | `true` | [docs/mreview.md](docs/mreview.md) |
 | Script slots | `appScripts.slot1..10.command` | `~` | |
+| Prompt templates | auto-discovered from `~/.pi/agent/prompts/` | — | § 13 |
 
 ---
 
