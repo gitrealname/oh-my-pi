@@ -49,8 +49,8 @@ function isValidSpec(spec: string): boolean {
 
 	const segments = spec.split("/");
 	if (segments.length === 1) return true;
-	if (segments.length !== 2) return false;
-	return segments[0].length > 0 && segments[1].length > 0;
+	if (segments.length < 1) return false;
+	return segments.every((s) => s.length > 0);
 }
 
 function matchSpec(spec: string, model: ResolvedModelRef): boolean {

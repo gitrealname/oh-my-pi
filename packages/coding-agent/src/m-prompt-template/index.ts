@@ -228,7 +228,7 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 				kind: "ready",
 				message: {
 					customType: "skill-loaded",
-					content: `<skill name="${normalizedSkillName}">\n${skillContent}\n</skill>`,
+					content: `## Skill: ${normalizedSkillName}\n\n${skillContent}`,
 					display: true,
 					details: { skillName: normalizedSkillName, skillContent, skillPath },
 				},
@@ -1659,12 +1659,14 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		}
 
 		const skillMessage = consumePendingSkillMessage();
-		if (additions.length === 0 && !skillMessage) return;
-
-		return {
-			...(additions.length > 0 ? { systemPrompt: [...event.systemPrompt, ...additions] } : {}),
-			...(skillMessage ? { message: skillMessage } : {}),
-		};
+		// Inject skill content into system prompt so it carries system authority.
+		// Sending as a user message causes security-aware models (Claude) to reject it
+		// as a prompt injection attempt. System prompt injection is the correct path.
+		if (skillMessage) {
+			additions.push(skillMessage.content);
+		}
+		if (additions.length === 0) return;
+		return { systemPrompt: [...event.systemPrompt, ...additions] };
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -1757,7 +1759,8 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	refreshPrompts(process.cwd());
+	// Initial scan deferred to session_start where ctx.cwd is the actual project dir. // cache-bust: 1778394452
+	// process.cwd() at activate time is the binary home dir, not the project dir.
 	if (toolManager.isEnabled()) toolManager.ensureRegistered();
 
 	pi.registerCommand("chain-prompts", {

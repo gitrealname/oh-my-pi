@@ -60,8 +60,7 @@ function isValidModelSpec(spec: string): boolean {
 	if (!spec || spec.includes("*") || /\s/.test(spec)) return false;
 	const segments = spec.split("/");
 	if (segments.length === 1) return true;
-	if (segments.length !== 2) return false;
-	return segments[0].length > 0 && segments[1].length > 0;
+	return segments.every((s) => s.length > 0);
 }
 
 function parseModelField(

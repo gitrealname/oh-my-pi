@@ -75,7 +75,7 @@ function getModelCandidates(modelSpec: string, registry: Pick<RegistryLike, "fin
 	if (slashIndex !== -1) {
 		const provider = modelSpec.slice(0, slashIndex);
 		const modelId = modelSpec.slice(slashIndex + 1);
-		if (!provider || !modelId || modelId.includes("/")) return [];
+		if (!provider || !modelId) return [];
 		const model = registry.find(provider, modelId);
 		return model ? [model] : [];
 	}

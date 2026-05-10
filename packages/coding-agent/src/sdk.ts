@@ -27,7 +27,8 @@ import chalk from "chalk";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { createAutoresearchExtension } from "./autoresearch";
 import { createMmemoryExtension } from "./mmemory-extension";
-import { createPromptTemplateExtension } from "./m-prompt-template/activate";
+import { createPromptTemplateExtension, setMPromptTemplateRoleResolver } from "./m-prompt-template/activate";
+import { resolveTemplateModelSpec } from "./utils/m-utils";
 import { createMpruneExtension } from "./extensibility/extensions/m-prune-extension";
 import { createPromptEngine } from "./prompt-engine";
 import { loadCapability } from "./capability";
@@ -1207,6 +1208,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		inlineExtensions.push(createPromptEngine);
 		inlineExtensions.push(createMmemoryExtension);
 		inlineExtensions.push(createMpruneExtension);
+		// Initialize m-prompt-template role resolver from settings before activation.
+		// Templates can use bare role names (model: slow, model: smol) resolved via modelRoles config.
+		setMPromptTemplateRoleResolver((spec) => resolveTemplateModelSpec(spec, settings));
 		inlineExtensions.push(createPromptTemplateExtension);
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
