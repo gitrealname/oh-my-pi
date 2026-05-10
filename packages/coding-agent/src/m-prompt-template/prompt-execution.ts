@@ -50,7 +50,7 @@ function sameModel(a: Model<any> | undefined, b: Model<any> | undefined): boolea
 }
 
 export async function preparePromptExecution(
-	prompt: Pick<PromptWithModel, "name" | "content" | "models">,
+	prompt: Pick<PromptWithModel, "name" | "content" | "models" | "role">,
 	args: string[],
 	currentModel: Model<any> | undefined,
 	modelRegistry: RegistryLike,
@@ -71,7 +71,7 @@ export async function preparePromptExecution(
 					alreadyActive: sameModel(currentModel, inheritedModel),
 				};
 			})()
-			: await selectModelCandidate(prompt.models, currentModel, modelRegistry);
+			: await selectModelCandidate(prompt.models, currentModel, modelRegistry, prompt.role);
 	if (!selectedModel) return undefined;
 	if ("message" in selectedModel) return selectedModel;
 

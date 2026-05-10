@@ -101,24 +101,36 @@ export async function selectModelCandidate(
 	modelSpecs: string[],
 	currentModel: Model<any> | undefined,
 	registry: RegistryLike,
+	roleSpec?: string,
 ): Promise<SelectedModelCandidate | undefined> {
-	// Resolve role names via module-level resolver (set from OMP settings at activate time).
-	// e.g. "slow" -> settings.modelRoles["slow"] -> "openrouter/deepseek/deepseek-v3.2"
-	const resolved = _roleResolver
-		? modelSpecs.map((s) => _roleResolver!(s) ?? s)
-		: modelSpecs;
-	if (currentModel && modelSpecs.some((spec) => modelSpecMatches(spec, currentModel))) {
+	// Build the effective spec list:
+	// - roleSpec (from role: frontmatter) → resolved via _roleResolver, no fallback to raw
+	// - modelSpecs (from model: frontmatter) → used as-is, no role resolution
+	// Precedence: roleSpec wins if present
+	const effectiveSpecs: string[] = [];
+	if (roleSpec) {
+		const resolved = _roleResolver ? _roleResolver(roleSpec) : undefined;
+		if (!resolved) {
+			// Role not found in config — nothing to try
+			return undefined;
+		}
+		effectiveSpecs.push(resolved);
+	} else {
+		// model: field — use directly without role resolution
+		effectiveSpecs.push(...modelSpecs);
+	}
+
+	if (currentModel && effectiveSpecs.some((spec) => modelSpecMatches(spec, currentModel))) {
 		return { model: currentModel, alreadyActive: true };
 	}
 
-	for (const spec of resolved) {
+	for (const spec of effectiveSpecs) {
 		for (const model of getModelCandidates(spec, registry)) {
 			if (await hasUsableAuth(model, registry)) {
 				return { model, alreadyActive: false };
 			}
 		}
 	}
-
 	return undefined;
 }
 

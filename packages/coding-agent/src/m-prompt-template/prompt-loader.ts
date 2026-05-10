@@ -64,6 +64,9 @@ export interface PromptWithModel {
 	description: string;
 	content: string;
 	models: string[];
+	role?: string;          // OMP role name (slow/smol/vision/...) — resolved via modelRoles config
+	tools?: string[];       // restrict active tools to this list for the command; restored after
+	memory?: "none";        // "none" = strip mmemory injection from system prompt for this turn
 	chain?: string;
 	chainContext?: "summary";
 	restore: boolean;
@@ -1633,6 +1636,19 @@ function loadPromptsWithModelFromDir(
 						);
 					}
 				}
+			// role: takes precedence; resolves via modelRoles config at runtime
+			const role = typeof frontmatter.role === "string" && frontmatter.role.trim()
+			    ? frontmatter.role.trim()
+			    : undefined;
+			// tools: restrict active tool set for this command (restored after)
+			const tools = Array.isArray(frontmatter.tools)
+			    ? (frontmatter.tools as unknown[]).filter((t): t is string => typeof t === "string").map(t => t.trim())
+			    : typeof frontmatter.tools === "string" && frontmatter.tools.trim()
+			        ? frontmatter.tools.split(",").map(t => t.trim()).filter(Boolean)
+			        : undefined;
+			// memory: "none" strips mmemory injection from this command's system prompt
+			const memory = frontmatter.memory === "none" ? "none" as const : undefined;
+
 				const hasModelField = Object.hasOwn(frontmatter, "model");
 				const parsedModels = chain ? [] : normalizeModelSpecs(frontmatter.model, fullPath, source, diagnostics);
 				if (!chain && hasModelField && !parsedModels) continue;
@@ -1750,6 +1766,7 @@ function loadPromptsWithModelFromDir(
 					description,
 					content: body,
 					models,
+					role,
 					chain: chain || undefined,
 					chainContext,
 					restore,
@@ -1773,6 +1790,8 @@ function loadPromptsWithModelFromDir(
 					source,
 					subdir: subdir || undefined,
 					filePath: fullPath,
+					tools: tools && tools.length > 0 ? tools : undefined,
+					memory,
 				});
 			} catch (error) {
 				diagnostics.push(

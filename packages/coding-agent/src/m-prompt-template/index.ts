@@ -109,6 +109,9 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 	let chainPrompts = new Map<string, PromptWithModel>();
 	let previousModel: Model<any> | undefined;
 	let previousThinking: ThinkingLevel | undefined;
+	let previousTools: string[] | undefined;    // tool set before restriction; restored after command
+	let activePrompt: PromptWithModel | undefined; // currently-executing prompt (for before_agent_start)
+	let pendingMemoryMode: "none" | undefined; // set before sendUserMessage, read in before_agent_start
 	let pendingSkillMessage: PendingSkillMessage | undefined;
 	let runtimeModel: Model<any> | undefined;
 	let chainActive = false;
@@ -375,6 +378,12 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		if (prompt.thinking) {
 			pi.setThinkingLevel(prompt.thinking);
 		}
+		// Tool restriction: switch to template's tool whitelist; restore after turn completes
+		if (prompt.tools && prompt.tools.length > 0) {
+			await pi.setActiveTools(prompt.tools);
+		}
+		activePrompt = prompt;
+		pendingMemoryMode = prompt.memory;
 		pendingSkillMessage = skillResolution.kind === "ready" ? skillResolution.message : undefined;
 
 		const startId = ctx.sessionManager.getLeafId();
@@ -385,6 +394,7 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		pi.sendUserMessage(content);
 		await waitForTurnStart(ctx);
 		await ctx.waitForIdle();
+		pendingMemoryMode = undefined;
 
 		const entries = getIterationEntries(ctx, startId);
 		if (wasIterationAborted(entries)) return "aborted";
@@ -418,6 +428,11 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		if (restoredParts.length > 0) {
 			notify(ctx, `Restored to ${restoredParts.join(", ")}`, "info");
 		}
+		// Restore tools if restricted by the template
+		if (activePrompt?.tools && activePrompt.tools.length > 0) {
+			await pi.setActiveTools([]); // empty = restore all session tools
+		}
+		activePrompt = undefined;
 	}
 
 	async function restoreAfterExecution(
@@ -552,8 +567,9 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		modelOverride?: string,
 	): Promise<Model<any> | undefined> {
 		const requestedModels = modelOverride ? [modelOverride] : prompt.models;
-		if (requestedModels.length > 0) {
-			const selected = await selectModelCandidate(requestedModels, currentModel, ctx.modelRegistry);
+		const roleSpec = modelOverride ? undefined : prompt.role;
+		if (roleSpec || requestedModels.length > 0) {
+			const selected = await selectModelCandidate(requestedModels, currentModel, ctx.modelRegistry, roleSpec);
 			if (!selected) {
 				notify(ctx, `No available model from: ${requestedModels.join(", ")}`, "error");
 				return undefined;
@@ -1640,6 +1656,15 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		const additions: string[] = [];
 
+		// Memory isolation: strip mmemory blocks when pendingMemoryMode is "none"
+		// pendingMemoryMode is set just before sendUserMessage and cleared after the turn.
+		const basePrompt = pendingMemoryMode === "none"
+			? event.systemPrompt.filter(
+				s => !s.includes("<observations>") &&
+				     !s.includes("<memories>") &&
+				     !s.includes("<referenced_files>"),
+			)
+			: event.systemPrompt;
 		if (toolManager.isEnabled() && !loopState && !chainActive) {
 			const toolGuidance = toolManager.getGuidance();
 			const guidance = toolGuidance
@@ -1660,13 +1685,12 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 
 		const skillMessage = consumePendingSkillMessage();
 		// Inject skill content into system prompt so it carries system authority.
-		// Sending as a user message causes security-aware models (Claude) to reject it
-		// as a prompt injection attempt. System prompt injection is the correct path.
 		if (skillMessage) {
 			additions.push(skillMessage.content);
 		}
-		if (additions.length === 0) return;
-		return { systemPrompt: [...event.systemPrompt, ...additions] };
+		const didStrip = basePrompt.length < event.systemPrompt.length;
+		if (additions.length === 0 && !didStrip) return;
+		return { systemPrompt: [...basePrompt, ...additions] };
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
