@@ -1179,7 +1179,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				try {
 					await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
 				} catch {
-					// Ignore cleanup errors
+					// Dispose timed out or threw — force-abort the session to stop any
+					// remaining in-flight work (LLM streams, tool calls, DB writes).
+					try {
+						await session.abort();
+					} catch {
+						// Ignore escalation errors — best-effort cleanup only
+					}
 				}
 			}
 		}

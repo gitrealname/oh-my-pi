@@ -197,6 +197,34 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 		const state = getOrCreateState(ctx);
 		if (!state || state.pendingBatches.length === 0) return;
 
+		// Guard: if any assistant tool_use block in the session has no matching tool_result,
+		// the session is in an inconsistent state (e.g. task interrupted mid-execution).
+		// Injecting a steer message here would land at the slot the API expects a tool_result,
+		// producing "Expected toolResult blocks at messages[N].content" on the next API call.
+		// Skip the flush and let the pending batches accumulate until the session is repaired.
+		const sessionEntries = ctx.sessionManager.getBranch();
+		const resolvedToolCallIds = new Set<string>();
+		for (const entry of sessionEntries) {
+			if (entry.type !== "message") continue;
+			const msg = entry.message as { role: string; toolCallId?: string; content?: unknown };
+			if (msg.role === "toolResult" && msg.toolCallId) {
+				resolvedToolCallIds.add(msg.toolCallId);
+			}
+		}
+		for (const entry of sessionEntries) {
+			if (entry.type !== "message") continue;
+			const msg = entry.message as { role: string; content?: unknown };
+			if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+			for (const block of msg.content as Array<{ type: string; id?: string }>) {
+				if (block.type === "toolCall" && block.id && !resolvedToolCallIds.has(block.id)) {
+					logger.warn("[mprune] skipping flush — unresolved tool_use detected", {
+						toolCallId: block.id,
+					});
+					return;
+				}
+			}
+		}
+
 		const batchesToFlush = state.pendingBatches.splice(0);
 		const rawChars = batchesToFlush
 			.flatMap(b => b.toolResults)
@@ -231,7 +259,7 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 		// Without this, the original verbose content remains in the session and still costs
 		// tokens on every subsequent API call — defeating the purpose of summarization.
 		// This mirrors what OMP's pruneToolOutputs() does (pruning.ts:85) but for mprune-handled entries.
-		const entries = ctx.sessionManager.getBranch();
+		const entries = sessionEntries;
 		const prunedAt = Date.now();
 		const prunedIds = new Set(
 			batchesToFlush.flatMap(b => b.toolResults.map(r => r.toolCallId)),

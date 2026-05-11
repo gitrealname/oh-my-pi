@@ -14,7 +14,8 @@ export interface ParallelResult<R> {
  * Results are returned in the same order as input items.
  *
  * On abort: returns partial results with `aborted: true`. Completed tasks are preserved,
- * in-progress tasks will complete with their abort handling, skipped tasks are `undefined`.
+ * in-progress tasks return immediately when aborted (teardown continues in background),
+ * skipped tasks are `undefined`.
  *
  * On error: fails fast - does not wait for other workers to complete.
  *
@@ -52,15 +53,30 @@ export async function mapWithConcurrencyLimit<T, R>(
 			const index = nextIndex++;
 			if (index >= items.length) return;
 			try {
-				results[index] = await fn(items[index], index);
+				// Race the task against the abort signal so that when the signal fires we
+				// return immediately rather than waiting for the task's internal teardown
+				// (e.g. subagent session flush + dispose). The task still handles its own
+				// cleanup via its own abort listener; we just don't block on it here.
+				const taskPromise = fn(items[index], index);
+				if (workerSignal.aborted) return;
+				const abortPromise = new Promise<never>((_, reject) => {
+					workerSignal.addEventListener(
+						"abort",
+						() => reject(new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+				});
+				results[index] = await Promise.race([taskPromise, abortPromise]);
 			} catch (error) {
-				// On abort, the fn itself handles it and returns a result
-				// Only propagate non-abort errors
+				// On abort, the fn itself handles it and returns a result.
+				// Only propagate non-abort errors.
 				if (!workerSignal.aborted) {
 					abortController.abort();
 					rejectFirst(error);
 					throw error;
 				}
+				// Aborted mid-task: leave results[index] as undefined (aborted sentinel)
+				return;
 			}
 		}
 	};

@@ -158,6 +158,8 @@ export interface ToolSession {
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get session ID */
+	/** Track tool-owned task work so ESC can abort it independently of the full agent loop. */
+	trackTaskExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	getSessionId?: () => string | null;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
