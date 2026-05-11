@@ -1898,6 +1898,34 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"promptTemplates.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Prompt Templates",
+			description: "Enable the m-prompt-template extension — registers .pi/prompts/ templates as slash commands",
+		},
+	},
+	"autoresearch.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Autoresearch",
+			description: "Enable the autoresearch extension and its /autoresearch slash command",
+		},
+	},
+	"promptEngine.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Prompt Engine",
+			description: "Enable the prompt-engine extension and its template slash commands",
+		},
+	},
+
 	"mreview.enabled": {
 		type: "boolean",
 		default: true,
@@ -1922,7 +1950,7 @@ export const SETTINGS_SCHEMA = {
 
 	"mmemory.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tools",
 			label: "MMemory",

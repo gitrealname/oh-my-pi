@@ -107,7 +107,7 @@ def test_T0_extension_loads():
 
 def test_T1_templates_registered():
     """All template commands appear in /help output — registered at session_start."""
-    print("\nT1: Template commands registered (/t1-basic, /t2-role, /test-pt, etc.)")
+    print("\nT1: Template commands registered (/prompt:t1-basic, /prompt:t2-role, /prompt:test-pt, etc.)")
     rc, stdout, log = run_ow("list all available / commands, one per line")
     has_exception = any("EXCEPTION" in l for l in log)
     # The LLM lists commands it knows about; templates registered as commands appear
@@ -128,7 +128,7 @@ def test_T2_role_field_resolves():
     print("\nT2: role: smol field resolves via modelRoles (no resolution error)")
     before = log_count()
     try:
-        r = subprocess.run([str(OMP), "-p", "/t2-role"] + FLAGS,
+        r = subprocess.run([str(OMP), "-p", "/prompt:t2-role"] + FLAGS,
             cwd=CWD, capture_output=True, text=True, timeout=5, env=ENV)
         rc = r.returncode
     except subprocess.TimeoutExpired:
@@ -149,7 +149,7 @@ def test_T2_role_field_resolves():
 def test_T3_bad_role_clean_error():
     """Unknown role: gives a clean abort — no hang, no crash."""
     print("\nT3: Unknown role: gives clean abort (rc=0, no crash)")
-    rc, stdout, log = run_ow("/t6-bad-role")
+    rc, stdout, log = run_ow("/prompt:t6-bad-role")
     has_exception = any("EXCEPTION" in l for l in log)
     # Unknown role → selectModelCandidate returns undefined → notify error → return "aborted"
     # The command handler aborts cleanly, no sendUserMessage, no hang → rc=0
@@ -168,7 +168,7 @@ def test_T4_model_field_resolves():
     )
     before = log_count()
     try:
-        r = subprocess.run([str(OMP), "-p", "/t-explicit-model"] + FLAGS,
+        r = subprocess.run([str(OMP), "-p", "/prompt:t-explicit-model"] + FLAGS,
             cwd=CWD, capture_output=True, text=True, timeout=5, env=ENV)
         rc = r.returncode
     except subprocess.TimeoutExpired:
@@ -187,19 +187,19 @@ def test_T4_model_field_resolves():
 INTERACTIVE_TESTS = """
 MANUAL TESTS (run in ow --new):
 
-/test-pt say hello
+/prompt:test-pt say hello
   PASS: "TEST MODE ACTIVE" prefix, uses smol model
 
-/t3-no-memory
+/prompt:t3-no-memory
   PASS: system prompt sections listed do NOT include observations/memories/referenced_files
 
-/t4-read-only
+/prompt:t4-read-only
   PASS: model lists only "read" as available tool
 
-/t5-skill
+/prompt:t5-skill
   PASS: response mentions "AZIMUTH-7" (from injected skill)
 
-/t2-role
+/prompt:t2-role
   PASS: model switches to smol (openrouter/xiaomi/mimo-v2-flash), answer is ROLE_T2_OK
 """
 

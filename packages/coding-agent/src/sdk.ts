@@ -36,7 +36,7 @@ import { type Rule, ruleCapability } from "./capability/rule";
 import { ModelRegistry } from "./config/model-registry";
 import { formatModelString, parseModelPattern, parseModelString, resolveModelRoleValue } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
-import { Settings, type SkillsSettings } from "./config/settings";
+import { Settings, type SettingPath, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
 import "./discovery";
 import { resolveConfigValue } from "./config/resolve-config-value";
@@ -1204,14 +1204,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const inlineExtensions: ExtensionFactory[] = options.extensions ? [...options.extensions] : [];
-		inlineExtensions.push(createAutoresearchExtension);
-		inlineExtensions.push(createPromptEngine);
-		inlineExtensions.push(createMmemoryExtension);
-		inlineExtensions.push(createMpruneExtension);
-		// Initialize m-prompt-template role resolver from settings before activation.
-		// Templates can use bare role names (model: slow, model: smol) resolved via modelRoles config.
-		setMPromptTemplateRoleResolver((spec) => resolveTemplateModelSpec(spec, settings));
-		inlineExtensions.push(createPromptTemplateExtension);
+		if (settings.get("autoresearch.enabled" as SettingPath) !== false) {
+			inlineExtensions.push(createAutoresearchExtension);
+		}
+		if (settings.get("promptEngine.enabled" as SettingPath) !== false) {
+			inlineExtensions.push(createPromptEngine);
+		}
+		if (settings.get("mmemory.enabled" as SettingPath) !== false) {
+			inlineExtensions.push(createMmemoryExtension);
+		}
+		if (settings.get("mprune.enabled" as SettingPath) !== false) {
+			inlineExtensions.push(createMpruneExtension);
+		}
+		if (settings.get("promptTemplates.enabled" as SettingPath) !== false) {
+			setMPromptTemplateRoleResolver((spec) => resolveTemplateModelSpec(spec, settings));
+			inlineExtensions.push(createPromptTemplateExtension);
+		}
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}

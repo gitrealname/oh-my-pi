@@ -147,7 +147,7 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 	pi.registerMessageRenderer(PROMPT_TEMPLATE_DETERMINISTIC_COMPLETION_MESSAGE_TYPE, renderDeterministicCompletion);
 
 	function registerPromptCommand(name: string) {
-		pi.registerCommand(name, {
+		pi.registerCommand(`prompt:${name}`, {
 			description: buildPromptCommandDescription(prompts.get(name)!),
 			handler: async (args, ctx) => {
 				await runPromptCommand(name, args, ctx);
@@ -156,10 +156,9 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 	}
 
 	function refreshPrompts(cwd: string, ctx?: ExtensionContext) {
-		const result = loadPromptsWithModel(cwd);
-		const chainResult = loadPromptsWithModel(cwd, true);
+		const result = loadPromptsWithModel(cwd, true);
 		prompts = result.prompts;
-		chainPrompts = chainResult.prompts;
+		chainPrompts = result.prompts;
 
 		for (const name of prompts.keys()) {
 			registerPromptCommand(name);
@@ -394,7 +393,6 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		pi.sendUserMessage(content);
 		await waitForTurnStart(ctx);
 		await ctx.waitForIdle();
-		pendingMemoryMode = undefined;
 
 		const entries = getIterationEntries(ctx, startId);
 		if (wasIterationAborted(entries)) return "aborted";
@@ -512,7 +510,7 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		const name = spaceIdx >= 0 ? stripped.slice(0, spaceIdx) : stripped;
 		const args = spaceIdx >= 0 ? stripped.slice(spaceIdx + 1) : "";
 
-		if (name === "chain-prompts") {
+		if (name === "mchain-prompts") {
 			await runChainCommand(args, ctx);
 		} else {
 			await runPromptCommand(name, args, ctx);
@@ -1656,15 +1654,28 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		const additions: string[] = [];
 
-		// Memory isolation: strip mmemory blocks when pendingMemoryMode is "none"
-		// pendingMemoryMode is set just before sendUserMessage and cleared after the turn.
-		const basePrompt = pendingMemoryMode === "none"
-			? event.systemPrompt.filter(
-				s => !s.includes("<observations>") &&
-				     !s.includes("<memories>") &&
-				     !s.includes("<referenced_files>"),
-			)
+		// Memory isolation: strip mmemory blocks when the command's memory field is "none".
+		// Primary: pendingMemoryMode is set by executePromptStep before sendUserMessage;
+		// before_agent_start fires for the follow-up turn (template body as prompt text).
+		// Fallback: if prompt text is a slash command, look up the template directly.
+		let memoryMode: "none" | undefined = pendingMemoryMode;
+		pendingMemoryMode = undefined; // consume-and-clear: must happen here, not after waitForIdle
+		if (!memoryMode) {
+			const cmdMatch = event.prompt.match(/^\/prompt:([a-zA-Z0-9_-]+)(?:\s|$)/);
+			if (cmdMatch) {
+				const tp = prompts.get(cmdMatch[1]) ?? chainPrompts.get(cmdMatch[1]);
+				if (tp?.memory === "none") memoryMode = "none";
+			}
+		}
+		const basePrompt = memoryMode === "none"
+			? event.systemPrompt.map(s =>
+				s
+					.replace(/<observations>[\s\S]*?<\/observations>/g, "")
+					.replace(/<memories>[\s\S]*?<\/memories>/g, "")
+					.replace(/<referenced_files>[\s\S]*?<\/referenced_files>/g, ""),
+			).filter(s => s.trim().length > 0)
 			: event.systemPrompt;
+
 		if (toolManager.isEnabled() && !loopState && !chainActive) {
 			const toolGuidance = toolManager.getGuidance();
 			const guidance = toolGuidance
@@ -1688,7 +1699,8 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 		if (skillMessage) {
 			additions.push(skillMessage.content);
 		}
-		const didStrip = basePrompt.length < event.systemPrompt.length;
+		const didStrip = basePrompt.length < event.systemPrompt.length ||
+			(memoryMode === "none" && basePrompt.some((s, i) => s !== event.systemPrompt[i]));
 		if (additions.length === 0 && !didStrip) return;
 		return { systemPrompt: [...basePrompt, ...additions] };
 	});
@@ -1787,11 +1799,16 @@ export default async function promptModelExtension(pi: ExtensionAPI) {
 	// process.cwd() at activate time is the binary home dir, not the project dir.
 	if (toolManager.isEnabled()) toolManager.ensureRegistered();
 
-	pi.registerCommand("chain-prompts", {
+	pi.registerCommand("mchain-prompts", {
 		description: "Chain prompt templates sequentially [template -> template -> ...]",
 		handler: async (args, ctx) => {
 			await runChainCommand(args, ctx);
 		},
 	});
 	toolManager.registerCommand();
+
+	// Register template commands immediately in the factory body so they appear
+	// in interactive-mode's autocomplete (built before session_start fires).
+	// session_start will re-register with the actual ctx.cwd.
+	refreshPrompts(process.cwd(), undefined);
 }

@@ -118,7 +118,7 @@ function runtimeCandidates(cwd: string): string[] {
 	const localSibling = resolve(dirname(fileURLToPath(import.meta.url)), "..", "subagent");
 	return [
 		resolve(cwd, ".pi", "agent", "extensions", "subagent"),
-		join(homedir(), ".pi", "agent", "extensions", "subagent"),
+		join(process.env["PI_CODING_AGENT_DIR"] ?? join(homedir(), ".omp", "agent"), "extensions", "subagent"),
 		localSibling,
 	];
 }

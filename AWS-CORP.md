@@ -324,101 +324,162 @@ descriptions. Other agents on the same machine are unaffected.
 
 ### 13. m-prompt-template — Declarative Slash Commands
 
-Source: adapted from [pi-prompt-template-model](https://github.com/nicobailon/pi-prompt-template-model)
-(MIT, Nico Bailon). All `@mariozechner/pi-*` imports rewritten to `@oh-my-pi/pi-*`.
-Copied into binary as `packages/coding-agent/src/m-prompt-template/`.
+**Source (original):** [`nicobailon/pi-prompt-template-model`](https://github.com/nicobailon/pi-prompt-template-model) (MIT, Nico Bailon).
+All `@mariozechner/pi-*` imports rewritten to `@oh-my-pi/pi-*`.
+Ported into `packages/coding-agent/src/m-prompt-template/`.
 
-Turn any `.md` file in `~/.pi/prompts/` (or `~/.pi/agent/prompts/` for global templates)
-into a `/slash-command` with full model routing, skill injection, and execution control.
+Turn any `.md` file in `<agent-dir>/prompts/` (global, `PI_CODING_AGENT_DIR/prompts/`) or `{cwd}/.pi/prompts/` (project)
+into a `/slash-command`. Frontmatter fields control model routing, skill injection, tool
+restriction, memory isolation, and chaining. All switches restore after the command.
 
-**Frontmatter fields:**
+**OMP additions vs original PT (not in `nicobailon/pi-prompt-template-model`):**
+- `role:` field — resolves via OMP `modelRoles` config; original only has `model:` (explicit string)
+- `memory: false` — strips injected memory blocks from system prompt; original PT has no memory system
+- `promptTemplates.enabled` setting — extension-level enable/disable; original unconditionally loads
+- Factory-body pre-registration (`refreshPrompts(process.cwd())`) for OMP autocomplete timing
+- `activate.ts` adapter isolating OMP-specific patches (`sendUserMessage` → `followUp` delivery,
+  `model_select` event drop) from the PT source
 
-| Field | Type | Effect | Enforced? |
+**Frontmatter reference:**
+
+| Field | Type | Effect | Restored? |
 |---|---|---|---|
-| `name` | string | Slash command name (required). `/name` to invoke. | — |
-| `description` | string | Shown in `/help`. | — |
-| `role` | role name | Switch model via `modelRoles` config (`slow`, `smol`, `vision`, `qwen`…). Restored after. Unknown role = clean abort. | Yes — API |
-| `model` | provider/model string | Switch to an explicit concrete model (`openrouter/qwen/qwen-2.5-72b-instruct`). No role resolution. Restored after. | Yes — API |
-| `thinking` | `low`\|`medium`\|`high`\|`none` | Set thinking level for this command. Restored after. | Yes — API |
-| `skill` | skill name | Inject skill file body into system prompt as `## Skill: name`. | Yes — sysprompt |
-| `tools` | string list | Restrict active tools to this whitelist for the command. Restored after. | Yes — API |
-| `memory` | `"none"` | Strip `<observations>/<memories>/<referenced_files>` from system prompt for this command turn. | Yes — sysprompt |
-| `chain` | pipeline string | Run commands sequentially: `/cmd1 $@ -> /cmd2 -> /cmd3`. | — |
-| `loop` | integer | Repeat body N times with context from previous iteration. | — |
+| `name` | string | Slash command name (required). Type `/prompt:name` to invoke. | — |
+| `description` | string | Shown in autocomplete. | — |
+| `role` | role name | Switch model via `modelRoles` config. Unknown role = clean abort. | ✓ API |
+| `model` | provider/model string | Switch to explicit concrete model. No role resolution. | ✓ API |
+| `thinking` | `low`\|`medium`\|`high`\|`none` | Set thinking level. | ✓ API |
+| `skill` | skill name | Inject `<agent-dir>/skills/{name}.md` into system prompt. | — |
+| `tools` | string list | Restrict active tools to this whitelist. | ✓ API |
+| `memory` | `"false"` | Strip `<observations>/<memories>/<referenced_files>` from system prompt. | — |
+| `chain` | pipeline string | Sequential step pipeline (`->` separator required). | — |
+| `loop` | integer | Repeat body N times with prior-iteration context. | — |
 
-The template body is rendered with `$@` (all args), `$1`, `$2`, etc. as substitution variables.
+Body text substitution: `$@` = all args, `$1`, `$2`, … = positional.
 
-**Model routing — `role:` vs `model:` (distinct fields):**
+---
 
+**Example: basic (no special fields)**
 ```yaml
-# role: — resolved via modelRoles config, no provider string needed
-role: slow         # → settings.modelRoles["slow"] = openrouter/deepseek/deepseek-v3.2
-role: smol         # → settings.modelRoles["smol"] = openrouter/xiaomi/mimo-v2-flash
-role: vision       # → settings.modelRoles["vision"] = google/gemini-2.5-flash
-role: qwen         # → custom role added to config
+---
+name: greet
+description: Greet the user
+---
+Say hello to: $@
+```
+Invoked with `/prompt:greet Alice` → sends "Say hello to: Alice" on current model.
 
-# model: — explicit provider/model string, bypasses role resolution
-model: openrouter/xiaomi/mimo-v2-flash
-model: openrouter/qwen/qwen-2.5-72b-instruct
-model: aws-corp/us.anthropic.claude-sonnet-4-5
-
-# Precedence: role: wins if both specified. Unknown role: clean abort (no fallback).
+**Example: role switch**
+```yaml
+---
+name: quick-answer
+role: smol                # → modelRoles["smol"] = openrouter/xiaomi/mimo-v2-flash
+description: Fast answer on lightweight model
+---
+$@
 ```
 
-**Full-featured example:**
+**Example: memory isolation**
+```yaml
+---
+name: t3-no-memory
+memory: false           # strips <observations>/<memories>/<referenced_files>
+description: Execute with clean system prompt (no injected memory)
+---
+List XML section headers from your system prompt.
+```
 
-```markdown
+**Example: tool restriction**
+```yaml
+---
+name: read-only-task
+tools:
+  - read
+  - search
+description: Task where only read and search are available
+---
+$@
+```
+
+**Example: skill injection**
+```yaml
+---
+name: architecture-advice
+skill: architecture-review   # injects <agent-dir>/skills/architecture-review.md
+role: slow
+description: Architecture review with injected context
+---
+Review: $@
+```
+
+**Example: chain (sequential pipeline)**
+```yaml
+---
+name: research-and-draft
+chain: "research $@ -> draft -> review"    # -> separator required
+description: Research topic, draft response, review
+---
+```
+Each step sees the prior steps' output in conversation context.
+Ad-hoc chains: `/mchain-prompts step1 -> step2 -> step3`
+
+**Example: full-featured (all controls)**
+```yaml
 ---
 name: deep-review
 role: slow                    # use slow model (deepseek-v3.2)
 thinking: high                # extended thinking
-skill: architecture-review    # inject architecture context into system prompt
-memory: none                  # strip <observations>/<memories> for this command
-tools:                        # only these tools available during this command
+skill: architecture-review    # inject skill into system prompt
+memory: false                # strip <observations>/<memories> for this command
+tools:                        # only these tools available
   - read
   - search
-description: Isolated deep review — no memory contamination, limited tools
+description: Isolated deep review — no memory, limited tools, slow model
 ---
-
 Review this code for correctness, edge cases, and design: $@
 ```
 
-**What is controlled (enforced, not instructional):**
-- `role:` / `model:` — model switches and restores via `pi.setModel()`. API-enforced.
-- `thinking:` — thinking level switches and restores via `pi.setThinkingLevel()`. API-enforced.
-- `tools:` — active tool set restricted via `pi.setActiveTools()`. API-enforced.
-- `skill:` — skill content added to system prompt before the turn. System-prompt-enforced.
-- `memory: none` — `<observations>/<memories>/<referenced_files>` filtered from system prompt. System-prompt-enforced.
-
-**What cannot be controlled from template frontmatter:**
-- Session conversation history (visible to model; cannot be cleared per-command)
-- `alwaysApply: true` skills already in system prompt (cannot be removed)
-- Base OMP system prompt (role/contract/rules always present)
-
-**Chain syntax:** Pipe-delimited command sequence:
+**model: vs role: distinction:**
+```yaml
+role: slow          # resolved via modelRoles config → concrete string
+model: openrouter/qwen/qwen-2.5-72b-instruct  # explicit, no resolution
 ```
-chain: /research $@ -> /draft -> /review
-```
-Each step receives the output of the previous step as context.
+`role:` wins if both specified. Unknown role = clean abort, no fallback to `model:`.
+3-segment provider paths (`openrouter/org/name`) supported.
 
-**Where to put templates:**
+**Built-in commands added by this extension:**
+- `/mchain-prompts step1 -> step2` — ad-hoc chain without a frontmatter definition
+- `/mprompt-tool [on|off|guidance]` — toggle the run-prompt AI tool (lets the model invoke templates)
+
+**Template discovery:**
 ```
 ~/.pi/agent/prompts/    ← global (all sessions, all projects)
-~/.pi/prompts/          ← project-local (cwd/.pi/prompts/)
+{cwd}/.pi/prompts/      ← project-local
+~/.pi/agent/prompts_disabled/  ← move here to hide without deleting
 ```
 
-Files:
-- `packages/coding-agent/src/m-prompt-template/index.ts` — main extension (~1770 lines)
-- `packages/coding-agent/src/m-prompt-template/activate.ts` — OMP activation wrapper
-- `packages/coding-agent/src/m-prompt-template/model-selection.ts` — role resolution
+**Enable/disable:**
+```yaml
+# Disable entire extension (all templates hidden):
+promptTemplates:
+  enabled: false
+
+# Hide specific built-in commands (OMP disabledCommands list):
+disabledCommands:
+  - mchain-prompts
+  - mprompt-tool
+```
+
+**Files:**
+- `packages/coding-agent/src/m-prompt-template/index.ts` — main extension
+- `packages/coding-agent/src/m-prompt-template/activate.ts` — OMP adapter (patches + role resolver)
+- `packages/coding-agent/src/m-prompt-template/model-selection.ts` — role → model resolution
 - `packages/coding-agent/src/m-prompt-template/prompt-loader.ts` — template scanning + registration
 - `packages/coding-agent/src/utils/m-utils.ts` — `resolveTemplateModelSpec()` shared utility
+- `feature-prompt-template-integration-STATUS.md` — detailed integration notes, OMP vs PI differences
 
-Config: templates are auto-discovered — no config key required. To disable:
-```yaml
-disabledCommands:
-  - chain-prompts   # disables the built-in /chain-prompts orchestration command
-```
+Config key: `promptTemplates.enabled` (default: `true`).
+See §15 (Config Surface) for the full table.
 
 ---
 
@@ -461,16 +522,16 @@ See `research/omp/dist-templates/config-ow.yml` for the fully annotated config.
 | MBrowser tool | `mbrowser.enabled` | `true` | |
 | Disabled commands | `disabledCommands[]` | `[]` | |
 | Double-escape action | `doubleEscapeAction` | `"tree"` | options: tree\|mtree\|branch\|none |
-| mmemory | `mmemory.enabled` | `false` | [docs/mmemory.md](docs/mmemory.md) |
+| mmemory | `mmemory.enabled` | `true` | [docs/mmemory.md](docs/mmemory.md) |
 | mmemory storage | `mmemory.storageRoot` | `~/mmemory` | |
 | mmemory agent tag | `mmemory.agentTag` | `"default"` | |
 | mmemory time-filter model | `mmemory.timeFilterModelRole` | inherits modelRole | |
-| mprune | `mprune.enabled` | `false` | [docs/mprune.md](docs/mprune.md) |
+| mprune | `mprune.enabled` | `true` | [docs/mprune.md](docs/mprune.md) |
 | mprune trim | `mprune.trim.softTrimChars` | `12000` | chars (~3k tokens) |
 | mprune image aging | `mprune.images.keepTurns` | `5` | |
 | MReview command | `mreview.enabled` | `true` | [docs/mreview.md](docs/mreview.md) |
 | Script slots | `appScripts.slot1..10.command` | `~` | |
-| Prompt templates | auto-discovered from `~/.pi/agent/prompts/` | — | § 13 |
+| Prompt templates | `promptTemplates.enabled` | `true` | § 13 |
 
 ---
 

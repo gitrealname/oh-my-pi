@@ -7,8 +7,8 @@ import { parseChainDeclaration } from "./chain-parser.js";
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export const RESERVED_COMMAND_NAMES = new Set([
-	"chain-prompts",
-	"prompt-tool",
+	"mchain-prompts",
+	"mprompt-tool",
 	"settings",
 	"model",
 	"scoped-models",
@@ -1427,6 +1427,7 @@ function loadPromptsWithModelFromDir(
 				const parsed = parseFrontmatter(rawContent);
 				const frontmatter = normalizeFrontmatterRecord(parsed.frontmatter, fullPath, source, diagnostics);
 				if (!frontmatter) continue;
+				if (Object.keys(frontmatter).length === 0) continue; // no frontmatter block — plain doc, not a template
 				const { body } = parsed;
 				const chain = normalizeChain(frontmatter.chain, fullPath, source, diagnostics);
 				let parsedChainDeclarationResult:
@@ -1647,7 +1648,11 @@ function loadPromptsWithModelFromDir(
 			        ? frontmatter.tools.split(",").map(t => t.trim()).filter(Boolean)
 			        : undefined;
 			// memory: "none" strips mmemory injection from this command's system prompt
-			const memory = frontmatter.memory === "none" ? "none" as const : undefined;
+			// memory: false/off/none strips mmemory injection from this command's system prompt
+			const mv = frontmatter.memory;
+			const memory = (mv === false || mv === "false" || mv === "off" || mv === "none" || mv === 0)
+				? ("none" as const)
+				: undefined;
 
 				const hasModelField = Object.hasOwn(frontmatter, "model");
 				const parsedModels = chain ? [] : normalizeModelSpecs(frontmatter.model, fullPath, source, diagnostics);
@@ -1756,7 +1761,10 @@ function loadPromptsWithModelFromDir(
 					safeWorktree === true ||
 					subagent !== undefined ||
 					safeInheritContext ||
-					hasModelConditionalDirectives;
+					hasModelConditionalDirectives ||
+					memory !== undefined ||
+					(tools !== undefined && tools.length > 0) ||
+					role !== undefined;
 				if (!chain && !hasModelField && !hasExtensionSpecificConfig && !includePlainPrompts) {
 					continue;
 				}
@@ -1819,7 +1827,7 @@ function loadPromptsWithModelFromDir(
 }
 
 export function loadPromptsWithModel(cwd: string, includePlainPrompts = false): LoadPromptsWithModelResult {
-	const globalDir = join(homedir(), ".pi", "agent", "prompts");
+	const globalDir = join(process.env["PI_CODING_AGENT_DIR"] ?? join(homedir(), ".omp", "agent"), "prompts");
 	const projectDir = resolve(cwd, ".pi", "prompts");
 	const promptMap = new Map<string, PromptWithModel>();
 	const diagnostics: PromptLoaderDiagnostic[] = [];
@@ -1936,7 +1944,7 @@ export function resolveSkillPath(skillName: string, cwd: string): string | undef
 		if (projectAgentsSkill) return projectAgentsSkill;
 	}
 
-	const globalPiSkill = findFirstExisting(getSkillCandidates(join(homedir(), ".pi", "agent", "skills"), skillName));
+	const globalPiSkill = findFirstExisting(getSkillCandidates(join(process.env["PI_CODING_AGENT_DIR"] ?? join(homedir(), ".omp", "agent"), "skills"), skillName));
 	if (globalPiSkill) return globalPiSkill;
 
 	return findFirstExisting(getSkillCandidates(join(homedir(), ".agents", "skills"), skillName));

@@ -17,7 +17,7 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 	let toolGuidance: string | null = null;
 	let toolRegistered = false;
 	let toolQueuedCommand: string | null = null;
-	const configPath = join(homedir(), ".pi", "agent", "prompt-template-model.json");
+	const configPath = join(process.env["PI_CODING_AGENT_DIR"] ?? join(homedir(), ".omp", "agent"), "prompt-template-model.json");
 
 	try {
 		const rawConfig = JSON.parse(readFileSync(configPath, "utf-8"));
@@ -41,7 +41,7 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 
 	function saveToolConfig() {
 		try {
-			mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+			mkdirSync(process.env["PI_CODING_AGENT_DIR"] ?? join(homedir(), ".omp", "agent"), { recursive: true });
 			writeFileSync(configPath, JSON.stringify({ toolEnabled, toolGuidance }, null, 2));
 		} catch (error) {
 			process.stderr.write(
@@ -61,18 +61,18 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 				"Supports --loop for loops (e.g. 'deslop --loop 5', 'deslop --loop=5', 'deslop --loop' for unlimited until convergence with a 999-iteration cap), " +
 				"--fresh for context collapse between iterations, and --no-converge to disable early stopping for bounded loops. " +
 				"Supports runtime delegation override via --subagent, --subagent=<name>, or --subagent:<name>. " +
-				"Use 'chain-prompts template1 -> template2' for chaining and add --chain-context to pass previous step summaries into delegated steps.",
+				"Use 'mchain-prompts template1 -> template2' for chaining and add --chain-context to pass previous step summaries into delegated steps.",
 			promptSnippet:
-				"Use this to run slash/prompt templates by name with args (including --loop/--fresh and chain-prompts flows) when the user asks to execute a prompt template.",
+				"Use this to run slash/prompt templates by name with args (including --loop/--fresh and mchain-prompts flows) when the user asks to execute a prompt template.",
 			parameters: Type.Object({
 				command: Type.String({
-					description: "Template name and arguments (e.g. 'deslop --loop 5 --fresh', 'deslop --subagent:worker', 'deslop --subagent', 'chain-prompts analyze -> fix --chain-context', 'chain-prompts analyze -> fix --loop=3')",
+					description: "Template name and arguments (e.g. 'deslop --loop 5 --fresh', 'deslop --subagent:worker', 'deslop --subagent', 'mchain-prompts analyze -> fix --chain-context', 'mchain-prompts analyze -> fix --loop=3')",
 				}),
 			}),
 			execute: async (_id, params) => {
 				if (!toolEnabled) {
 					return {
-						content: [{ type: "text", text: "run-prompt tool is disabled. User must run `/prompt-tool on` to enable." }],
+						content: [{ type: "text", text: "run-prompt tool is disabled. User must run `/mprompt-tool on` to enable." }],
 						details: {},
 					};
 				}
@@ -117,7 +117,7 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 	}
 
 	function registerCommand() {
-		pi.registerCommand("prompt-tool", {
+		pi.registerCommand("mprompt-tool", {
 			description: "Manage the run-prompt tool (agent-accessible prompt execution)",
 			handler: async (args, ctx) => {
 				deps.setStoredCtx(ctx);
@@ -149,7 +149,7 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 						if (toolGuidance) {
 							notify(ctx, `Current guidance: "${toolGuidance}"`, "info");
 						} else {
-							notify(ctx, "No guidance set. Use `/prompt-tool guidance <text>` to set.", "info");
+							notify(ctx, "No guidance set. Use `/mprompt-tool guidance <text>` to set.", "info");
 						}
 					} else if (trimmed === "guidance clear") {
 						toolGuidance = null;
@@ -174,7 +174,7 @@ export function createToolManager(pi: ExtensionAPI, deps: ToolManagerDeps) {
 					return;
 				}
 
-				notify(ctx, "Usage: /prompt-tool [on [guidance] | off | guidance [text|clear]]", "error");
+				notify(ctx, "Usage: /mprompt-tool [on [guidance] | off | guidance [text|clear]]", "error");
 			},
 		});
 	}

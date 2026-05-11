@@ -20,7 +20,7 @@ const RESERVED_NAMES = new Set([
 	"resume", "btw", "background", "bg", "debug", "memory", "rename", "move",
 	"marketplace", "plugins", "reload-plugins", "force", "exit", "quit",
 	// Extension's own meta-commands
-	"chain-prompts", "prompt-tool", "scoped-models",
+	"mchain-prompts", "mprompt-tool", "scoped-models",
 	// mreview slash command (prevent user prompt templates from shadowing)
 	"mreview",
 ]);
