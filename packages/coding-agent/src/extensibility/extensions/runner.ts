@@ -56,7 +56,7 @@ import type {
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
 	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
-	systemPrompt?: string;
+	systemPrompt?: string[];
 }
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
@@ -169,7 +169,7 @@ export class ExtensionRunner {
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
-	#getSystemPromptFn: () => string = () => "";
+	#getSystemPromptFn: () => string[] = () => [];
 	#executePythonFn: NonNullable<ExtensionContextActions["executePython"]> = (code, options) =>
 		executePython(code, { ...options, cwd: options?.cwd ?? this.cwd });
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -183,6 +183,11 @@ export class ExtensionRunner {
 
 	setTaskDepth(n: number): void {
 		this.#taskDepth = n;
+	}
+
+
+	getTaskDepth(): number {
+		return this.#taskDepth;
 	}
 
 
@@ -425,6 +430,7 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		const ac = new AbortController();
 		return {
 			...this.createContext(),
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -435,6 +441,7 @@ export class ExtensionRunner {
 			switchSession: sessionPath => this.#switchSessionHandler(sessionPath),
 			reload: () => this.#reloadHandler(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
+			signal: ac.signal,
 		};
 	}
 
@@ -808,7 +815,7 @@ export class ExtensionRunner {
 	async emitBeforeAgentStart(
 		prompt: string,
 		images: ImageContent[] | undefined,
-		systemPrompt: string,
+		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		const ctx = this.createContext();
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];

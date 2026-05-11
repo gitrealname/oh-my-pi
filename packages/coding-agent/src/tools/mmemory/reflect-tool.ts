@@ -3,6 +3,7 @@ import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { Type } from "@sinclair/typebox";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
+import { executeMemoryReflect, loadMmemoryConfig } from ".";
 import embeddedReflectDesc from "../../sidecars/mme-reflect.tool-desc.md" with { type: "text" };
 import { createSidecar, sidecarPath } from "../../utils/m-utils";
 const resolveDesc = createSidecar(sidecarPath("mme-reflect.tool-desc.md"), embeddedReflectDesc);
@@ -37,7 +38,9 @@ export class MmemoryReflectTool implements AgentTool<typeof schema> {
 		_toolCallId: string,
 		{ query, scope }: { query: string; scope?: string },
 	): Promise<AgentToolResult> {
-		const slashCmd = `/mmemory reflect ${query}${scope ? ` --scope ${scope}` : ""}`.trim();
+		const activeRole = this.session.activeSkillRoles?.get(this.name);
+		const roleFlag = activeRole ? ` --role ${activeRole}` : "";
+		const slashCmd = `/mmemory reflect ${query}${scope ? ` --scope ${scope}` : ""}${roleFlag}`.trim();
 		this.session.eventBus?.emit(SCHEDULE_SLASH_CHANNEL, slashCmd);
 		return toolResult().text("↩").done();
 	}

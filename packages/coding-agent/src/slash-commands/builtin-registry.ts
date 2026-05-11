@@ -46,6 +46,7 @@ import {
 } from "../extensibility/plugins/marketplace";
 import type { InteractiveModeContext } from "../modes/types";
 import { parseMarketplaceInstallArgs, parsePluginScopeArgs } from "./marketplace-install-parser";
+import type { SessionMessageEntry } from "../session/session-manager";
 
 function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
@@ -87,8 +88,8 @@ interface BuiltinSlashCommandSpec extends BuiltinSlashCommand {
 	handle: (
 		command: ParsedBuiltinSlashCommand,
 		runtime: BuiltinSlashCommandRuntime,
-		// biome-ignore lint/suspicious/noConfusingVoidType: void needed so handlers returning nothing are assignable
-	) => Promise<string | undefined> | string | void;
+		// biome-ignore lint/suspicious/noConfusingVoidType: void needed so async handlers returning nothing are assignable
+	) => Promise<string | void> | string | void;
 }
 
 export interface BuiltinSlashCommandRuntime {
@@ -144,7 +145,7 @@ async function callLLMForMemory(
 	const response = await completeSimple(
 		model,
 		{
-			systemPrompt,
+			systemPrompt: [systemPrompt],
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
 		},
 		{ apiKey },
@@ -430,7 +431,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 				runtime.ctx.showStatus("mprune: not enabled. Set mprune.enabled: true in config.");
 				return;
 			}
-			const unprunedEntries = entries.filter(e => {
+			const unprunedEntries = entries.filter((e): e is SessionMessageEntry => {
 				if (e.type !== "message") return false;
 				const msg = e.message as { role: string; prunedAt?: number };
 				return msg.role === "toolResult" && msg.prunedAt === undefined;
@@ -442,7 +443,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 			runtime.ctx.showStatus(`mprune: summarizing ${unprunedEntries.length} unpruned tool result(s)...`);
 			try {
 				const registry = runtime.ctx.session.modelRegistry;
-				const roleValue = settings.get("modelRoles.prune" as "modelRoles.smol") ?? settings.get("modelRoles.smol") ?? settings.get("modelRoles.default" as "modelRoles.smol");
+				const roleValue = settings.getModelRole("prune") ?? settings.getModelRole("smol") ?? settings.getModelRole("default");
 				const resolved = resolveModelRoleValue(roleValue, registry.getAvailable(), { modelRegistry: registry });
 				const model = resolved.model;
 				if (!model) { runtime.ctx.showStatus("mprune: no model configured (set modelRoles.prune)."); return; }
@@ -464,7 +465,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 				const response = await completeSimple(
 					model,
 					{
-						systemPrompt: buildSummarizerPrompt(),
+						systemPrompt: [buildSummarizerPrompt()],
 						messages: [{ role: "user", content: [{ type: "text", text: serialized }], timestamp: Date.now() }],
 					},
 				{ },
@@ -626,8 +627,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 		name: "loop",
 		description:
 			"Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Esc cancels the current iteration; /loop again to disable.",
-		handle: async (_command, runtime) => {
-			await runtime.ctx.handleLoopCommand();
+		inlineHint: "[count|duration]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			await runtime.ctx.handleLoopCommand(command.args);
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -1085,6 +1088,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 			const question = command.text.slice(`/${command.name}`.length).trim();
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleBtwCommand(question);
+		},
+	},
+	{
+		name: "retry",
+		description: "Retry the last failed agent turn",
+		handle: async (_command, runtime) => {
+			const didRetry = await runtime.ctx.session.retry();
+			if (!didRetry) {
+				runtime.ctx.showStatus("Nothing to retry");
+			}
+			runtime.ctx.editor.setText("");
 		},
 	},
 	{

@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [14.7.6] - 2026-05-07
+
+### Added
+
+- Added `hideThinkingSummary` option/getter/setter on `Agent` and `AgentLoopConfig`. Forwarded to the underlying stream call so providers can omit reasoning/thinking summaries on demand.
+## [14.7.2] - 2026-05-06
+### Added
+
+- Added `loadMode` option to `AgentTool` to mark built-in tools as `essential` for initial loading or `discoverable` for search activation
+- Added optional `summary` field to `AgentTool` definitions for one-line text used in tool discovery indexes
+
+## [14.7.0] - 2026-05-04
+### Breaking Changes
+
+- Changed `Agent` API types so `systemPrompt` is now a list of prompt strings, requiring callers to pass and update system prompts via string arrays
+
+### Changed
+
+- Removed automatic project-context injection into each model call from loop logic
+
+### Removed
+
+- Removed the `projectPrompt` field from agent state/context and the `setProjectPrompt` mutator
+
 ## [14.6.2] - 2026-05-03
 
 ### Fixed

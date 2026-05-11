@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [14.7.1] - 2026-05-06
+
+### Added
+
+- Added `size` property to `GlobMatch` for regular files to expose their byte size
+
+### Changed
+
+- Sped up native `grep` files-with-matches searches by stopping after the first match per file, reading small files without mmap overhead, and relying on grep-searcher binary detection instead of a separate full-file NUL scan.
+
+### Fixed
+
+- Fixed native `grep` `filesWithMatches` mode so `totalMatches` reports the number of matching files rather than line-match totals
+- Fixed native `grep` count-mode limits applying to files instead of matches, and restored timeout/abort cancellation checks for small native filesystem scans.
+
+## [14.7.0] - 2026-05-04
+### Added
+
+- Added `summarizeCode` function to expose native code summarization with `kind`, `startLine`, `endLine`, and optional `text` segments plus parse/elision metadata
+- Added `minBodyLines` and `minCommentLines` options to `summarizeCode` to control when function/body and multiline comment elision is applied
+- Added `SummaryOptions` and `SummaryResult` TypeScript definitions for typed `summarizeCode` input and output
+
 ## [14.6.1] - 2026-05-02
 ### Changed
 

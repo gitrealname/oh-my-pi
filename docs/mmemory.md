@@ -6,7 +6,6 @@ memories into the system prompt at the start of each session.
 
 **No external service, no API keys, no cost beyond the embedding model download.**
 All data stays on disk under a configurable `storageRoot`.
-
 ---
 
 ## Enabling mmemory
@@ -57,9 +56,14 @@ visible console window.
 ```
 storageRoot/                    e.g. D:/.ai/knowledge/projects/omp_memory/
   queue/                        ← .md files arrive here; always empty after a build
-  chunks.json                   ← DURABLE STORE: all chunks (session + file + observation)
+  chunks.json                   ← DURABLE STORE: full text of all indexed chunks
   vectors.safetensors           ← rebuildable from chunks.json
+  vectors.meta.json             ← {model, count} for rebuild validation
+  mental_models/                ← Phase 3: auto-generated summaries
+  facts.json                    ← Phase 3: extracted facts
+  observations.json             ← Phase 3: consolidation output
   .gitignore                    ← * (all memory data private)
+  kb_config.yaml                ← auto-generated: type: external, handler: mmemory
 ```
 
 Project label is auto-derived from the normalized working directory:
@@ -73,19 +77,18 @@ Each `.md` file written to `queue/` includes YAML frontmatter:
 ```yaml
 ---
 project: D/.ai
-source: session           # session | file | observation
-ts: <unix-seconds>
-read_files: []
-modified_files: []
-written_files: []
+agent_tag: default
+source: session | retain_tool
+session_id: <uuid>
+ts: 2026-05-05T12:34:56.000Z
 ---
 <transcript content>
 ```
 
 ### Chunk metadata
 
-Each chunk stored in `chunks.json` carries fields (`project`, `agent_tag`, `source`,
-`ts`) used for filtering during recall.
+Each chunk stored in `chunks.json` carries the same fields (`project`, `agent_tag`, `source`,
+`session_id`, `ts`) used for filtering during recall.
 
 ### Recall filters
 
@@ -95,16 +98,15 @@ Each chunk stored in `chunks.json` carries fields (`project`, `agent_tag`, `sour
 |---|---|---|
 | `project` | string | Restrict to chunks from a specific project label |
 | `agent_tag` | string | Restrict to chunks from a specific agent tag |
-| `source` | string | Restrict to `session`, `file`, or `observation` chunks |
+| `source` | string | Restrict to `session` or `retain_tool` chunks |
 | `ts_after` | number | Unix seconds — exclude chunks older than this timestamp |
 | `ts_before` | number | Unix seconds — exclude chunks newer than this timestamp |
 
 The time-filter system prompt is written to disk on first run and can be customised:
-  Compiled : `<binary-dir>/mme-time-filter.prompt.md`
-  User override: `~/.omp/mme-time-filter.prompt.md`
+  Compiled : <binary-dir>/prompts/mmemory-time-filter.md
+  Dev      : ~/.omp/agent-work/prompts/mmemory-time-filter.md
 Edit the local copy to adapt time expressions for different languages or conventions.
 The binary version is restored if the local copy is older than the build timestamp.
-
 ### Migration
 
 On first build after upgrade, the server automatically migrates the legacy `index/`
@@ -156,10 +158,16 @@ mmemory:
   enabled: true
   storageRoot: /path/to/storage     # required; full path
 
-  # Model roles
-  modelRole: memory                 # embedding + extraction model role
-  consolidateModelRole: memory      # consolidation model role
-  timeFilterModelRole: ~            # time-filter LLM role; null = use modelRole
+  # Storage (machine-specific — set in deployed config, not in template)
+  storageRoot: D:/.ai/knowledge/projects/omp_memory   # full path; project label = auto-derived from cwd
+
+  # LLM roles
+  modelRole: smol                   # reflect synthesis (Phase 2); extraction (Phase 3)
+  timeFilterModelRole: ~           # model role for time-hint LLM preprocessing;
+                                    #   falls back to modelRole. Use a cheap/fast model.
+                                    #   Default: inherits modelRole.
+  consolidateModelRole: smol        # consolidation + mental model seeding (Phase 3)
+                                    # upgrade to a large-context model when Phase 3 is wired
 
   # Retention
   retainMission: ~                  # mission string passed to extraction prompt
@@ -170,44 +178,15 @@ mmemory:
   maxTranscriptChars: 0             # 0 = full session; N = last N turns only
 
   # Scoping
-  scoping: per-project              # per-project = this project's queue/ only
+  scoping: per-project             # per-project = this project's queue/ only
                                     # global      = all projects
   agentTag: default                 # isolates memories by agent identity within same project
                                     # global scope (/mmemory /) bypasses this filter
                                     # existing chunks without this field default to "default"
-
-  # Injection (system-prompt snapshot at session start)
-  injection:
-    sessionLimit: 5                 # most recent session chunks to inject
-    observationLimit: 3             # observation chunks to inject (before session window)
-    fileLimit: 5                    # most recently modified file chunks to inject
-    maxChars: 8000                  # total character budget; overflow drops newest sessions
-
-  # Recall (user-driven search)
-  recall:
-    limit: 10                       # max chunks returned
-    deadlineMs: 10000               # abort if server doesn't respond (cold start protection)
-    maxQueryChars: 2000             # max chars in composed recall query
-    recencyWeight: 0.3              # exponential decay: score *= exp(-age_days/30 * weight)
-    fileLimit: 20                   # max file chunks considered
-    includeReadFiles: false         # include read-only file chunks in recall
-    observationLimit: 10            # max observation chunks returned
-
-  # Consolidation
-  consolidationMinTurns: 10         # min turns before consolidation is eligible
-  consolidationMaxTurns: 50         # max turns before consolidation is forced
-  consolidationPollIntervalMinutes: 5
-  consolidationMaxObservationChars: 400  # max chars per observation in consolidated output
-
-  # Vacuum
-  vacuum:
-    enabled: true
-    intervalHours: 24
-    sessionMaxAgeDays: 365
-    observationMaxAgeDays: 90
-    fileMaxAgeDays: 180
-
-  # Deduplication and server
+  # Recall
+  recallLimit: 10                   # max chunks returned
+  recallDeadlineMs: 10000           # abort if server doesn't respond (cold start protection)
+  recencyWeight: 0.3                # exponential decay: score *= exp(-age_days/30 * weight)
   deduplicationThreshold: 0.92      # cosine similarity above which a new chunk is near-duplicate
   serverIdleTimeoutMinutes: 10      # server self-terminates after N minutes idle
   serverPort: 49200
@@ -481,7 +460,7 @@ Phase 2 was completed 2026-05-03 against the `aws-corp` branch.
 | No visible window | `windowsHide: true` on `Bun.spawn` |
 | Background priority | `SetPriorityClass(BELOW_NORMAL)` on Windows; `os.nice(5)` on Unix |
 | Logger integration | Python stderr → `logger.debug/warn` via omp logger |
-| Privacy `.gitignore` | Written at `storageRoot` on first use |
+|| Privacy `.gitignore` | Written at `storageRoot` on first use |
 | Build coalescing | `_pending_build` set; at most 2 sequential builds |
 | H5 BM25 fix | `max(2, N*0.5)` pruning threshold (prevents over-pruning small corpora) |
 | `_run_build` zero-vector fix | `else` branch re-embeds all chunks; zero-padding removed |
@@ -527,3 +506,16 @@ This takes a few seconds — normal.
 **Seeing a Python process in Task Manager:**
 That's the mmemory recall server (`mmemory_server.py`). It runs at BELOW_NORMAL
 priority and self-terminates after `serverIdleTimeoutMinutes` of inactivity.
+
+---
+
+## Integration with Prompt Templates
+
+The `m-prompt-template` system (see `AWS-CORP.md §13`) can invoke mmemory tools
+from within template chains. A template with `skill: architecture-review` will inject
+skill context into the same session that has mmemory active. Both operate on the
+system prompt concurrently — mmemory via `<observations>/<memories>/<referenced_files>`
+blocks, skill context via `## Skill: <name>` section.
+
+For memory-isolated template execution, define an `AgentDefinition` with `memory: none`
+and invoke it from a template body: `task agent=isolated-agent, assignment="$@"`.

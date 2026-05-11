@@ -8,7 +8,7 @@ import type {
 	MessageParam,
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages";
-import { $env, abortableSleep, isEnoent } from "@oh-my-pi/pi-utils";
+import { $env, abortableSleep, isEnoent, readSseEvents } from "@oh-my-pi/pi-utils";
 import { hasOpus47ApiRestrictions, mapEffortToAnthropicAdaptiveEffort } from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
@@ -33,7 +33,13 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types";
-import { isAnthropicOAuthToken, isRecord, normalizeToolCallId, resolveCacheRetention } from "../utils";
+import {
+	isAnthropicOAuthToken,
+	isRecord,
+	normalizeSystemPrompts,
+	normalizeToolCallId,
+	resolveCacheRetention,
+} from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { isFoundryEnabled } from "../utils/foundry";
@@ -652,18 +658,6 @@ function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]):
 // We surface the resulting provider error ourselves, so keep the SDK quiet.
 const ANTHROPIC_SDK_LOG_LEVEL = "off" as const;
 
-interface ServerSentEvent {
-	event: string | null;
-	data: string;
-	raw: string[];
-}
-
-interface SseDecoderState {
-	event: string | null;
-	data: string[];
-	raw: string[];
-}
-
 const ANTHROPIC_MESSAGE_EVENTS: ReadonlySet<string> = new Set([
 	"message_start",
 	"message_delta",
@@ -672,136 +666,6 @@ const ANTHROPIC_MESSAGE_EVENTS: ReadonlySet<string> = new Set([
 	"content_block_delta",
 	"content_block_stop",
 ]);
-
-function flushSseEvent(state: SseDecoderState): ServerSentEvent | null {
-	if (!state.event && state.data.length === 0) {
-		return null;
-	}
-
-	const event: ServerSentEvent = {
-		event: state.event,
-		data: state.data.join("\n"),
-		raw: [...state.raw],
-	};
-	state.event = null;
-	state.data = [];
-	state.raw = [];
-	return event;
-}
-
-function decodeSseLine(line: string, state: SseDecoderState): ServerSentEvent | null {
-	if (line === "") {
-		return flushSseEvent(state);
-	}
-
-	state.raw.push(line);
-	if (line.startsWith(":")) {
-		return null;
-	}
-
-	const delimiterIndex = line.indexOf(":");
-	const fieldName = delimiterIndex === -1 ? line : line.slice(0, delimiterIndex);
-	let value = delimiterIndex === -1 ? "" : line.slice(delimiterIndex + 1);
-	if (value.startsWith(" ")) {
-		value = value.slice(1);
-	}
-
-	if (fieldName === "event") {
-		state.event = value;
-	} else if (fieldName === "data") {
-		state.data.push(value);
-	}
-
-	return null;
-}
-
-function nextLineBreakIndex(text: string): number {
-	const carriageReturnIndex = text.indexOf("\r");
-	const newlineIndex = text.indexOf("\n");
-	if (carriageReturnIndex === -1) {
-		return newlineIndex;
-	}
-	if (newlineIndex === -1) {
-		return carriageReturnIndex;
-	}
-	return Math.min(carriageReturnIndex, newlineIndex);
-}
-
-function consumeLine(text: string): { line: string; rest: string } | null {
-	const lineBreakIndex = nextLineBreakIndex(text);
-	if (lineBreakIndex === -1) {
-		return null;
-	}
-
-	let nextIndex = lineBreakIndex + 1;
-	if (text[lineBreakIndex] === "\r" && text[nextIndex] === "\n") {
-		nextIndex += 1;
-	}
-
-	return {
-		line: text.slice(0, lineBreakIndex),
-		rest: text.slice(nextIndex),
-	};
-}
-
-async function* iterateSseMessages(
-	body: ReadableStream<Uint8Array>,
-	signal?: AbortSignal,
-): AsyncGenerator<ServerSentEvent> {
-	const reader = body.getReader();
-	const decoder = new TextDecoder();
-	const state: SseDecoderState = { event: null, data: [], raw: [] };
-	let buffer = "";
-
-	try {
-		while (true) {
-			if (signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-
-			const { value, done } = await reader.read();
-			if (done) {
-				break;
-			}
-
-			buffer += decoder.decode(value, { stream: true });
-			let consumed = consumeLine(buffer);
-			while (consumed) {
-				buffer = consumed.rest;
-				const event = decodeSseLine(consumed.line, state);
-				if (event) {
-					yield event;
-				}
-				consumed = consumeLine(buffer);
-			}
-		}
-
-		buffer += decoder.decode();
-		let consumed = consumeLine(buffer);
-		while (consumed) {
-			buffer = consumed.rest;
-			const event = decodeSseLine(consumed.line, state);
-			if (event) {
-				yield event;
-			}
-			consumed = consumeLine(buffer);
-		}
-
-		if (buffer.length > 0) {
-			const event = decodeSseLine(buffer, state);
-			if (event) {
-				yield event;
-			}
-		}
-
-		const trailingEvent = flushSseEvent(state);
-		if (trailingEvent) {
-			yield trailingEvent;
-		}
-	} finally {
-		reader.releaseLock();
-	}
-}
 
 async function* iterateAnthropicEvents(
 	response: Response,
@@ -814,7 +678,7 @@ async function* iterateAnthropicEvents(
 	let sawMessageStart = false;
 	let sawMessageEnd = false;
 
-	for await (const sse of iterateSseMessages(response.body, signal)) {
+	for await (const sse of readSseEvents(response.body, signal)) {
 		if (sse.event === "error") {
 			throw new Error(sse.data);
 		}
@@ -1417,18 +1281,18 @@ type SystemBlockOptions = {
 };
 
 export function buildAnthropicSystemBlocks(
-	systemPrompt: string | undefined,
+	systemPrompt: readonly string[] | undefined,
 	options: SystemBlockOptions = {},
 ): AnthropicSystemBlock[] | undefined {
 	const { includeClaudeCodeInstruction = false, extraInstructions = [], billingPayload, cacheControl } = options;
 	const blocks: AnthropicSystemBlock[] = [];
-	const sanitizedPrompt = systemPrompt ? systemPrompt.toWellFormed() : "";
+	const sanitizedPrompts = normalizeSystemPrompts(systemPrompt);
 	const trimmedInstructions = extraInstructions.map(instruction => instruction.trim()).filter(Boolean);
-	const hasBillingHeader = sanitizedPrompt.includes(CLAUDE_BILLING_HEADER_PREFIX);
+	const hasBillingHeader = sanitizedPrompts.some(prompt => prompt.includes(CLAUDE_BILLING_HEADER_PREFIX));
 
 	if (includeClaudeCodeInstruction && !hasBillingHeader) {
 		const payloadSeed = billingPayload ?? {
-			system: sanitizedPrompt,
+			system: sanitizedPrompts,
 			extraInstructions: trimmedInstructions,
 		};
 		blocks.push(
@@ -1441,19 +1305,19 @@ export function buildAnthropicSystemBlocks(
 	}
 
 	for (const instruction of trimmedInstructions) {
-		blocks.push({
-			type: "text",
-			text: instruction,
-			...(cacheControl ? { cache_control: cacheControl } : {}),
-		});
+		blocks.push({ type: "text", text: instruction });
 	}
 
-	if (systemPrompt) {
-		blocks.push({
-			type: "text",
-			text: sanitizedPrompt,
-			...(cacheControl ? { cache_control: cacheControl } : {}),
-		});
+	for (const systemPrompt of sanitizedPrompts) {
+		blocks.push({ type: "text", text: systemPrompt });
+	}
+
+	// Attach cache_control to the LAST emitted block only. Anthropic breakpoints are cumulative
+	// prefix cuts, so a single trailing breakpoint covers every preceding block; spreading
+	// cache_control across N blocks wastes slots against the 4-breakpoint cap.
+	const lastIndex = blocks.length - 1;
+	if (cacheControl && lastIndex >= 0) {
+		blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cacheControl };
 	}
 
 	return blocks.length > 0 ? blocks : undefined;
@@ -1921,10 +1785,11 @@ function buildParams(
 	}
 
 	const shouldInjectClaudeCodeInstruction = isOAuthToken && !model.id.startsWith("claude-3-5-haiku");
+	const billingSystemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	const billingPayload = shouldInjectClaudeCodeInstruction
 		? {
 				...params,
-				...(context.systemPrompt ? { system: context.systemPrompt.toWellFormed() } : {}),
+				...(billingSystemPrompts.length > 0 ? { system: billingSystemPrompts } : {}),
 			}
 		: undefined;
 	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {

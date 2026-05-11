@@ -14,6 +14,10 @@ export interface SkillFrontmatter {
 	description?: string;
 	globs?: string[];
 	alwaysApply?: boolean;
+	/** Model role to use for tool execution when this skill is active. */
+	role?: string;
+	/** Tool names this role applies to (e.g. ["mmemory_recall", "mmemory_reflect"]). */
+	tools?: string[];
 	[key: string]: unknown;
 }
 

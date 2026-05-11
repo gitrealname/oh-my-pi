@@ -195,7 +195,9 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 	readonly name = "task";
 	readonly label = "Task";
+	readonly summary = "Spawn a subagent to complete a parallel task";
 	readonly strict = true;
+	readonly loadMode = "discoverable";
 	readonly renderResult = renderResult;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
@@ -862,6 +864,8 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						mcpManager: this.session.mcpManager,
 						contextFiles,
 						skills: availableSkills,
+						agentsMdSearch: this.session.agentsMdSearch,
+						workspaceTree: this.session.workspaceTree,
 						promptTemplates,
 						localProtocolOptions,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
@@ -917,6 +921,8 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						mcpManager: this.session.mcpManager,
 						contextFiles,
 						skills: availableSkills,
+						agentsMdSearch: this.session.agentsMdSearch,
+						workspaceTree: this.session.workspaceTree,
 						promptTemplates,
 						localProtocolOptions,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),

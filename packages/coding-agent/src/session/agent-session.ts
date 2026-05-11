@@ -129,6 +129,12 @@ import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { t
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
+import {
+	buildDiscoverableToolSearchIndex,
+	collectDiscoverableTools,
+	type DiscoverableTool,
+	type DiscoverableToolSearchIndex,
+} from "../tool-discovery/tool-index";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta } from "../tools/output-meta";
@@ -245,8 +251,8 @@ export interface AgentSessionConfig {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	/** System prompt builder that can consider tool availability */
-	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<string>;
+	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
+	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
 	/**
 	 * Optional accessor for live MCP server instructions. Read by the session's
 	 * `rebuildSystemPrompt`-skip optimization to detect server-side instruction
@@ -520,9 +526,11 @@ export class AgentSession {
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	#rebuildSystemPrompt: ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<string>) | undefined;
+	#rebuildSystemPrompt:
+		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
+		| undefined;
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
-	#baseSystemPrompt: string;
+	#baseSystemPrompt: string[];
 	/**
 	 * Signature of the (toolNames, tool descriptions) tuple passed to the most
 	 * recent successful `rebuildSystemPrompt` call. Used to skip redundant rebuilds
@@ -534,6 +542,9 @@ export class AgentSession {
 	#discoverableMCPTools = new Map<string, DiscoverableMCPTool>();
 	#discoverableMCPSearchIndex: DiscoverableMCPSearchIndex | null = null;
 	#selectedMCPToolNames = new Set<string>();
+	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
+	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
+	#selectedDiscoveredToolNames = new Set<string>();
 	#rpcHostToolNames = new Set<string>();
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
@@ -2092,8 +2103,8 @@ export class AgentSession {
 	getLastAssistantMessage(): AssistantMessage | undefined {
 		return this.#findLastAssistantMessage();
 	}
-	/** Current effective system prompt (includes any per-turn extension modifications) */
-	get systemPrompt(): string {
+	/** Current effective system prompt blocks (includes any per-turn extension modifications) */
+	get systemPrompt(): string[] {
 		return this.agent.state.systemPrompt;
 	}
 
@@ -2108,7 +2119,15 @@ export class AgentSession {
 
 	#setDiscoverableMCPTools(discoverableMCPTools: Map<string, DiscoverableMCPTool>): void {
 		this.#discoverableMCPTools = discoverableMCPTools;
+		this.#invalidateDiscoveryCaches();
+	}
+
+	/** Single point for invalidating cached discovery indices. Call after any change that can
+	 *  affect which tools should be discoverable: registry mutations (refreshMCPTools,
+	 *  refreshRpcHostTools) or active-tool mutations (#applyActiveToolsByName). */
+	#invalidateDiscoveryCaches(): void {
 		this.#discoverableMCPSearchIndex = null;
+		this.#discoverableToolSearchIndex = null;
 	}
 
 	#filterSelectableMCPToolNames(toolNames: Iterable<string>): string[] {
@@ -2211,10 +2230,21 @@ export class AgentSession {
 		return this.#mcpDiscoveryEnabled;
 	}
 
+	/** @deprecated Use {@link getDiscoverableTools} with `{ source: "mcp" }` instead.
+	 *  Preserves the legacy `description`-bearing MCP shape for back-compat callers. */
 	getDiscoverableMCPTools(): DiscoverableMCPTool[] {
-		return Array.from(this.#discoverableMCPTools.values());
+		return Array.from(this.#discoverableMCPTools.values()).map(t => ({
+			name: t.name,
+			label: t.label,
+			description: t.description,
+			serverName: t.serverName,
+			mcpToolName: t.mcpToolName,
+			schemaKeys: t.schemaKeys,
+		}));
 	}
 
+	/** @deprecated Use {@link getDiscoverableToolSearchIndex} instead.
+	 *  Returns the legacy MCP search index whose documents expose `tool.description`. */
 	getDiscoverableMCPSearchIndex(): DiscoverableMCPSearchIndex {
 		if (!this.#discoverableMCPSearchIndex) {
 			this.#discoverableMCPSearchIndex = buildDiscoverableMCPSearchIndex(this.#discoverableMCPTools.values());
@@ -2250,6 +2280,113 @@ export class AgentSession {
 		return [...new Set(activated)];
 	}
 
+	// ── Generic tool discovery (covers built-in + MCP + extension) ────────────
+
+	/** Resolve effective discovery mode: tools.discoveryMode wins; mcp.discoveryMode is back-compat alias. */
+	#resolveEffectiveDiscoveryMode(): "off" | "mcp-only" | "all" {
+		const toolsMode = this.settings.get("tools.discoveryMode");
+		if (toolsMode !== "off") return toolsMode as "off" | "mcp-only" | "all";
+		if (this.settings.get("mcp.discoveryMode")) return "mcp-only";
+		return "off";
+	}
+
+	isToolDiscoveryEnabled(): boolean {
+		return this.#resolveEffectiveDiscoveryMode() !== "off";
+	}
+
+	getDiscoverableTools(filter?: { source?: DiscoverableTool["source"] }): DiscoverableTool[] {
+		// For "all" mode we combine built-in registry entries + MCP tools.
+		// For "mcp-only" mode we only return MCP tools.
+		const mode = this.#resolveEffectiveDiscoveryMode();
+		const activeNames = new Set(this.getActiveToolNames());
+		const mcpTools: DiscoverableTool[] = Array.from(this.#discoverableMCPTools.values())
+			.filter(t => !activeNames.has(t.name))
+			.map(t => ({
+				name: t.name,
+				label: t.label,
+				summary: t.description,
+				source: "mcp" as const,
+				serverName: t.serverName,
+				mcpToolName: t.mcpToolName,
+				schemaKeys: t.schemaKeys,
+			}));
+		const builtinTools: DiscoverableTool[] = mode === "all" ? this.#collectDiscoverableBuiltinTools() : [];
+		const allTools = [...builtinTools, ...mcpTools];
+		return filter?.source ? allTools.filter(t => t.source === filter.source) : allTools;
+	}
+
+	/** Collect built-in tools the model can discover via search_tool_bm25. Restricted to tool
+	 *  definitions whose `loadMode === "discoverable"`. This keeps hidden/internal tools
+	 *  (resolve, yield, exit_plan_mode, report_finding, report_tool_issue) out of the index
+	 *  and avoids mislabeling extension/custom default-inactive tools as built-ins. */
+	#collectDiscoverableBuiltinTools(): DiscoverableTool[] {
+		const activeNames = new Set(this.getActiveToolNames());
+		const result: DiscoverableTool[] = [];
+		for (const tool of this.#toolRegistry.values()) {
+			if (tool.loadMode !== "discoverable") continue;
+			if (activeNames.has(tool.name)) continue;
+			const collected = collectDiscoverableTools([tool], { source: "builtin" });
+			result.push(...collected);
+		}
+		return result;
+	}
+
+	getDiscoverableToolSearchIndex(): DiscoverableToolSearchIndex {
+		if (!this.#discoverableToolSearchIndex) {
+			this.#discoverableToolSearchIndex = buildDiscoverableToolSearchIndex(this.getDiscoverableTools());
+		}
+		return this.#discoverableToolSearchIndex;
+	}
+
+	/** Invalidate the generic search index cache (call after tool set changes).
+	 *  Delegates to {@link #invalidateDiscoveryCaches} so all discovery-related caches stay in sync. */
+	#invalidateDiscoverableToolSearchIndex(): void {
+		this.#invalidateDiscoveryCaches();
+	}
+
+	getSelectedDiscoveredToolNames(): string[] {
+		// Union of MCP-selected and generic non-MCP selected. Non-MCP selections are only
+		// selected while they are still active; otherwise BM25 must be able to rediscover them.
+		const activeNames = new Set(this.getActiveToolNames());
+		const mcpSelected = this.getSelectedMCPToolNames();
+		const nonMcpSelected = Array.from(this.#selectedDiscoveredToolNames).filter(
+			name => activeNames.has(name) && this.#toolRegistry.has(name) && !isMCPToolName(name),
+		);
+		return [...new Set([...mcpSelected, ...nonMcpSelected])];
+	}
+
+	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
+		const mcpNames = toolNames.filter(isMCPToolName);
+		const nonMcpNames = toolNames.filter(name => !isMCPToolName(name));
+		const activated: string[] = [];
+
+		// Activate MCP tools via existing path
+		if (mcpNames.length > 0) {
+			const activatedMcp = await this.activateDiscoveredMCPTools(mcpNames);
+			activated.push(...activatedMcp);
+		}
+
+		// Activate non-MCP tools (built-ins that are in the registry but not currently active)
+		if (nonMcpNames.length > 0) {
+			const currentActiveNames = new Set(this.getActiveToolNames());
+			const newlyAdded: string[] = [];
+			for (const name of nonMcpNames) {
+				if (this.#toolRegistry.has(name) && !currentActiveNames.has(name)) {
+					newlyAdded.push(name);
+					this.#selectedDiscoveredToolNames.add(name);
+					activated.push(name);
+				}
+			}
+			if (newlyAdded.length > 0) {
+				const nextActive = [...this.getActiveToolNames(), ...newlyAdded];
+				await this.setActiveToolsByName(nextActive);
+				this.#invalidateDiscoverableToolSearchIndex();
+			}
+		}
+
+		return [...new Set(activated)];
+	}
+
 	async #applyActiveToolsByName(
 		toolNames: string[],
 		options?: { persistMCPSelection?: boolean; previousSelectedMCPToolNames?: string[] },
@@ -2280,7 +2417,17 @@ export class AgentSession {
 				),
 			);
 		}
+		const activeNameSet = new Set(validToolNames);
+		for (const name of Array.from(this.#selectedDiscoveredToolNames)) {
+			if (!activeNameSet.has(name) || isMCPToolName(name) || !this.#toolRegistry.has(name)) {
+				this.#selectedDiscoveredToolNames.delete(name);
+			}
+		}
 		this.agent.setTools(tools);
+
+		// Active tool set changed → discoverable tool list (which excludes already-active tools)
+		// is now stale. Invalidate before any prompt-template hook reads the discovery list.
+		this.#invalidateDiscoveryCaches();
 
 		// Rebuild base system prompt with new tool set, but only when the tool set
 		// actually changed. MCP servers can reconnect at arbitrary times and call
@@ -2290,7 +2437,8 @@ export class AgentSession {
 		if (this.#rebuildSystemPrompt) {
 			const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 			if (signature !== this.#lastAppliedToolSignature) {
-				this.#baseSystemPrompt = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
+				const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
+				this.#baseSystemPrompt = built.systemPrompt;
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
 			}
@@ -2333,7 +2481,8 @@ export class AgentSession {
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
 		const activeToolNames = this.getActiveToolNames();
-		this.#baseSystemPrompt = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
+		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
+		this.#baseSystemPrompt = built.systemPrompt;
 		this.agent.setSystemPrompt(this.#baseSystemPrompt);
 		// Refresh the cached signature so a subsequent `#applyActiveToolsByName` with
 		// the same tool set does not re-rebuild on top of the explicit refresh we
@@ -2344,14 +2493,14 @@ export class AgentSession {
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
-	async #buildSystemPromptForAgentStart(promptText: string): Promise<string> {
+	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
 		const backend = resolveMemoryBackend(this.settings);
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
 
 		try {
 			const injected = await backend.beforeAgentStartPrompt(this, promptText);
 			if (!injected) return this.#baseSystemPrompt;
-			return `${this.#baseSystemPrompt}\n\n${injected}`;
+			return [...this.#baseSystemPrompt, injected];
 		} catch (err) {
 			logger.debug("Memory backend beforeAgentStartPrompt failed", {
 				backend: backend.id,
@@ -2513,6 +2662,11 @@ export class AgentSession {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 			this.#rpcHostToolNames.add(finalTool.name);
 		}
+
+		// Registry contents changed — invalidate discovery caches so the next BM25 lookup sees
+		// the new RPC-host tool set. (#applyActiveToolsByName below also invalidates, but doing
+		// it here too keeps the contract local to "registry mutated".)
+		this.#invalidateDiscoveryCaches();
 
 		const activeNonRpcToolNames = previousActiveToolNames.filter(name => !previousRpcHostToolNames.has(name));
 		const preservedRpcToolNames = previousActiveToolNames.filter(
@@ -3065,6 +3219,7 @@ export class AgentSession {
 			return this.#extensionRunner.createCommandContext();
 		}
 
+		const ac = new AbortController();
 		return {
 			ui: noOpUIContext,
 			hasUI: false,
@@ -3116,6 +3271,8 @@ export class AgentSession {
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
+			taskDepth: 0,
+			signal: ac.signal,
 		};
 	}
 
@@ -4224,7 +4381,11 @@ export class AgentSession {
 					apiKey,
 					customInstructions,
 					compactionAbortController.signal,
-					{ promptOverride: hookPrompt, extraContext: hookContext, remoteInstructions: this.#baseSystemPrompt },
+					{
+						promptOverride: hookPrompt,
+						extraContext: hookContext,
+						remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+					},
 				);
 				summary = result.summary;
 				shortSummary = result.shortSummary;
@@ -5337,7 +5498,7 @@ export class AgentSession {
 							compactResult = await compact(preparation, candidate, apiKey, undefined, autoCompactionSignal, {
 								promptOverride: hookPrompt,
 								extraContext: hookContext,
-								remoteInstructions: this.#baseSystemPrompt,
+								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
 								initiatorOverride: "agent",
 							});
 							break;
@@ -5984,6 +6145,32 @@ export class AgentSession {
 	setAutoRetryEnabled(enabled: boolean): void {
 		this.settings.set("retry.enabled", enabled);
 	}
+	/**
+	 * Manually retry the last failed assistant turn.
+	 * Removes the error message from agent state and re-attempts with a fresh retry budget.
+	 * @returns true if retry was initiated, false if no failed turn to retry or agent is busy
+	 */
+	async retry(): Promise<boolean> {
+		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
+
+		const messages = this.agent.state.messages;
+		const lastMsg = messages[messages.length - 1];
+		if (lastMsg?.role !== "assistant") return false;
+
+		const assistantMsg = lastMsg as AssistantMessage;
+		if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") return false;
+
+		// Remove the failed/aborted assistant message (same as auto-retry does before re-attempting)
+		this.agent.replaceMessages(messages.slice(0, -1));
+
+		// Reset retry budget for a fresh attempt
+		this.#retryAttempt = 0;
+
+		// Re-attempt the turn
+		this.#scheduleAgentContinue({ delayMs: 1 });
+
+		return true;
+	}
 
 	// =========================================================================
 	// Bash Execution
@@ -6435,6 +6622,7 @@ export class AgentSession {
 			apiKey,
 			sessionId: this.sessionId,
 			reasoning: toReasoningEffort(this.thinkingLevel),
+			hideThinkingSummary: this.agent.hideThinkingSummary,
 			serviceTier: this.serviceTier,
 			signal: args.signal,
 			toolChoice: "none",

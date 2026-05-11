@@ -312,3 +312,17 @@ export function showMPanel(
 	ctx.chatContainer.addChild(new DynamicBorder());
 	ctx.ui.requestRender();
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. resolveTemplateModelSpec (m-prompt-template support)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve a template model: / role: field to a concrete model string.
+ * Used by m-prompt-template/activate.ts role resolver.
+ */
+export function resolveTemplateModelSpec(spec: string, settings: import("../config/settings").Settings): string {
+	const roles = settings.get("modelRoles") as Record<string, string | undefined>;
+	return roles[spec] ?? spec;
+}

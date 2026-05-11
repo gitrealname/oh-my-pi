@@ -31,8 +31,10 @@ import type { InteractiveModeContext } from "../types";
 // and submitted as a user message (LLM sees them as tool-result style input).
 //
 // Pure parser lives in input-controller-m-scripts-protocol.ts (no native deps).
-export type { OmpDirective } from "./input-controller-m-scripts-protocol";
-export { parseOutput } from "./input-controller-m-scripts-protocol";
+import type { OmpDirective } from "./input-controller-m-scripts-protocol";
+import { parseOutput } from "./input-controller-m-scripts-protocol";
+export type { OmpDirective };
+export { parseOutput };
 
 // ─── Command runner ───────────────────────────────────────────────────────────
 

@@ -191,7 +191,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
  * Agent state containing all configuration and conversation data.
  */
 export interface AgentState {
-	systemPrompt: string;
+	systemPrompt: string[];
 	model: Model;
 	thinkingLevel?: Effort;
 	tools: AgentTool<any>[];
@@ -248,6 +248,10 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	hidden?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */
 	deferrable?: boolean;
+	/** Built-in tool loading behavior. "essential" loads initially; "discoverable" can be activated by tool search. */
+	loadMode?: "essential" | "discoverable";
+	/** Short one-line summary used for tool discovery indexes. */
+	summary?: string;
 	/** If true, tool execution ignores abort signals (runs to completion) */
 	nonAbortable?: boolean;
 	/**
@@ -283,7 +287,7 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 
 // AgentContext is like Context but uses AgentTool
 export interface AgentContext {
-	systemPrompt: string;
+	systemPrompt: string[];
 	messages: AgentMessage[];
 	tools?: AgentTool<any>[];
 }

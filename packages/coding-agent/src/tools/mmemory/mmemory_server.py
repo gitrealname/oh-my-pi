@@ -190,38 +190,15 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     body = text[end + 5:]
     meta: dict = {}
     for line in fm_text.splitlines():
-        if ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        k = k.strip()
-        v = v.strip()
-        # Inline YAML list: [a, b, "c"] or ["a", "b"]
-        if v.startswith("[") and v.endswith("]"):
-            inner = v[1:-1].strip()
-            if inner:
-                meta[k] = [s.strip().strip('"').strip("'") for s in re.split(r',\s*', inner) if s.strip().strip('"').strip("'")]
-            else:
-                meta[k] = []
-        else:
-            meta[k] = v
+        if ":" in line:
+            k, _, v = line.partition(":")
+            meta[k.strip()] = v.strip()
     return meta, body
-
-def _parse_ts(value) -> int:
-    """Parse a ts value to epoch int. Accepts int, float, or digit-string.
-    Returns int(time.time()) for None, empty, or un-parseable values (ISO strings etc.)."""
-    if value is None or value == "":
-        return int(time.time())
-    try:
-        return int(float(str(value)))
-    except (ValueError, TypeError):
-        return int(time.time())
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
 class MmemoryServer:
     def __init__(self, port: int, timeout_minutes: int, pid_file: "Path | None" = None) -> None:
-        try: os.nice(10)
-        except AttributeError: pass
         self.port = port
         self.timeout = timeout_minutes * 60
         self.pid_file = pid_file
@@ -242,6 +219,50 @@ class MmemoryServer:
         # fire build for any that have orphaned queue files after a crash/restart.
         self._known_project_dirs: set[str] = set()
         self._model_lock  = threading.Lock()
+
+    # ── Singleton election ────────────────────────────────────────────────────
+
+    def _acquire_singleton(self) -> bool:
+        """Three-layer race guard. Returns True if this process should proceed.
+
+        Layer 1 — port ping: exit early if a live server already answers.
+        Layer 2 — double-write CAS: write own PID, sleep 50ms, read back.
+                  Last writer wins; earlier writers see a foreign PID and exit.
+        Layer 3 — bind: OS-level guarantee (SO_EXCLUSIVEADDRUSE on Windows).
+        Layers 1+2 are here; layer 3 is in run().
+        """
+        if self.pid_file is None:
+            return True
+
+        own_pid = str(os.getpid())
+
+        # Layer 1: ping the port — if a server already answers, exit.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(("127.0.0.1", self.port))
+            s.sendall(json.dumps({"action": "ping"}).encode() + b"\n")
+            s.recv(256)
+            s.close()
+            print(f"[mmemory] PID {own_pid}: live server on port {self.port} — exiting.",
+                  file=sys.stderr, flush=True)
+            return False
+        except OSError:
+            pass  # no server yet — proceed
+
+        # Layer 2: write own PID, sleep, read back — last writer wins.
+        try:
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(own_pid)
+            time.sleep(0.05)  # 50ms — enough for concurrent writers to land
+            if self.pid_file.read_text().strip() != own_pid:
+                print(f"[mmemory] PID {own_pid}: lost singleton election — exiting.",
+                      file=sys.stderr, flush=True)
+                return False
+        except OSError:
+            pass  # file I/O failure is non-fatal; layer 3 (bind) is the backstop
+
+        return True
 
     # ── Singleton election ────────────────────────────────────────────────────
 
@@ -320,6 +341,7 @@ class MmemoryServer:
             "queue":        p / "queue",
             "chunks":       p / "chunks.json",
             "vectors":      p / "vectors.safetensors",
+            "vectors_meta": p / "vectors.meta.json",
         }
 
     # ── Cache helpers ────────────────────────────────────────────────────────
@@ -348,7 +370,7 @@ class MmemoryServer:
             tmp = p / "chunks.tmp.json"
             tmp.write_text(json.dumps(old_chunks, indent=2))
             tmp.replace(p / "chunks.json")
-            for name in ("vectors.safetensors",):
+            for name in ("vectors.safetensors", "vectors.meta.json"):
                 src = legacy_dir / name
                 if src.exists():
                     shutil.copy2(str(src), str(p / name))
@@ -357,7 +379,7 @@ class MmemoryServer:
             print(f"[mmemory] Migrated {len(old_chunks)} chunks from legacy index/ layout.",
                   file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"EXCEPTION: [mmemory] Migration failed: {e}\n" + traceback.format_exc(), file=sys.stderr, flush=True)
+            print(f"[mmemory] Migration failed (continuing): {e}", file=sys.stderr, flush=True)
 
     def _get_chunks(self, chunks_path: str) -> list[dict]:
         if chunks_path in self._chunks_cache:
@@ -443,15 +465,17 @@ class MmemoryServer:
         scope: str = req.get("scope", "per-project")
         project: str = req.get("project", "")
         filter_params: dict = req.get("filter", {})
-        mode: str = req.get("mode", "query")  # "session" | "query"
+        mode: str = req.get("mode", "query")
 
         if not project_dir:
             return {"error": "project_dir required"}
         if mode != "session" and not query:
             return {"error": "query required for mode=query"}
         self._known_project_dirs.add(project_dir)
-
         # One-shot migration: legacy index/ layout → flat layout.
+        # Background thread — recall is time-constrained; the file copy can take
+        # several seconds for large safetensors files. Return empty this call;
+        # next recall will find the migrated data.
         if (Path(project_dir) / "index" / "chunks.json").exists() and \
                 not (Path(project_dir) / "chunks.json").exists():
             threading.Thread(target=self._migrate_legacy, args=(project_dir,), daemon=False).start()
@@ -545,6 +569,26 @@ class MmemoryServer:
         t1.join(); t2.join()
 
         merged = rrf_merge(sem_results, bm25_results)
+
+        if filter_params:
+            merged = [(i, s) for i, s in merged if i < len(chunks) and _matches_filter(chunks[i], filter_params)]
+
+        def _matches_filter(chunk: dict, f: dict) -> bool:
+            if f.get("project") and chunk.get("project") != f["project"]:
+                return False
+            src = f.get("source")
+            if src:
+                chunk_src = chunk.get("source", "session")
+                sources = src if isinstance(src, list) else [src]
+                if chunk_src not in sources:
+                    return False
+            if f.get("ts_after") and chunk.get("ts", 0) < int(f["ts_after"]):
+                return False
+            if f.get("ts_before") and chunk.get("ts", 0) > int(f["ts_before"]):
+                return False
+            if f.get("agent_tag") and chunk.get("agent_tag", "default") != f["agent_tag"]:
+                return False
+            return True
 
         if filter_params:
             merged = [(i, s) for i, s in merged if i < len(chunks) and _matches_filter(chunks[i], filter_params)]
@@ -657,10 +701,24 @@ class MmemoryServer:
                 for c in existing_chunks:
                     if not c.get('ts'):
                         c['ts'] = now_ts  # heal legacy chunks missing ts
+                    if 'end_ts' not in c:
+                        c['end_ts'] = c['ts']  # heal legacy chunks missing end_ts
             except Exception:
                 pass
 
         existing_hashes: set[str] = {c["hash"] for c in existing_chunks}
+        def _parse_list(val: object) -> list[str] | None:
+            """Parse a frontmatter value that may be a JSON array string or already a list."""
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return val
+            try:
+                parsed = json.loads(str(val))
+                return parsed if isinstance(parsed, list) else None
+            except Exception:
+                return None
+
         # ── 2. Collect new chunks from queue ──────────────────────────────────
         queue_files = sorted(queue_dir.glob("*.md")) if queue_dir.exists() else []
         new_raw_chunks: list[dict] = []
@@ -671,38 +729,32 @@ class MmemoryServer:
                 source = fm.get("source", "session")
                 if source == "session":
                     chunks = chunk_by_turns(text, str(md_file))
-                    for c in chunks:
-                        c["project"]    = fm.get("project",    Path(project_dir).name)
-                        c["source"]     = source
-                        c["session_id"] = fm.get("session_id", None)
-                        c["ts"]         = _parse_ts(fm.get("ts"))
-                        c["end_ts"]     = c["ts"]
-                        c["agent_tag"]  = fm.get("agent_tag",  "default")
-                        # Persist file arrays so step 2b can re-derive file chunks on rebuild
-                        for _f in ("read_files", "modified_files", "written_files"):
-                            if fm.get(_f) is not None:
-                                c[_f] = fm[_f]
-                    new_raw_chunks.extend(chunks)
                 else:
-                    # observation: plain body, one chunk per file
-                    if source not in ('session', 'observation'):
-                        continue
+                    # Observations, facts, and other non-session sources are stored as a
+                    # single chunk — they have no turn-boundary markers.
                     body = text.strip()
                     if body:
-                        h = hashlib.sha256(body.encode()).hexdigest()[:16]
-                        new_raw_chunks.append({
-                            "hash":       h,
-                            "text":       body,
-                            "path":       str(md_file),
-                            "source":     source,
-                            "project":    fm.get("project", Path(project_dir).name),
-                            "session_id": fm.get("session_id", None),
-                            "ts":         _parse_ts(fm.get("ts")),
-                            "end_ts":     _parse_ts(fm.get("end_ts") or fm.get("ts")),
-                            "agent_tag":  fm.get("agent_tag", "default"),
-                            "entities":   fm.get("entities", []),
-                            "date":       fm.get("date", ""),
-                        })
+                        chunk_hash = hashlib.sha256(body.encode()).hexdigest()[:16]
+                        chunks = [{"text": body, "path": str(md_file), "hash": chunk_hash}]
+                    else:
+                        chunks = []
+                for c in chunks:
+                    c["project"]    = fm.get("project",    Path(project_dir).name)
+                    c["source"]     = source
+                    c["session_id"] = fm.get("session_id", None)
+                    c["ts"]         = int(fm.get("ts", time.time()))
+                    c["agent_tag"]  = fm.get("agent_tag",  "default")
+                    c["end_ts"]     = int(fm.get("end_ts",   c["ts"]))
+                    rf = _parse_list(fm.get("read_files"))
+                    mf = _parse_list(fm.get("modified_files"))
+                    wf = _parse_list(fm.get("written_files"))
+                    if rf is not None:
+                        c["read_files"] = rf
+                    if mf is not None:
+                        c["modified_files"] = mf
+                    if wf is not None:
+                        c["written_files"] = wf
+                new_raw_chunks.extend(chunks)
             except Exception as e:
                 print(f"EXCEPTION: [mmemory] Failed to read {md_file.name}: {e}\n" + traceback.format_exc(), file=sys.stderr, flush=True)
 

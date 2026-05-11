@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, UsageReport } from "@oh-my-pi/pi-ai";
-import type { Component, Container, Loader, Spacer, Text, TUI } from "@oh-my-pi/pi-tui";
+import type { Component, Container, EditorTheme, Loader, Spacer, Text, TUI } from "@oh-my-pi/pi-tui";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
 import type {
@@ -24,6 +24,7 @@ import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
+import type { LoopLimitRuntime } from "./loop-limit";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
 import type { Theme } from "./theme/theme";
 
@@ -86,6 +87,7 @@ export interface InteractiveModeContext {
 	planModeEnabled: boolean;
 	loopModeEnabled: boolean;
 	loopPrompt?: string;
+	loopLimit?: LoopLimitRuntime;
 	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
 	pendingImages: ImageContent[];
@@ -129,6 +131,9 @@ export interface InteractiveModeContext {
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;
 	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void;
 	createBackgroundUiContext(): ExtensionUIContext;
+	setEditorComponent(
+		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
+	): void;
 
 	// Event handling
 	handleBackgroundEvent(event: AgentSessionEvent): Promise<void>;
@@ -151,6 +156,19 @@ export interface InteractiveModeContext {
 	cancelPendingSubmission(): boolean;
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean;
 	finishPendingSubmission(input: SubmittedUserInput): void;
+	/**
+	 * Marks a locally-initiated user submission so the eventual `message_start`
+	 * event for that user message does not clobber the editor draft (see #783).
+	 * Returns a dispose function that removes the signature; call it on
+	 * delivery failure so a retry can be re-marked cleanly.
+	 */
+	recordLocalSubmission(text: string, imageCount?: number): () => void;
+	/**
+	 * Wraps `fn` in a `recordLocalSubmission` marker that is automatically
+	 * removed if `fn` rejects. Use this for the common case where a thrown
+	 * delivery error should leave the signature set untouched.
+	 */
+	withLocalSubmission<T>(text: string, fn: () => Promise<T>, options?: { imageCount?: number }): Promise<T>;
 	isKnownSlashCommand(text: string): boolean;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
 	renderSessionContext(
@@ -235,7 +253,7 @@ export interface InteractiveModeContext {
 	openExternalEditor(): void;
 	registerExtensionShortcuts(): void;
 	handlePlanModeCommand(initialPrompt?: string): Promise<void>;
-	handleLoopCommand(): Promise<void>;
+	handleLoopCommand(args?: string): Promise<void>;
 	disableLoopMode(): void;
 	pauseLoop(): void;
 	handleExitPlanModeTool(details: ExitPlanModeDetails): Promise<void>;

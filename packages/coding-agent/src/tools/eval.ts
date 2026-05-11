@@ -207,6 +207,8 @@ async function resolveBackend(
 
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
+	readonly summary = "Execute Python or JavaScript code in an in-process eval backend";
+	readonly loadMode = "discoverable";
 	readonly label = "Eval";
 	get description(): string {
 		if (!this.session) return getEvalToolDescription();
@@ -216,6 +218,16 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly parameters = evalSchema;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
+	readonly intent = (args: Partial<Static<typeof evalSchema>>): string | undefined => {
+		const input = args.input;
+		if (input) {
+			try {
+				const cells = parseEvalInput(input).cells;
+				return cells.map(cell => cell.title || `running ${cell.language}`).join("\n");
+			} catch {}
+		}
+		return "evaluating";
+	};
 
 	get customFormat(): { syntax: "lark"; definition: string } {
 		return { syntax: "lark", definition: evalGrammar };

@@ -22,7 +22,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/utils/oauth/types";
 import type * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
-import type { AutocompleteItem, Component, EditorComponent, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
+import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { Static, TSchema } from "@sinclair/typebox";
 import type { Rule } from "../../capability/rule";
 import type { KeybindingsManager } from "../../config/keybindings";
@@ -32,6 +32,7 @@ import type { PythonResult } from "../../eval/py/executor";
 import type { PythonExecutorOptions } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
+import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 import type { CompactionPreparation, CompactionResult } from "../../session/compaction";
 import type { CustomMessage } from "../../session/messages";
@@ -171,9 +172,15 @@ export interface ExtensionUIContext {
 		editorOptions?: { promptStyle?: boolean },
 	): Promise<string | undefined>;
 
-	/** Set a custom editor component via factory function, or undefined to restore the default editor. */
+	/**
+	 * Set a custom editor component via factory function, or `undefined` to restore the default editor.
+	 *
+	 * The factory must return a {@link CustomEditor} subclass. Plain `EditorComponent`/`Editor`
+	 * instances do not implement the action-keys, escape callbacks, and custom-key-handler surface
+	 * required by interactive mode.
+	 */
 	setEditorComponent(
-		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => EditorComponent) | undefined,
+		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
 	): void;
 
 	/** Get the current theme for styling. */
@@ -241,7 +248,7 @@ export interface ExtensionContext {
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/** Get the current effective system prompt. */
-	getSystemPrompt(): string;
+	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
 	/** Execute Python code via the shared kernel (session-scoped or per-call). */
@@ -251,6 +258,8 @@ export interface ExtensionContext {
 	): Promise<PythonResult>;
 	/** Task recursion depth. 0 = top-level session; >0 = subagent. */
 	readonly taskDepth: number;
+	/** Navigate to a different point in the session tree (available in command context). */
+	navigateTree?(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 }
 
 /**
@@ -276,6 +285,9 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Navigate to a different point in the session tree. */
 	navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 
+
+	/** AbortSignal for the current command invocation. */
+	signal: AbortSignal;
 	/** Switch to a different session file. */
 	switchSession(sessionPath: string): Promise<{ cancelled: boolean }>;
 
@@ -331,6 +343,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** Short snippet included in the tool prompt section to guide LLM tool selection. */
+	promptSnippet?: string;
 	/** Execute the tool. */
 	execute(
 		toolCallId: string,
@@ -500,7 +514,7 @@ export interface BeforeAgentStartEvent {
 	type: "before_agent_start";
 	prompt: string;
 	images?: ImageContent[];
-	systemPrompt: string;
+	systemPrompt: string[];
 }
 
 /** Fired when an agent loop starts */
@@ -884,7 +898,7 @@ export interface ToolResultEventResult {
 export interface BeforeAgentStartEventResult {
 	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
-	systemPrompt?: string;
+	systemPrompt?: string[];
 }
 
 export interface SessionBeforeSwitchResult {
@@ -1326,7 +1340,7 @@ export interface ExtensionContextActions {
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
-	getSystemPrompt: () => string;
+	getSystemPrompt: () => string[];
 	executePython?: ExtensionContext["executePython"];
 }
 

@@ -20,6 +20,10 @@ import { settings } from "./config/settings";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "./extensibility/extensions";
 import type { ReadonlySessionManager } from "./session/session-manager";
+import { completeSimple, validateToolCall } from "@oh-my-pi/pi-ai";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
+import { Type } from "@sinclair/typebox";
+import { resolveRoleModel } from "./utils/m-utils";
 import {
 	STRIP_TAGS_REGEX,
 	buildConsolidateFn,
@@ -36,6 +40,7 @@ import {
 	sessionFilename,
 	truncateRecallQuery,
 } from "./tools/mmemory/index";
+import { getRecallScope } from "./tools/mmemory/session-scope";
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
@@ -51,6 +56,7 @@ interface MmemorySessionState {
 	consolidationPending: boolean;
 	lastConsolidationTs: number;
 	lastConsolidationPollAt: number;
+	hasRecalledForFirstTurn: boolean;
 	/** Chunks fetched by maybePollConsolidation, waiting for agent_end to execute LLM call. */
 	pendingConsolidationChunks: unknown[] | null;
 }
@@ -132,6 +138,7 @@ function createSessionState(ctx: ExtensionContext): MmemorySessionState | null {
 		lastConsolidationTs: 0,
 		lastConsolidationPollAt: 0,
 		pendingConsolidationChunks: null,
+		hasRecalledForFirstTurn: false,
 	};
 }
 
@@ -218,6 +225,15 @@ function buildTranscript(messages: { role: string; content: unknown }[], context
 	return { transcript: result, pairsFound, userSkipped };
 }
 
+async function extractFromTranscript(
+	transcript: string,
+	config: import("./tools/mmemory/index").MmemoryConfig,
+	ctx: ExtensionContext,
+): Promise<void> {
+	const registry = ctx.modelRegistry;
+	const model = resolveRoleModel(config.modelRole, registry, settings, ["memory"]);
+	if (!model) return;
+}
 
 
 async function retainSession(
@@ -226,14 +242,7 @@ async function retainSession(
 	ctx: ExtensionContext | null,
 	note?: string,
 ): Promise<void> {
-	// DEBUG (cleanup when stable): log every retain attempt
-	logger.debug(`[mmemory] retainSession: session=${state.sessionId} messages=${messages.length} note=${note ? "yes" : "no"}`, { source: "mmemory" });
-
 	const userCount = messages.filter(m => m.role === "user").length;
-	logger.debug(
-		`[mmemory] buildTranscript: total=${messages.length} user=${userCount} contextTurns=${state.config.retainContextTurns} maxChars=${state.config.maxTranscriptChars}`,
-		{ source: "mmemory" },
-	);
 	const { transcript, pairsFound, userSkipped } = buildTranscript(messages, state.config.retainContextTurns, state.config.maxTranscriptChars);
 	if (!transcript) {
 		logger.debug(
@@ -242,7 +251,6 @@ async function retainSession(
 		);
 		return;
 	}
-	logger.debug(`[mmemory] retainSession: transcript=${transcript.length} chars pairs=${pairsFound} skipped=${userSkipped}`, { source: "mmemory" });
 
 	const today = new Date().toISOString().slice(0, 10);
 	// Fixed filename per session — repeated retains overwrite the same file
@@ -250,59 +258,15 @@ async function retainSession(
 	const filePath = path.join(state.queueDir, filename);
 
 	const projectLabel = state.config.projectLabel;
-
-	// Collect file paths from tool calls in this session's messages.
-	// read_files: paths passed to read() / search() / find()
-	// modified_files: paths written by edit() / write() / notebook()
-	// written_files: paths created fresh by write()
-	const readFiles  = new Set<string>();
-	const modFiles   = new Set<string>();
-	const writtenFiles = new Set<string>();
-	for (const msg of messages) {
-		if (msg.role !== "assistant") continue;
-		const parts = Array.isArray(msg.content) ? msg.content as import("@oh-my-pi/pi-ai").ToolCall[] : [];
-		for (const part of parts) {
-			if (part.type !== "toolCall") continue;
-			const name = part.name;
-			const args = part.arguments ?? {};
-		const rawP  = (args["path"] as string | undefined)?.replace(/\\/g, "/") ?? "";
-		if (!rawP || rawP.startsWith("http") || rawP.includes("*")) continue;
-		// Resolve to absolute path — plan requires absolute paths in file chunks.
-		const cwd = ctx?.sessionManager.getCwd().replace(/\\/g, "/") ?? "";
-		const p   = (rawP.startsWith("/") || /^[a-zA-Z]:/.test(rawP))
-			? rawP
-			: cwd ? `${cwd}/${rawP}` : rawP;
-		// Skip directories — only track actual files. Client has full fs context.
-		try { if (fs.statSync(p).isDirectory()) continue; } catch { /* not on disk yet or inaccessible — keep */ }
-			if (name === "read" || name === "search" || name === "find") {
-				readFiles.add(p);
-			} else if (name === "edit" || name === "notebook" || name === "ast_edit") {
-				modFiles.add(p);
-			} else if (name === "write") {
-				writtenFiles.add(p);
-				modFiles.add(p);
-			}
-		}
-	}
-	const fmFiles = (arr: Set<string>) =>
-		arr.size ? ` [${[...arr].map(p => `"${p}"`).join(", ")}]` : " []";
-	const frontmatter =
-		`---\nproject: ${projectLabel}\nagent_tag: ${state.config.agentTag}\nsource: session\n` +
-		`session_id: ${state.sessionId}\nts: ${Math.floor(state.sessionStartTime.getTime() / 1000)}\n` +
-		`read_files:${fmFiles(readFiles)}\nmodified_files:${fmFiles(modFiles)}\nwritten_files:${fmFiles(writtenFiles)}\n---\n\n`;
-	const noteSection = note ? `\n\n**Note:** ${note}` : "";
+	const frontmatter = `---\nproject: ${projectLabel}\nagent_tag: ${state.config.agentTag}\nsource: session\nsession_id: ${state.sessionId}\nts: ${Math.floor(state.sessionStartTime.getTime() / 1000)}\n---\n\n`;
 	fs.writeFileSync(
 		filePath,
-		`${frontmatter}# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}${noteSection}`,
+		`${frontmatter}# Memory — ${today}\n\n**Mission:** ${state.config.retainMission}\n\n${transcript}`,
 		"utf-8",
 	);
-	// DEBUG (cleanup when stable): log queue file written
-	logger.debug(`[mmemory] retainSession: wrote queue file=${filename} transcriptLen=${transcript.length}`, { source: "mmemory" });
-	logger.debug(`[mmemory] queue file written: ${filename} (${transcript.length} chars)`, { source: "mmemory" });
-
+	logger.debug(`[mmemory] retainSession: wrote ${filename} (${transcript.length} chars, pairs=${pairsFound})`, { source: "mmemory" });
 
 	// Server reads queue/*.md, embeds new chunks, deletes processed .md files
-	logger.debug("[mmemory] scheduling build", { source: "mmemory" });
 	void executeMemoryBuild(state.config).catch(e => logger.error(`EXCEPTION: [mmemory] build failed: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" }));
 }
 
@@ -393,23 +357,12 @@ export function createMmemoryExtension(api: ExtensionAPI): void {
 	api.setLabel("mmemory");
 
 /**
- * Fire the consolidation poll unconditionally. Checks the server for enough
- * unprocessed session chunks, calls executeMemoryConsolidate if threshold met.
- * Always updates lastConsolidationPollAt so repeated calls within the same
- * interval are cheap no-ops. Safe to call from session_start or agent_end.
- */
-/**
  * Phase 1: fetch unprocessed chunks from server and stash on state.
  * Safe to call at session_start — no LLM key needed.
  * No-ops if called within the poll interval.
  */
 function maybePollConsolidation(state: MmemorySessionState, _ctx: ExtensionContext): void {
 	const now = Date.now();
-	// DEBUG (cleanup when stable): log every poll call including skipped ones
-	const _elapsed = now - (state.lastConsolidationPollAt ?? 0);
-	const _interval = state.config.consolidationPollIntervalMinutes * 60 * 1000;
-	logger.debug(`[mmemory] maybePollConsolidation: elapsed=${Math.round(_elapsed/1000)}s interval=${Math.round(_interval/1000)}s willSkip=${_elapsed <= _interval}`, { source: "mmemory" });
-
 	if (now - (state.lastConsolidationPollAt ?? 0) <= state.config.consolidationPollIntervalMinutes * 60 * 1000) return;
 	state.lastConsolidationPollAt = now;
 	void getOrCreateServerClient(state.config).then(async (client) => {
@@ -422,7 +375,7 @@ function maybePollConsolidation(state: MmemorySessionState, _ctx: ExtensionConte
 			state.pendingConsolidationChunks = resp.chunks;
 			logger.debug(`[mmemory] consolidation: ${resp.chunks.length} chunks queued for next agent_end`, { source: "mmemory" });
 		} else {
-			logger.debug(`[mmemory] maybePollConsolidation: server returned no chunks count=${resp?.count ?? 0} watermark=${resp?.watermark ?? 0} threshold=${state.config.consolidationMinTurns}`, { source: "mmemory" });
+			// no chunks available yet — skip
 		}
 	}).catch(e => logger.error(`EXCEPTION: [mmemory] consolidation poll error: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" }));
 }
@@ -434,12 +387,9 @@ function maybePollConsolidation(state: MmemorySessionState, _ctx: ExtensionConte
  */
 async function drainPendingConsolidation(state: MmemorySessionState, ctx: ExtensionContext): Promise<void> {
 	const chunks = state.pendingConsolidationChunks;
-	if (!chunks?.length) {
-		logger.debug(`[mmemory] drain: no pending chunks`, { source: "mmemory" });
-		return;
-	}
+	if (!chunks?.length) return;
 	state.pendingConsolidationChunks = null;
-	logger.debug(`[mmemory] drain: executing consolidation for ${chunks.length} chunks`, { source: "mmemory" });
+	logger.debug(`[mmemory] drain: consolidating ${chunks.length} chunks`, { source: "mmemory" });
 	try {
 		const fn = buildConsolidateFn(state.config, ctx.modelRegistry, undefined);
 		const result = await executeMemoryConsolidate(chunks as any, state.config, fn);
@@ -454,7 +404,6 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 	}
 }
 
-	// DEBUG (cleanup when stable): log every session_start — tracks session identity, config, and what fires on load
 	api.on("session_start", (_event, ctx) => {
 		const state = createSessionState(ctx);
 		if (!state) {
@@ -462,24 +411,16 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			return;
 		}
 		sessionMap.set(ctx.sessionManager, state);
-		logger.debug(
-			`[mmemory] session_start: session=${state.sessionId} storageRoot=${state.config.storageRoot}` +
-			` retainEvery=${state.config.retainEveryNTurns} autoRetain=${state.config.autoRetain}` +
-			` consolidationMinTurns=${state.config.consolidationMinTurns} pollInterval=${state.config.consolidationPollIntervalMinutes}min`,
-			{ source: "mmemory" },
-		);
+		logger.debug(`[mmemory] session started: ${state.sessionId}`, { source: "mmemory" });
 	});
 
-	// DEBUG (cleanup when stable): every turn entry — tracks injection, recall, and system prompt modification
 	api.on("before_agent_start", async (event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) {
-			logger.debug("[mmemory] before_agent_start: no state in sessionMap — injection skipped", { source: "mmemory" });
+			logger.debug("[mmemory] before_agent_start: no state — skipping", { source: "mmemory" });
 			return undefined;
 		}
 		state.turnCount++;
-		// DEBUG (cleanup when stable): log turn count
-		logger.debug(`[mmemory] before_agent_start: turn=${state.turnCount}`, { source: "mmemory" });
 		// Mental models: lazy-load once, reload on invalidation
 		const mmProjectDir = resolvePaths(state.config).projectDir;
 		const needsReload  = pendingMentalModelReload.has(mmProjectDir);
@@ -488,23 +429,53 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			state.mentalModelsSnippet = await loadMentalModels(state.config).catch(() => "");
 			logger.debug(`[mmemory] before_agent_start: mental models len=${state.mentalModelsSnippet?.length ?? 0}`, { source: "mmemory" });
 		}
+
+		// First turn: recall and cache snippet for subsequent turns
+		if (!state.hasRecalledForFirstTurn) {
+			state.hasRecalledForFirstTurn = true;
+			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
+			const rawQuery = composeRecallQuery(event.prompt, messages, state.config.retainContextTurns);
+			const query = truncateRecallQuery(rawQuery, event.prompt, state.config.recall.maxQueryChars);
+			logger.debug(`[mmemory] first-turn recall: query=${query.slice(0, 80)}...`, { source: "mmemory" });
+			const result = await executeMemoryRecall(
+				query, getRecallScope(ctx.sessionManager), state.config, ctx.modelRegistry, settings,
+			).catch((e) => {
+				logger.debug(`[mmemory] recall failed: ${e}`, { source: "mmemory" });
+				// Reset flag so next turn retries — server may not have been ready yet.
+				state.hasRecalledForFirstTurn = false;
+				return null;
+			});
+			const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
+			if (snippet) {
+				state.lastRecallSnippet = snippet;
+				logger.debug(`[mmemory] recall injected: ${result?.resultCount} results`, { source: "mmemory" });
+			} else {
+				logger.debug("[mmemory] recall: no results to inject", { source: "mmemory" });
+			}
+		}
+
+		// Inject mental models on every turn (after lazy-load ensures they're available)
+		const mmBlock = state.mentalModelsSnippet
+			? `<mental_models>\n${state.mentalModelsSnippet}\n</mental_models>`
+			: undefined;
+
+		if (state.lastRecallSnippet || mmBlock) {
+			let extra = event.systemPrompt.join("\n").trimEnd();
+			if (state.lastRecallSnippet) extra += "\n\n" + state.lastRecallSnippet;
+			if (mmBlock) extra += "\n\n" + mmBlock;
+			return { systemPrompt: [extra] };
+		}
+
 		return undefined;
 	});
 
-	// DEBUG (cleanup when stable): every turn exit — tracks retain cadence and consolidation drain
 	api.on("agent_end", async (_event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) {
-			logger.debug("[mmemory] agent_end: no state — skipping", { source: "mmemory" });
 			return;
 		}
 		const due = state.turnCount - state.lastRetainedTurn >= state.config.retainEveryNTurns;
-		logger.debug(
-			`[mmemory] agent_end: turn=${state.turnCount} lastRetained=${state.lastRetainedTurn}` +
-			` every=${state.config.retainEveryNTurns} due=${due}` +
-			` pendingConsolidChunks=${state.pendingConsolidationChunks?.length ?? "null"}`,
-			{ source: "mmemory" },
-		);
+		logger.debug(`[mmemory] agent_end: turn=${state.turnCount} due=${due}`, { source: "mmemory" });
 
 		if (due && state.config.autoRetain) {
 			const messages = ctx.sessionManager
@@ -512,7 +483,7 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 				.filter((e): e is import("./session/session-manager").SessionMessageEntry => e.type === "message")
 				.map(e => e.message as { role: string; content: unknown });
 			state.lastRetainedTurn = state.turnCount;
-			logger.debug(`[mmemory] agent_end: retain firing session=${state.sessionId} messages=${messages.length}`, { source: "mmemory" });
+			logger.debug(`[mmemory] agent_end: retaining session=${state.sessionId}`, { source: "mmemory" });
 			void retainSession(state, messages, ctx).catch((e) => {
 				logger.error(`EXCEPTION: [mmemory] agent_end: retain failed: ${e instanceof Error ? e.stack : String(e)}`, { source: "mmemory" });
 			});
@@ -524,7 +495,6 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) return undefined;
 		const messages: AgentMessage[] = event.messages ?? [];
-		// DEBUG (cleanup when stable): log compaction recall trigger
 		logger.debug(`[mmemory] session.compacting: messages=${messages.length}`, { source: "mmemory" });
 		const firstUser = messages.find(m => m.role === "user");
 		const rawPrompt = firstUser
@@ -545,7 +515,6 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 
 		const result = await executeMemoryRecall(query, undefined, state.config).catch(() => null);
 		const snippet = result ? formatRecallForSystemPrompt(result) : undefined;
-		// DEBUG (cleanup when stable): log compaction recall result
 		logger.debug(`[mmemory] session.compacting: recall result=${snippet ? "yes len=" + snippet.length : "no snippet"}`, { source: "mmemory" });
 		return snippet ? { context: [snippet] } : undefined;
 	});
@@ -553,7 +522,6 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 	api.on("session_shutdown", async (_event, ctx) => {
 		const state = sessionMap.get(ctx.sessionManager);
 		if (!state) return;
-		// DEBUG (cleanup when stable): log every shutdown
 		logger.debug(`[mmemory] session_shutdown: session=${state.sessionId} turnCount=${state.turnCount} lastRetained=${state.lastRetainedTurn}`, { source: "mmemory" });
 		// P4-3: retain on shutdown to capture content since the last periodic retain.
 		// Only fires if autoRetain is on and there's been at least one turn since last retain.

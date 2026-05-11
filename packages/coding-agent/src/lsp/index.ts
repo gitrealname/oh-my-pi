@@ -1169,6 +1169,8 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Theme> {
 	readonly name = "lsp";
 	readonly label = "LSP";
+	readonly loadMode = "discoverable";
+	readonly summary = "Query LSP (language server) for diagnostics, hover info, and references";
 	readonly description: string;
 	readonly parameters = lspSchema;
 	readonly renderCall = renderCall;
@@ -1338,7 +1340,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				if (!detailed && targets.length === 1) {
 					if (uniqueDiagnostics.length === 0) {
 						return {
-							content: [{ type: "text", text: "No diagnostics" }],
+							content: [{ type: "text", text: "OK" }],
 							details: { action, serverName: Array.from(allServerNames).join(", "), success: true },
 						};
 					}

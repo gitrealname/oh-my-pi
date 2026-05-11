@@ -13,7 +13,7 @@ import {
 	modelsAreEqual,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
-import type { Component, SlashCommand } from "@oh-my-pi/pi-tui";
+import type { Component, EditorTheme, SlashCommand } from "@oh-my-pi/pi-tui";
 import {
 	Container,
 	clearRenderCache,
@@ -73,6 +73,15 @@ import { MCPCommandController } from "./controllers/mcp-command-controller";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
+import {
+	consumeLoopLimitIteration,
+	createLoopLimitRuntime,
+	describeLoopLimit,
+	describeLoopLimitRuntime,
+	isLoopDurationExpired,
+	type LoopLimitRuntime,
+	parseLoopLimitArgs,
+} from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import type { Theme } from "./theme/theme";
@@ -158,6 +167,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	planModePlanFilePath: string | undefined = undefined;
 	loopModeEnabled = false;
 	loopPrompt: string | undefined = undefined;
+	loopLimit: LoopLimitRuntime | undefined = undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
 	todoPhases: TodoPhase[] = [];
 	hideThinkingBlock = false;
@@ -183,6 +193,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	optimisticUserMessageSignature: string | undefined = undefined;
 	locallySubmittedUserSignatures: Set<string> = new Set();
 	#pendingSubmittedInput: SubmittedUserInput | undefined;
+	#pendingSubmissionDispose: (() => void) | undefined;
 	lastSigintTime = 0;
 	lastEscapeTime = 0;
 	shutdownRequested = false;
@@ -418,6 +429,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setFocus(this.editor);
 
+		// Initialize hooks BEFORE enabling input to prevent race condition
+		// where user could type a command before it's registered
+		await this.initHooksAndCustomTools();
+
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
 
@@ -443,11 +458,22 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = true;
 		this.ui.requestRender(true);
 
-		// Initialize hooks with TUI-based UI context
-		await this.initHooksAndCustomTools();
-
 		// Restore mode from session (e.g. plan mode on resume)
 		await this.#restoreModeFromSession();
+
+		// Restore unsent editor draft from previous session shutdown (Ctrl+D).
+		// One-shot: consumeDraft removes the sidecar after read so the next
+		// resume does not re-restore the same text.
+		try {
+			const draft = await this.sessionManager.consumeDraft();
+			if (draft && !this.editor.getText()) {
+				this.editor.setText(draft);
+				this.updateEditorBorderColor();
+				this.ui.requestRender();
+			}
+		} catch (err) {
+			logger.warn("Failed to restore session draft", { error: String(err) });
+		}
 
 		// Subscribe to agent events
 		this.#subscribeToAgent();
@@ -525,25 +551,35 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #runLoopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
+		if (!consumeLoopLimitIteration(this.loopLimit)) {
+			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+			return;
+		}
+
 		if (action === "compact") {
 			await this.handleCompactCommand();
 		} else if (action === "reset") {
 			await this.handleClearCommand();
 		}
 		if (!this.loopModeEnabled || !this.onInputCallback) return;
+		if (isLoopDurationExpired(this.loopLimit)) {
+			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
+			return;
+		}
 		this.onInputCallback(this.startPendingSubmission({ text: prompt }));
 	}
 
-	disableLoopMode(): void {
+	disableLoopMode(message = "Loop mode disabled."): void {
 		const wasEnabled = this.loopModeEnabled;
 		this.loopModeEnabled = false;
 		this.loopPrompt = undefined;
+		this.loopLimit = undefined;
 		this.#cancelLoopAutoSubmit();
 		this.statusLine.setLoopModeStatus(undefined);
 		this.updateEditorTopBorder();
 		this.ui.requestRender();
 		if (wasEnabled) {
-			this.showStatus("Loop mode disabled.");
+			this.showStatus(message);
 		}
 	}
 
@@ -557,19 +593,51 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelLoopAutoSubmit();
 	}
 
-	async handleLoopCommand(): Promise<void> {
+	async handleLoopCommand(args = ""): Promise<void> {
 		if (this.loopModeEnabled) {
 			this.disableLoopMode();
 			return;
 		}
+		const parsedLimit = parseLoopLimitArgs(args);
+		if (typeof parsedLimit === "string") {
+			this.showError(parsedLimit);
+			return;
+		}
 		this.loopModeEnabled = true;
 		this.loopPrompt = undefined;
+		this.loopLimit = createLoopLimitRuntime(parsedLimit);
 		this.statusLine.setLoopModeStatus({ enabled: true });
 		this.updateEditorTopBorder();
 		this.ui.requestRender();
+		const limitSuffix = parsedLimit ? ` Limited to ${describeLoopLimit(parsedLimit)}.` : "";
+		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
 		this.showStatus(
-			"Loop mode enabled. Your next prompt will repeat after each turn. Esc cancels the current iteration; /loop again to disable.",
+			`Loop mode enabled.${limitSuffix}${remainingSuffix} Your next prompt will repeat after each turn. Esc cancels the current iteration; /loop again to disable.`,
 		);
+	}
+
+	recordLocalSubmission(text: string, imageCount = 0): () => void {
+		if (this.isKnownSlashCommand(text)) {
+			return () => {};
+		}
+		const signature = `${text}\u0000${imageCount}`;
+		this.locallySubmittedUserSignatures.add(signature);
+		let disposed = false;
+		return () => {
+			if (disposed) return;
+			disposed = true;
+			this.locallySubmittedUserSignatures.delete(signature);
+		};
+	}
+
+	async withLocalSubmission<T>(text: string, fn: () => Promise<T>, options?: { imageCount?: number }): Promise<T> {
+		const dispose = this.recordLocalSubmission(text, options?.imageCount ?? 0);
+		try {
+			return await fn();
+		} catch (err) {
+			dispose();
+			throw err;
+		}
 	}
 
 	startPendingSubmission(input: { text: string; images?: ImageContent[] }): SubmittedUserInput {
@@ -580,8 +648,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			started: false,
 		};
 		this.#pendingSubmittedInput = submission;
-		this.optimisticUserMessageSignature = `${submission.text}\u0000${submission.images?.length ?? 0}`;
-		this.locallySubmittedUserSignatures.add(this.optimisticUserMessageSignature);
+		const imageCount = submission.images?.length ?? 0;
+		this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
+		this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
 		this.addMessageToChat({
 			role: "user",
 			content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
@@ -603,7 +672,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		submission.cancelled = true;
 		this.#pendingSubmittedInput = undefined;
 		this.optimisticUserMessageSignature = undefined;
-		this.locallySubmittedUserSignatures.delete(`${submission.text}\u0000${submission.images?.length ?? 0}`);
+		this.#pendingSubmissionDispose?.();
+		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
@@ -627,8 +697,22 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	finishPendingSubmission(input: SubmittedUserInput): void {
-		if (this.#pendingSubmittedInput === input) {
+		const wasPendingSubmission = this.#pendingSubmittedInput === input;
+		const pendingSubmissionDispose = this.#pendingSubmissionDispose;
+		if (wasPendingSubmission) {
 			this.#pendingSubmittedInput = undefined;
+			this.#pendingSubmissionDispose = undefined;
+		}
+
+		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
+			this.optimisticUserMessageSignature = undefined;
+			pendingSubmissionDispose?.();
+			this.#pendingWorkingMessage = undefined;
+			if (this.loadingAnimation) {
+				this.loadingAnimation.stop();
+				this.loadingAnimation = undefined;
+				this.statusContainer.clear();
+			}
 		}
 	}
 
@@ -820,6 +904,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Restore mode state from session entries on resume (e.g. plan mode). */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
+		if (!this.session.settings.get("plan.enabled")) {
+			// Clear stale plan/plan_paused mode so re-enabling the setting
+			// later doesn't unexpectedly restore an old plan session.
+			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused") {
+				this.sessionManager.appendModeChange("none");
+			}
+			return;
+		}
 		if (sessionContext.mode === "plan") {
 			const planFilePath = sessionContext.modeData?.planFilePath as string | undefined;
 			await this.#enterPlanMode({ planFilePath });
@@ -1023,7 +1115,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #approvePlan(
 		planContent: string,
-		options: { planFilePath: string; finalPlanFilePath: string },
+		options: { planFilePath: string; finalPlanFilePath: string; preserveContext?: boolean },
 	): Promise<void> {
 		await renameApprovedPlanFile({
 			planFilePath: options.planFilePath,
@@ -1033,14 +1125,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		});
 		const previousTools = this.#planModePreviousTools ?? this.session.getActiveToolNames();
 		await this.#exitPlanMode({ silent: true, paused: false });
-		await this.handleClearCommand();
-		// The new session has a fresh local:// root — persist the approved plan there
-		// so `local://<title>.md` resolves correctly in the execution session.
-		const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
-			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-			getSessionId: () => this.sessionManager.getSessionId(),
-		});
-		await Bun.write(newLocalPath, planContent);
+		if (!options.preserveContext) {
+			await this.handleClearCommand();
+			// The new session has a fresh local:// root — persist the approved plan there
+			// so `local://<title>.md` resolves correctly in the execution session.
+			const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
+				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+				getSessionId: () => this.sessionManager.getSessionId(),
+			});
+			await Bun.write(newLocalPath, planContent);
+		}
 		if (previousTools.length > 0) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
@@ -1049,6 +1143,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const planModePrompt = prompt.render(planModeApprovedPrompt, {
 			planContent,
 			finalPlanFilePath: options.finalPlanFilePath,
+			contextPreserved: options.preserveContext === true,
 		});
 		await this.session.prompt(planModePrompt, { synthetic: true });
 	}
@@ -1061,6 +1156,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 			if (!confirmed) return;
 			await this.#exitPlanMode({ paused: true });
+			return;
+		}
+		if (!this.session.settings.get("plan.enabled")) {
+			this.showWarning("Plan mode is disabled. Enable it in settings (plan.enabled).");
 			return;
 		}
 		await this.#enterPlanMode();
@@ -1092,7 +1191,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#renderPlanPreview(planContent);
 		const choice = await this.showHookSelector(
 			"Plan mode - next step",
-			["Approve and execute", "Refine plan", "Stay in plan mode"],
+			["Approve and execute", "Approve and keep context", "Refine plan", "Stay in plan mode"],
 			{
 				initialIndex: 2,
 				helpText: this.#getPlanReviewHelpText(),
@@ -1100,7 +1199,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 		);
 
-		if (choice === "Approve and execute") {
+		if (choice === "Approve and execute" || choice === "Approve and keep context") {
 			const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
 			try {
 				const latestPlanContent = await this.#readPlanFile(planFilePath);
@@ -1108,7 +1207,11 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.showError(`Plan file not found at ${planFilePath}`);
 					return;
 				}
-				await this.#approvePlan(latestPlanContent, { planFilePath, finalPlanFilePath });
+				await this.#approvePlan(latestPlanContent, {
+					planFilePath,
+					finalPlanFilePath,
+					preserveContext: choice === "Approve and keep context",
+				});
 			} catch (error) {
 				this.showError(
 					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
@@ -1167,8 +1270,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#isShuttingDown) return;
 		this.#isShuttingDown = true;
 
+		// Snapshot the editor before any teardown empties it. Persisting the draft
+		// here covers Ctrl+D shutdown with non-empty text; for /exit the editor is
+		// already cleared so saveDraft("") just removes any stale sidecar.
+		const draftText = this.editor.getText();
+
 		// Flush pending session writes before shutdown
 		await this.sessionManager.flush();
+		try {
+			await this.sessionManager.saveDraft(draftText);
+		} catch (err) {
+			logger.warn("Failed to save session draft", { error: String(err) });
+		}
 		this.#btwController.dispose();
 
 		// Emit shutdown event to hooks
@@ -1211,9 +1324,48 @@ export class InteractiveMode implements InteractiveModeContext {
 	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void {
 		this.#extensionUiController.initializeHookRunner(uiContext, hasUI);
 	}
-
 	createBackgroundUiContext(): ExtensionUIContext {
 		return this.#extensionUiController.createBackgroundUiContext();
+	}
+
+	setEditorComponent(
+		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
+	): void {
+		const previousEditor = this.editor;
+		const previousText = previousEditor.getText();
+		const nextEditor = factory
+			? factory(this.ui, getEditorTheme(), this.keybindings)
+			: new CustomEditor(getEditorTheme());
+
+		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
+		nextEditor.setAutocompleteMaxVisible(this.settings.get("autocompleteMaxVisible"));
+		nextEditor.onAutocompleteCancel = () => {
+			this.ui.requestRender(true);
+		};
+		nextEditor.onAutocompleteUpdate = () => {
+			this.ui.requestRender();
+		};
+		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
+		if (this.historyStorage) {
+			nextEditor.setHistoryStorage(this.historyStorage);
+		}
+		nextEditor.setText(previousText);
+
+		this.editorContainer.clear();
+		this.editor = nextEditor;
+		this.editorContainer.addChild(nextEditor);
+		this.ui.setFocus(nextEditor);
+
+		this.#inputController.setupKeyHandlers();
+		this.#inputController.setupEditorSubmitHandler();
+
+		void this.refreshSlashCommandState().catch(error => {
+			logger.warn("Failed to refresh slash command state for custom editor", { error: String(error) });
+		});
+
+		this.updateEditorBorderColor();
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
 	}
 
 	// Event handling
@@ -1229,6 +1381,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	showError(message: string): void {
 		this.#pendingSubmittedInput = undefined;
 		this.optimisticUserMessageSignature = undefined;
+		this.#pendingSubmissionDispose?.();
+		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();

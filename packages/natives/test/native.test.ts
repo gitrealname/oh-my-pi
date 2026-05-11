@@ -15,6 +15,7 @@ import {
 	MacOSPowerAssertion,
 	PtySession,
 	sanitizeText,
+	summarizeCode,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -83,6 +84,70 @@ describe("pi-natives", () => {
 		};
 	});
 
+	describe("summarize", () => {
+		it("summarizes TypeScript function bodies", () => {
+			const result = summarizeCode({
+				path: "fixture.ts",
+				code: "export function greet(name: string): string {\n\tconst clean = name.trim();\n\tconst label = clean || 'world';\n\treturn label.toUpperCase();\n}\n",
+			});
+
+			expect(result.parsed).toBe(true);
+			expect(result.elided).toBe(true);
+			expect(result.segments.map(segment => segment.kind)).toEqual(["kept", "elided", "kept"]);
+			expect(result.segments[0].text).toBe("export function greet(name: string): string {");
+			expect(result.segments[1].startLine).toBe(2);
+			expect(result.segments[1].endLine).toBe(4);
+			expect(result.segments[2].text).toBe("}");
+		});
+
+		it("summarizes Rust and Python bodies while preserving boundary lines", () => {
+			const rust = summarizeCode({
+				path: "fixture.rs",
+				code: 'impl Greeter {\n\tfn greet(&self) -> String {\n\t\tlet name = "world";\n\t\tlet label = name.to_uppercase();\n\t\tformat!("hello {label}")\n\t}\n}\n',
+			});
+			const python = summarizeCode({
+				path: "fixture.py",
+				code: "class Greeter:\n    def greet(self, name: str) -> str:\n        clean = name.strip()\n        label = clean or 'world'\n        return f'hello {label}'\n",
+			});
+
+			expect(rust.elided).toBe(true);
+			expect(rust.segments.map(segment => segment.text ?? "...").join("\n")).toContain("impl Greeter {\n...\n}");
+			expect(python.elided).toBe(true);
+			expect(python.segments[0].text).toContain("def greet");
+			expect(python.segments.at(-1)?.text).toContain("return");
+		});
+
+		it("summarizes multiline literals and block comments", () => {
+			const result = summarizeCode({
+				path: "fixture.ts",
+				code: "/*\n * line 1\n * line 2\n * line 3\n * line 4\n */\nexport const config = {\n\ta: 1,\n\tb: 2,\n\tc: 3,\n};\n",
+			});
+
+			expect(result.elided).toBe(true);
+			expect(result.segments.filter(segment => segment.kind === "elided")).toHaveLength(2);
+			expect(result.segments.map(segment => segment.text ?? "...").join("\n")).toContain("...\n */");
+			expect(result.segments.map(segment => segment.text ?? "...").join("\n")).toContain(
+				"export const config = {\n...\n};",
+			);
+		});
+
+		it("falls back for unsupported or empty input", () => {
+			const unsupported = summarizeCode({ path: "fixture.txt", code: "plain text\nwith lines\n" });
+			const empty = summarizeCode({ path: "fixture.ts", code: "" });
+
+			expect(unsupported.parsed).toBe(false);
+			expect(unsupported.segments).toHaveLength(1);
+			expect(unsupported.segments[0].text).toBe("plain text\nwith lines\n");
+			expect(empty.parsed).toBe(false);
+			expect(empty.segments).toHaveLength(0);
+		});
+
+		it("respects minBodyLines", () => {
+			const code = "function small() {\n\treturn 1;\n}\n";
+			expect(summarizeCode({ path: "fixture.ts", code }).elided).toBe(false);
+			expect(summarizeCode({ path: "fixture.ts", code, minBodyLines: 3 }).elided).toBe(true);
+		});
+	});
 	describe("grep", () => {
 		it("should find patterns in files", async () => {
 			const result = await grep({
@@ -125,6 +190,26 @@ describe("pi-natives", () => {
 			});
 
 			expect(result.filesWithMatches).toBeGreaterThan(0);
+		});
+
+		it("counts files instead of line matches in filesWithMatches mode", async () => {
+			const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-grep-files-"));
+			try {
+				await fs.writeFile(path.join(scopedDir, "one.ts"), "return 1;\nreturn 2;\n");
+				await fs.writeFile(path.join(scopedDir, "two.ts"), "return 3;\n");
+
+				const result = await grep({
+					pattern: "return",
+					path: scopedDir,
+					mode: GrepOutputMode.FilesWithMatches,
+				});
+
+				expect(result.totalMatches).toBe(2);
+				expect(result.filesWithMatches).toBe(2);
+				expect(result.matches.map(match => path.basename(match.path)).sort()).toEqual(["one.ts", "two.ts"]);
+			} finally {
+				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
 		});
 
 		it("should treat unknown grep type filter as a strict extension filter", async () => {

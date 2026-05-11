@@ -35,9 +35,10 @@ session actually shrinks after a flush (not just gets a steer message bolted on 
 Fork of [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) with
 enterprise and workflow extensions baked into the binary.
 
-Current base: upstream v14.5.14 (`ae7c4100c`)
-Upstream: `origin/main` → periodically merged into `aws-corp`.
+Current base: upstream v14.8.1 (`d4bb2f3f3`)
+Upstream: `origin/main` → periodically merged into `aws-corp`. Last merge: 2026-05-09.
 See [MERGE-INSTRUCTIONS.md](MERGE-INSTRUCTIONS.md) for merge checklist.
+>>>>>>> feature/prompt-template-integration
 
 ---
 
@@ -327,12 +328,176 @@ descriptions. Other agents on the same machine are unaffected.
 | `mme-retain.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
 | `mme-reflect.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
 | `mme-gateway.tool-desc.md` | mmemory | Tool description | `<agentDir>/sidecars/` |
+| `mme-consolidation.prompt.md` | mmemory | LLM prompt | `<agentDir>/sidecars/` |
+| `mme-injection-preamble.md` | mmemory | System prompt | `<agentDir>/sidecars/` |
+| `mme-recall-preamble.prompt.md` | mmemory | System prompt | `<agentDir>/sidecars/` |
 | `mprune-summarizer.prompt.md` | mprune | LLM prompt | `<agentDir>/sidecars/` |
 | `mreview-editor.ui.html` | mreview | Browser UI | `<agentDir>/sidecars/` |
 
 ---
 
-### 13. app.script.1-10 (Generic Script Executor)
+### 13. m-prompt-template — Declarative Slash Commands
+
+**Source (original):** [`nicobailon/pi-prompt-template-model`](https://github.com/nicobailon/pi-prompt-template-model) (MIT, Nico Bailon).
+All `@mariozechner/pi-*` imports rewritten to `@oh-my-pi/pi-*`.
+Ported into `packages/coding-agent/src/m-prompt-template/`.
+
+Turn any `.md` file in `<agent-dir>/prompts/` (global, `PI_CODING_AGENT_DIR/prompts/`) or `{cwd}/.pi/prompts/` (project)
+into a `/slash-command`. Frontmatter fields control model routing, skill injection, tool
+restriction, memory isolation, and chaining. All switches restore after the command.
+
+**OMP additions vs original PT (not in `nicobailon/pi-prompt-template-model`):**
+- `role:` field — resolves via OMP `modelRoles` config; original only has `model:` (explicit string)
+- `memory: false` — strips injected memory blocks from system prompt; original PT has no memory system
+- `promptTemplates.enabled` setting — extension-level enable/disable; original unconditionally loads
+- Factory-body pre-registration (`refreshPrompts(process.cwd())`) for OMP autocomplete timing
+- `activate.ts` adapter isolating OMP-specific patches (`sendUserMessage` → `followUp` delivery,
+  `model_select` event drop) from the PT source
+
+**Frontmatter reference:**
+
+| Field | Type | Effect | Restored? |
+|---|---|---|---|
+| `name` | string | Slash command name (required). Type `/prompt:name` to invoke. | — |
+| `description` | string | Shown in autocomplete. | — |
+| `role` | role name | Switch model via `modelRoles` config. Unknown role = clean abort. | ✓ API |
+| `model` | provider/model string | Switch to explicit concrete model. No role resolution. | ✓ API |
+| `thinking` | `low`\|`medium`\|`high`\|`none` | Set thinking level. | ✓ API |
+| `skill` | skill name | Inject `<agent-dir>/skills/{name}.md` into system prompt. | — |
+| `tools` | string list | Restrict active tools to this whitelist. | ✓ API |
+| `memory` | `"false"` | Strip `<observations>/<memories>/<referenced_files>` from system prompt. | — |
+| `chain` | pipeline string | Sequential step pipeline (`->` separator required). | — |
+| `loop` | integer | Repeat body N times with prior-iteration context. | — |
+
+Body text substitution: `$@` = all args, `$1`, `$2`, … = positional.
+
+---
+
+**Example: basic (no special fields)**
+```yaml
+---
+name: greet
+description: Greet the user
+---
+Say hello to: $@
+```
+Invoked with `/prompt:greet Alice` → sends "Say hello to: Alice" on current model.
+
+**Example: role switch**
+```yaml
+---
+name: quick-answer
+role: smol                # → modelRoles["smol"] = openrouter/xiaomi/mimo-v2-flash
+description: Fast answer on lightweight model
+---
+$@
+```
+
+**Example: memory isolation**
+```yaml
+---
+name: t3-no-memory
+memory: false           # strips <observations>/<memories>/<referenced_files>
+description: Execute with clean system prompt (no injected memory)
+---
+List XML section headers from your system prompt.
+```
+
+**Example: tool restriction**
+```yaml
+---
+name: read-only-task
+tools:
+  - read
+  - search
+description: Task where only read and search are available
+---
+$@
+```
+
+**Example: skill injection**
+```yaml
+---
+name: architecture-advice
+skill: architecture-review   # injects <agent-dir>/skills/architecture-review.md
+role: slow
+description: Architecture review with injected context
+---
+Review: $@
+```
+
+**Example: chain (sequential pipeline)**
+```yaml
+---
+name: research-and-draft
+chain: "research $@ -> draft -> review"    # -> separator required
+description: Research topic, draft response, review
+---
+```
+Each step sees the prior steps' output in conversation context.
+Ad-hoc chains: `/mchain-prompts step1 -> step2 -> step3`
+
+**Example: full-featured (all controls)**
+```yaml
+---
+name: deep-review
+role: slow                    # use slow model (deepseek-v3.2)
+thinking: high                # extended thinking
+skill: architecture-review    # inject skill into system prompt
+memory: false                # strip <observations>/<memories> for this command
+tools:                        # only these tools available
+  - read
+  - search
+description: Isolated deep review — no memory, limited tools, slow model
+---
+Review this code for correctness, edge cases, and design: $@
+```
+
+**model: vs role: distinction:**
+```yaml
+role: slow          # resolved via modelRoles config → concrete string
+model: openrouter/qwen/qwen-2.5-72b-instruct  # explicit, no resolution
+```
+`role:` wins if both specified. Unknown role = clean abort, no fallback to `model:`.
+3-segment provider paths (`openrouter/org/name`) supported.
+
+**Built-in commands added by this extension:**
+- `/mchain-prompts step1 -> step2` — ad-hoc chain without a frontmatter definition
+- `/mprompt-tool [on|off|guidance]` — toggle the run-prompt AI tool (lets the model invoke templates)
+
+**Template discovery:**
+```
+~/.pi/agent/prompts/    ← global (all sessions, all projects)
+{cwd}/.pi/prompts/      ← project-local
+~/.pi/agent/prompts_disabled/  ← move here to hide without deleting
+```
+
+**Enable/disable:**
+```yaml
+# Disable entire extension (all templates hidden):
+promptTemplates:
+  enabled: false
+
+# Hide specific built-in commands (OMP disabledCommands list):
+disabledCommands:
+  - mchain-prompts
+  - mprompt-tool
+```
+
+**Files:**
+- `packages/coding-agent/src/m-prompt-template/index.ts` — main extension
+- `packages/coding-agent/src/m-prompt-template/activate.ts` — OMP adapter (patches + role resolver)
+- `packages/coding-agent/src/m-prompt-template/model-selection.ts` — role → model resolution
+- `packages/coding-agent/src/m-prompt-template/prompt-loader.ts` — template scanning + registration
+- `packages/coding-agent/src/utils/m-utils.ts` — `resolveTemplateModelSpec()` shared utility
+- `feature-prompt-template-integration-STATUS.md` — detailed integration notes, OMP vs PI differences
+
+Config key: `promptTemplates.enabled` (default: `true`).
+See §15 (Config Surface) for the full table.
+
+---
+
+### 14. app.script.1-10 (Generic Script Executor)
 
 Ten keybinding slots (`app.script.1` through `app.script.10`) that execute
 arbitrary shell commands and route their output into the agent session.
@@ -371,7 +536,7 @@ See `research/omp/dist-templates/config-ow.yml` for the fully annotated config.
 | MBrowser tool | `mbrowser.enabled` | `true` | |
 | Disabled commands | `disabledCommands[]` | `[]` | |
 | Double-escape action | `doubleEscapeAction` | `"tree"` | options: tree\|mtree\|branch\|none |
-| mmemory | `mmemory.enabled` | `false` | [docs/mmemory.md](docs/mmemory.md) |
+| mmemory | `mmemory.enabled` | `true` | [docs/mmemory.md](docs/mmemory.md) |
 | mmemory storage | `mmemory.storageRoot` | `~/mmemory` | |
 | mmemory agent tag | `mmemory.agentTag` | `"default"` | |
 | mmemory time-filter model | `mmemory.timeFilterModelRole` | inherits modelRole | |
@@ -380,6 +545,7 @@ See `research/omp/dist-templates/config-ow.yml` for the fully annotated config.
 | mprune image aging | `mprune.images.keepTurns` | `5` | |
 | MReview command | `mreview.enabled` | `true` | [docs/mreview.md](docs/mreview.md) |
 | Script slots | `appScripts.slot1..10.command` | `~` | |
+| Prompt templates | `promptTemplates.enabled` | `true` | § 13 |
 
 ---
 

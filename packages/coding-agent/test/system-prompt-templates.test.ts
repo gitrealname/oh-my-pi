@@ -203,6 +203,37 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("call `search_tool_bm25` before concluding no such tool exists");
 	});
 
+	test("buildSystemPrompt renders workspace tree after directory context in project prompt", async () => {
+		await withTempDir(async dir => {
+			const { systemPrompt } = await buildSystemPrompt({
+				cwd: dir,
+				contextFiles: [],
+				skills: [],
+				rules: [],
+				toolNames: ["read"],
+				agentsMdSearch: {
+					scopePath: ".",
+					limit: 200,
+					pattern: "AGENTS.md depth 1-4",
+					files: ["packages/coding-agent/AGENTS.md"],
+				},
+				workspaceTree: {
+					rootPath: dir,
+					rendered: ".\n  - src/        1m",
+					truncated: true,
+					totalLines: 2,
+				},
+			});
+
+			const projectPrompt = systemPrompt[1] ?? "";
+
+			expect(projectPrompt).toContain("<workspace-tree>");
+			expect(projectPrompt).toContain("Working directory layout (sorted by mtime, recent first; depth ≤ 3):");
+			expect(projectPrompt).toContain("(some entries elided to keep the tree short");
+			expect(projectPrompt.indexOf("</dir-context>")).toBeLessThan(projectPrompt.indexOf("<workspace-tree>"));
+		});
+	});
+
 	test("buildSystemPrompt deduplicates always-apply rules already present in SYSTEM.md", async () => {
 		const duplicateRule = ["Use static imports.", "", "Do not use dynamic loading."].join("\n");
 		const distinctRule = "Validate inputs at boundaries.";
@@ -215,7 +246,7 @@ describe("system Handlebars prompt templates", () => {
 				["Project instructions", "", duplicateRule, "", "Trailing note"].join("\n"),
 			);
 
-			const prompt = await buildSystemPrompt({
+			const { systemPrompt } = await buildSystemPrompt({
 				cwd: dir,
 				contextFiles: [],
 				skills: [],
@@ -228,6 +259,8 @@ describe("system Handlebars prompt templates", () => {
 				],
 			});
 
+			const prompt = systemPrompt.join("\n\n");
+
 			expect(countOccurrences(prompt, "Use static imports.")).toBe(1);
 			expect(countOccurrences(prompt, "Do not use dynamic loading.")).toBe(1);
 			expect(countOccurrences(prompt, distinctRule)).toBe(1);
@@ -238,7 +271,7 @@ describe("system Handlebars prompt templates", () => {
 		const duplicateRule = ["Keep functions small.", "", "Extract shared helpers on the second use."].join("\n");
 		const distinctRule = "Surface failures explicitly to callers.";
 
-		const prompt = await buildSystemPrompt({
+		const { systemPrompt } = await buildSystemPrompt({
 			cwd: os.tmpdir(),
 			contextFiles: [],
 			skills: [],
@@ -250,6 +283,8 @@ describe("system Handlebars prompt templates", () => {
 				{ name: "truthful-failures", content: distinctRule, path: "/tmp/truthful-failures.md" },
 			],
 		});
+
+		const prompt = systemPrompt.join("\n\n");
 
 		expect(countOccurrences(prompt, "Keep functions small.")).toBe(1);
 		expect(countOccurrences(prompt, "Extract shared helpers on the second use.")).toBe(1);
@@ -272,7 +307,7 @@ describe("system Handlebars prompt templates", () => {
 	});
 
 	test("buildSystemPrompt references overridden tool wire names", async () => {
-		const systemPrompt = await buildSystemPrompt({
+		const { systemPrompt } = await buildSystemPrompt({
 			cwd: os.tmpdir(),
 			contextFiles: [],
 			skills: [],
@@ -289,10 +324,12 @@ describe("system Handlebars prompt templates", () => {
 			]),
 		});
 
-		expect(systemPrompt).toContain("Edit: `apply_patch`");
-		expect(systemPrompt).toContain("`read`, `search`, `find`, `apply_patch`, `lsp`");
-		expect(systemPrompt).toContain("Use `apply_patch` for surgical text changes");
-		expect(systemPrompt).not.toContain("Edit: `edit`");
+		const promptText = systemPrompt.join("\n\n");
+
+		expect(promptText).toContain("Edit: `apply_patch`");
+		expect(promptText).toContain("`read`, `search`, `find`, `apply_patch`, `lsp`");
+		expect(promptText).toContain("Use `apply_patch` for surgical text changes");
+		expect(promptText).not.toContain("Edit: `edit`");
 	});
 
 	test("buildSystemPrompt omits CPU info when os.cpus fails", async () => {
@@ -300,7 +337,7 @@ describe("system Handlebars prompt templates", () => {
 			throw new Error("os.cpus() failed");
 		});
 
-		const systemPrompt = await buildSystemPrompt({
+		const { systemPrompt } = await buildSystemPrompt({
 			cwd: os.tmpdir(),
 			contextFiles: [],
 			skills: [],
@@ -308,7 +345,9 @@ describe("system Handlebars prompt templates", () => {
 			toolNames: ["read"],
 		});
 
-		const workstation = /<workstation>\n(?<content>[\s\S]*?)\n<\/workstation>/u.exec(systemPrompt)?.groups?.content;
+		const projectPrompt = systemPrompt[1] ?? "";
+
+		const workstation = /<workstation>\n(?<content>[\s\S]*?)\n<\/workstation>/u.exec(projectPrompt)?.groups?.content;
 		expect(workstation).toContain("OS:");
 		expect(workstation).not.toContain("CPU:");
 	});

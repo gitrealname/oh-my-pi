@@ -27,7 +27,8 @@ import {
 	getOrCreateServerClient,
 	loadMmemoryConfig,
 } from "../tools/mmemory/index";
-import type { AgentSession, MemoryBackend, MemoryBackendStartOptions } from "./types";
+import type { MemoryBackend, MemoryBackendStartOptions } from "./types";
+import type { AgentSession } from "../session/agent-session";
 import type { InjectionSnapshot, MmemoryConfig } from "../tools/mmemory/index";
 import embeddedInjectionPreamble from "../sidecars/mme-injection-preamble.md" with { type: "text" };
 const resolveInjectionPreamble = createSidecar(sidecarPath("mme-injection-preamble.md"), embeddedInjectionPreamble);
@@ -75,6 +76,9 @@ export const mmemoryBackend: MemoryBackend = {
 			logger.debug("[mmemory-backend] start: mmemory not enabled in config — skipping", { source: "mmemory" });
 			return;
 		}
+
+		// If the spawning agent definition requested no memory injection, skip entirely
+		if (options.memory === "none") return;
 
 		const state: BackendState = {
 			config,

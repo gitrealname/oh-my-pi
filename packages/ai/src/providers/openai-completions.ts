@@ -9,6 +9,7 @@ import type {
 	ChatCompletionMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
+import packageJson from "../../package.json" with { type: "json" };
 import type { Effort } from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
@@ -32,6 +33,7 @@ import {
 	type ToolChoice,
 	type ToolResultMessage,
 } from "../types";
+import { normalizeSystemPrompts } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { toFireworksWireModelId } from "../utils/fireworks-model-id";
@@ -285,10 +287,18 @@ function getTrailingPartialTag(text: string, tags: readonly string[]): string {
 // Body is restricted to identifier-like chars (with the DeepSeek tokenizer's `▁`),
 // capped at a sane length to avoid swallowing legitimate angle-bracket text.
 const DEEPSEEK_SPECIAL_TOKEN_REGEX = /<(?:｜|\|)[A-Za-z0-9_.｜|▁]{1,64}(?:｜|\|)>/g;
+const DEEPSEEK_SPECIAL_TOKEN_AT_START_REGEX = /^\s*<(?:｜|\|)[A-Za-z0-9_.｜|▁]{1,64}(?:｜|\|)>/;
+const DEEPSEEK_SPECIAL_TOKEN_AT_END_REGEX = /<(?:｜|\|)[A-Za-z0-9_.｜|▁]{1,64}(?:｜|\|)>\s*$/;
 const DEEPSEEK_OPEN_DELIMS = ["<｜", "<|"] as const;
 
 function stripDeepseekSpecialTokens(text: string): string {
-	return text.replace(DEEPSEEK_SPECIAL_TOKEN_REGEX, "");
+	const stripped = text.replace(DEEPSEEK_SPECIAL_TOKEN_REGEX, "");
+	if (stripped === text) return text;
+
+	let normalized = stripped;
+	if (DEEPSEEK_SPECIAL_TOKEN_AT_START_REGEX.test(text)) normalized = normalized.replace(/^\s+/u, "");
+	if (DEEPSEEK_SPECIAL_TOKEN_AT_END_REGEX.test(text)) normalized = normalized.replace(/\s+$/u, "");
+	return normalized;
 }
 
 // Find any trailing partial `<｜...` (or `<|...`) that has not yet been closed by a
@@ -429,10 +439,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			stream.push({ type: "start", partial: output });
 
 			const parseMiniMaxThinkTags = model.provider === "minimax-code";
-			// NVIDIA NIM and similar OpenAI-compatible hosts return DeepSeek's chat-template
-			// tool-call markers in `delta.content` even though tool calls are also surfaced
-			// structurally. Strip the leaked markers so users don't see raw `<｜...｜>` tokens.
-			const stripDeepseekChatTemplateTokens = model.provider === "nvidia" && /deepseek/i.test(model.id);
+			// Some OpenAI-compatible DeepSeek hosts (including NVIDIA NIM and DeepSeek's
+			// native API) leak chat-template tool-call markers in `delta.content` even
+			// though tool calls are also surfaced structurally. Strip the leaked markers
+			// so users don't see raw `<｜...｜>` tokens.
+			const stripDeepseekChatTemplateTokens =
+				/deepseek/i.test(model.id) && (model.provider === "nvidia" || model.provider === "deepseek");
 			type OpenAIStreamBlock = TextContent | ThinkingContent | (ToolCall & { partialArgs: string });
 			let currentBlock: OpenAIStreamBlock | undefined;
 			const blockIndex = (block: OpenAIStreamBlock | undefined): number => {
@@ -566,7 +578,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					deepseekStripBuffer = trailing;
 				}
 				const stripped = stripDeepseekSpecialTokens(flushable);
-				if (stripped) appendTextDelta(stripped);
+				if (stripped && (stripped === flushable || stripped.trim().length > 0)) appendTextDelta(stripped);
 			};
 
 			for await (const chunk of iterateWithIdleTimeout(openaiStream, {
@@ -781,10 +793,26 @@ async function createClient(
 	}
 	const rawApiKey = apiKey;
 
-	let headers = { ...(model.headers ?? {}), ...(extraHeaders ?? {}) };
+	let headers = { ...model.headers };
 	if (model.provider === "openrouter") {
-		headers["X-Title"] = "Oh-My-Pi";
+		// App attribution — opts the agent into OpenRouter's public rankings and per-app
+		// analytics. `HTTP-Referer` is the unique app identifier; without it nothing is
+		// tracked. `X-OpenRouter-Title` is the display name (`X-Title` is the legacy
+		// alias kept for back-compat). `X-OpenRouter-Categories` slots us into the
+		// `cli-agent` marketplace category. `User-Agent` overrides the default OpenAI
+		// SDK UA so traffic is identifiable in upstream provider logs.
+		// https://openrouter.ai/docs/app-attribution
+		headers["User-Agent"] = `Oh-My-Pi/${packageJson.version}`;
+		headers["HTTP-Referer"] = "https://github.com/can1357/oh-my-pi";
+		headers["X-OpenRouter-Title"] = "Oh-My-Pi";
+		headers["X-OpenRouter-Categories"] = "cli-agent";
+		// Always-on response caching: identical requests return cached responses for free.
+		// TTL 1h; first call hits the provider, every identical call within the window
+		// replays from OpenRouter's edge cache. https://openrouter.ai/docs/features/response-caching
+		headers["X-OpenRouter-Cache"] = "true";
+		headers["X-OpenRouter-Cache-TTL"] = "3600";
 	}
+	Object.assign(headers, extraHeaders);
 	if (model.provider === "kimi-code") {
 		headers = { ...getKimiCommonHeaders(), ...headers };
 	}
@@ -978,6 +1006,14 @@ function buildParams(
 		params.reasoning_effort = mapReasoningEffort(options.reasoning, compat.reasoningEffortMap) as Effort;
 	}
 
+	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
+		// DeepSeek reasoning models accept tools/tool_choice, but reject that
+		// control field while thinking is enabled. Keep the tool-selection
+		// contract and suppress reasoning for this single request.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+	}
+
 	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
 		// Mirrors anthropic.ts:disableThinkingIfToolChoiceForced — backends like
 		// Kimi 400 with `tool_choice 'specified' is incompatible with thinking
@@ -1161,10 +1197,23 @@ export function convertMessages(
 		return generateFallbackToolCallId(seed);
 	};
 
-	if (context.systemPrompt) {
+	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	if (systemPrompts.length > 0) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
 		const role = useDeveloperRole ? "developer" : "system";
-		params.push({ role: role, content: context.systemPrompt.toWellFormed() });
+		// Default to one block per ordered system prompt so the leading prefix
+		// stays byte-identical between turns and the provider's KV cache can
+		// reuse it. Hosts whose chat templates reject follow-up system messages
+		// (Qwen via vLLM, MiniMax, Alibaba Dashscope, Qwen Portal, …) opt out
+		// via `compat.supportsMultipleSystemMessages = false`; in that mode we
+		// coalesce into a single message joined by `\n\n`.
+		if (compat.supportsMultipleSystemMessages) {
+			for (const systemPrompt of systemPrompts) {
+				params.push({ role, content: systemPrompt });
+			}
+		} else {
+			params.push({ role, content: systemPrompts.join("\n\n") });
+		}
 	}
 
 	let lastRole: string | null = null;

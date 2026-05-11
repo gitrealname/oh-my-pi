@@ -26,24 +26,27 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import { settings } from "../../config/settings";
 import { MmemoryServerClient } from "./server-client";
+import mmemoryBm25Py   from "./mmemory_bm25.py"    with { type: "text" };
+import mmemoryVacuumPy from "./mmemory_vacuum.py"  with { type: "text" };
 import mmemoryServerPy from "./mmemory_server.py" with { type: "text" };
-import mmemoryBm25Py    from "./mmemory_bm25.py"   with { type: "text" };
-import mmemoryVacuumPy  from "./mmemory_vacuum.py"  with { type: "text" };
 import { resolveTimeFilter } from "./time-filter";
-import { formatBlock, createSidecar, sidecarPath, callWithRole } from "../../utils/m-utils";
-import embeddedConsolidationPrompt from "../../sidecars/mme-consolidation.prompt.md" with { type: "text" };
-const resolveConsolidationPrompt = createSidecar(sidecarPath("mme-consolidation.prompt.md"), embeddedConsolidationPrompt);
-import embeddedRecallPreamble from "../../sidecars/mme-recall-preamble.prompt.md" with { type: "text" };
-// Only the first line is the system-prompt passive-background instruction.
-// Lines after the --- separator are tool-call guidance (belongs in tool description only).
-const resolveRecallPreamble = createSidecar(sidecarPath("mme-recall-preamble.prompt.md"), embeddedRecallPreamble);
-function getRecallPreamble(): string {
-	const full = resolveRecallPreamble();
-	const firstLine = full.split("\n")[0].trim();
-	return firstLine;
-}
 
 import type { ModelRegistry } from "../../config/model-registry";
+import { callWithRole, createSidecar, sidecarPath } from "../../utils/m-utils";
+import mmemoryConsolidationPromptMd from "../../sidecars/mme-consolidation.prompt.md" with { type: "text" };
+
+// ── Sidecar: consolidation prompt ─────────────────────────────────────────────
+const resolveConsolidationPrompt = createSidecar(
+	sidecarPath("mme-consolidation.prompt.md"),
+	mmemoryConsolidationPromptMd,
+);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function formatBlock(tag: string, lines: string[]): string {
+	if (!lines.length) return "";
+	return `<${tag}>\n${lines.join("\n")}\n</${tag}>`;
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 export interface MmemoryConfig {
@@ -98,6 +101,7 @@ export interface MmemoryConfig {
 function normalizeCwd(p: string): string {
 	return p.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1");
 }
+
 
 export function loadMmemoryConfig(settings: Settings, cwd?: string): MmemoryConfig | null {
 	if (!settings.get("mmemory.enabled")) return null;
@@ -165,6 +169,8 @@ export interface MmemoryPaths {
 	chunksPath: string;       // storageRoot/chunks.json  (durable store)
 	vectorsPath: string;      // storageRoot/vectors.safetensors
 	vectorsMetaPath: string;  // storageRoot/vectors.meta.json
+	factsPath: string;        // projectDir/facts.json  (Phase 3)
+	observationsPath: string; // projectDir/observations.json  (Phase 3)
 	mentalModelsDir: string;  // projectDir/mental_models  (Phase 3)
 }
 
@@ -176,6 +182,8 @@ export function resolvePaths(config: MmemoryConfig): MmemoryPaths {
 		chunksPath: path.join(projectDir, "chunks.json"),
 		vectorsPath: path.join(projectDir, "vectors.safetensors"),
 		vectorsMetaPath: path.join(projectDir, "vectors.meta.json"),
+		factsPath: path.join(projectDir, "facts.json"),
+		observationsPath: path.join(projectDir, "observations.json"),
 		mentalModelsDir: path.join(projectDir, "mental_models"),
 	};
 }
@@ -491,8 +499,8 @@ export async function executeMemoryRecall(
 	query: string,
 	scope: string | undefined | null,
 	config: MmemoryConfig,
-	registry?: import("../config/model-registry").ModelRegistry,
-	settings?: import("../config/settings").Settings,
+	registry?: ModelRegistry,
+	settings?: Settings,
 	mode?: "session" | "query",
 ): Promise<RecallResult> {
 	const EMPTY: RecallResult = { text: "", observations: [], referencedFiles: [], resultCount: 0 };
@@ -501,6 +509,8 @@ export async function executeMemoryRecall(
 	logger.debug(`[mmemory] executeMemoryRecall: mode=${effectiveMode} scope=${scope ?? "default"} query="${query.slice(0,60)}..."`, { source: "mmemory" });
 	const paths = resolvePaths(config);
 	const client = await getOrCreateServerClient(config);
+
+	// LLM time-filter: detect "yesterday", "last week", etc. and convert to timestamps
 
 	// LLM time-filter: only applies to "query" mode (session inject has no user query)
 	const timeFilter = (effectiveMode === "query" && registry)
@@ -526,7 +536,6 @@ export async function executeMemoryRecall(
 			: {}),
 		...(timeFilter.ts_after  !== undefined ? { ts_after:  timeFilter.ts_after  } : {}),
 		...(timeFilter.ts_before !== undefined ? { ts_before: timeFilter.ts_before } : {}),
-		...(timeFilter.source    !== undefined ? { source:    [timeFilter.source]   } : {}),
 	};
 	const recallArgs = {
 		query: resolvedQuery,
@@ -534,7 +543,6 @@ export async function executeMemoryRecall(
 		filter,
 		limit: config.recall.limit * 3,
 		recency_weight: config.recall.recencyWeight,
-		mode: effectiveMode,
 	};
 
 	let rawResults: any[];
@@ -773,7 +781,6 @@ export async function executeMemoryBuild(config: MmemoryConfig): Promise<void> {
 				max_age_days: {
 					session:     config.vacuum.sessionMaxAgeDays,
 					observation: config.vacuum.observationMaxAgeDays,
-					fact:        config.vacuum.factMaxAgeDays,
 					file:        config.vacuum.fileMaxAgeDays,
 				},
 			},

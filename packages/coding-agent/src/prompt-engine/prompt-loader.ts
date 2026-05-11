@@ -20,7 +20,7 @@ const RESERVED_NAMES = new Set([
 	"resume", "btw", "background", "bg", "debug", "memory", "rename", "move",
 	"marketplace", "plugins", "reload-plugins", "force", "exit", "quit",
 	// Extension's own meta-commands
-	"chain-prompts", "prompt-tool", "scoped-models",
+	"mchain-prompts", "mprompt-tool", "scoped-models",
 	// mreview slash command (prevent user prompt templates from shadowing)
 	"mreview",
 ]);
@@ -60,8 +60,7 @@ function isValidModelSpec(spec: string): boolean {
 	if (!spec || spec.includes("*") || /\s/.test(spec)) return false;
 	const segments = spec.split("/");
 	if (segments.length === 1) return true;
-	if (segments.length !== 2) return false;
-	return segments[0].length > 0 && segments[1].length > 0;
+	return segments.every((s) => s.length > 0);
 }
 
 function parseModelField(
@@ -218,19 +217,20 @@ export function loadPrompts(cwd: string, agentDir?: string): LoadPromptsResult {
 	const diagnostics: PromptLoaderDiagnostic[] = [];
 	const prompts = new Map<string, PromptTemplate>();
 
-	// Project-level commands (higher priority)
-	const projectDir = resolve(cwd, ".omp", "commands");
-	for (const [name, prompt] of scanDir(projectDir, "project", diagnostics)) {
-		prompts.set(name, prompt);
-	}
+	// Scan directories in order of priority (project > user)
+	// Per spec: {cwd}/.pi/prompts/, {cwd}/.pi/, ~/.pi/prompts/, ~/.pi/
+	const scanDirs = [
+		{ path: resolve(cwd, ".pi", "prompts"), source: "project" as const },
+		{ path: resolve(cwd, ".pi"), source: "project" as const },
+		{ path: join(homedir(), ".pi", "prompts"), source: "user" as const },
+		{ path: join(homedir(), ".pi"), source: "user" as const },
+	];
 
-	// User-level commands
-	const userDir = agentDir
-		? join(agentDir, "commands")
-		: join(homedir(), ".omp", "agent", "commands");
-	for (const [name, prompt] of scanDir(userDir, "user", diagnostics)) {
-		if (!prompts.has(name)) {
-			prompts.set(name, prompt);
+	for (const { path, source } of scanDirs) {
+		for (const [name, prompt] of scanDir(path, source, diagnostics)) {
+			if (!prompts.has(name)) {
+				prompts.set(name, prompt);
+			}
 		}
 	}
 
@@ -249,12 +249,12 @@ function findFirst(paths: string[]): string | undefined {
 export function resolveSkillPath(skillName: string, cwd: string): string | undefined {
 	const projectDir = resolve(cwd);
 
-	// Project .omp/skills/
-	const projectSkill = findFirst(getSkillCandidates(join(projectDir, ".omp", "skills"), skillName));
+	// Project .pi/skills/
+	const projectSkill = findFirst(getSkillCandidates(join(projectDir, ".pi", "skills"), skillName));
 	if (projectSkill) return projectSkill;
 
-	// User ~/.omp/agent/skills/
-	const userSkill = findFirst(getSkillCandidates(join(homedir(), ".omp", "agent", "skills"), skillName));
+	// User ~/.pi/agent/skills/
+	const userSkill = findFirst(getSkillCandidates(join(homedir(), ".pi", "agent", "skills"), skillName));
 	if (userSkill) return userSkill;
 
 	return undefined;

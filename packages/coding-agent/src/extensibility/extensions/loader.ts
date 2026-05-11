@@ -17,7 +17,9 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import type { CustomMessage } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
+import { installLegacyPiSpecifierShim } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
+
 import { resolvePath } from "../utils";
 import type {
 	Extension,
@@ -30,6 +32,8 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types";
+
+installLegacyPiSpecifierShim();
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
@@ -267,9 +271,15 @@ async function loadExtension(
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
-
 	try {
-		const module = await import(resolvedPath);
+		// Try plain import first (pre-compiled .js extensions work in compiled binary).
+		// Fall back to omp-legacy-pi-file: scheme for .ts extensions needing the Pi shim.
+		let module: Record<string, unknown>;
+		try {
+			module = await import(resolvedPath) as Record<string, unknown>;
+		} catch {
+			module = await import(`omp-legacy-pi-file:${resolvedPath}`) as Record<string, unknown>;
+		}
 		const factory = (module.default ?? module) as ExtensionFactory;
 
 		if (typeof factory !== "function") {

@@ -67,6 +67,7 @@ export interface ToolExecutionOptions {
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	editFuzzyThreshold?: number;
 	editAllowFuzzy?: boolean;
+	hashlineAutoDropPureInsertDuplicates?: boolean;
 }
 
 export interface ToolExecutionHandle {
@@ -100,6 +101,7 @@ export class ToolExecutionComponent extends Container {
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
+	#hashlineAutoDropPureInsertDuplicates: boolean | undefined;
 	#isPartial = true;
 	#tool?: AgentTool;
 	#ui: TUI;
@@ -112,7 +114,6 @@ export class ToolExecutionComponent extends Container {
 	// Edit preview state
 	#editMode?: EditMode;
 	#editDiffPreview?: PerFileDiffPreview[];
-	#editDiffScheduleTimer?: NodeJS.Timeout;
 	#editDiffAbort?: AbortController;
 	#editDiffLastArgsKey?: string;
 	// Cached converted images for Kitty protocol (which requires PNG), keyed by index
@@ -147,6 +148,7 @@ export class ToolExecutionComponent extends Container {
 		this.#showImages = options.showImages ?? true;
 		this.#editFuzzyThreshold = options.editFuzzyThreshold;
 		this.#editAllowFuzzy = options.editAllowFuzzy;
+		this.#hashlineAutoDropPureInsertDuplicates = options.hashlineAutoDropPureInsertDuplicates;
 		this.#tool = tool;
 		this.#ui = ui;
 		this.#cwd = cwd;
@@ -170,13 +172,13 @@ export class ToolExecutionComponent extends Container {
 		this.#editMode = resolveEditModeForTool(toolName, tool);
 
 		this.#updateDisplay();
-		this.#schedulePreviewDiff(0);
+		void this.#runPreviewDiff();
 	}
 
 	updateArgs(args: any, _toolCallId?: string): void {
 		this.#args = cloneToolArgs(args);
 		this.#updateSpinnerAnimation();
-		this.#schedulePreviewDiff();
+		void this.#runPreviewDiff();
 		this.#updateDisplay();
 	}
 
@@ -187,28 +189,7 @@ export class ToolExecutionComponent extends Container {
 	setArgsComplete(_toolCallId?: string): void {
 		this.#argsComplete = true;
 		this.#updateSpinnerAnimation();
-		this.#schedulePreviewDiff(0);
-	}
-
-	/**
-	 * Schedule a debounced compute of the streaming edit-diff preview.
-	 * `delayMs === 0` runs immediately (used on construction and on
-	 * `setArgsComplete`). All other calls coalesce to a trailing-edge timer.
-	 */
-	#schedulePreviewDiff(delayMs = 80): void {
-		if (!this.#editMode) return;
-		if (this.#editDiffScheduleTimer) {
-			clearTimeout(this.#editDiffScheduleTimer);
-			this.#editDiffScheduleTimer = undefined;
-		}
-		if (delayMs === 0) {
-			void this.#runPreviewDiff();
-			return;
-		}
-		this.#editDiffScheduleTimer = setTimeout(() => {
-			this.#editDiffScheduleTimer = undefined;
-			void this.#runPreviewDiff();
-		}, delayMs);
+		void this.#runPreviewDiff();
 	}
 
 	async #runPreviewDiff(): Promise<void> {
@@ -248,6 +229,7 @@ export class ToolExecutionComponent extends Container {
 				signal: controller.signal,
 				fuzzyThreshold: this.#editFuzzyThreshold,
 				allowFuzzy: this.#editAllowFuzzy,
+				hashlineAutoDropPureInsertDuplicates: this.#hashlineAutoDropPureInsertDuplicates,
 			});
 			if (controller.signal.aborted) return;
 			if (previews) {
@@ -360,10 +342,6 @@ export class ToolExecutionComponent extends Container {
 			clearInterval(this.#spinnerInterval);
 			this.#spinnerInterval = undefined;
 			this.#spinnerFrame = undefined;
-		}
-		if (this.#editDiffScheduleTimer) {
-			clearTimeout(this.#editDiffScheduleTimer);
-			this.#editDiffScheduleTimer = undefined;
 		}
 		this.#editDiffAbort?.abort();
 		this.#editDiffAbort = undefined;

@@ -364,8 +364,11 @@ export class InputController {
 				// (a user-role `message_start` event) leaves any draft the user has
 				// typed since queuing intact. Same protection as #783, applied to
 				// the streaming/queue path.
-				this.ctx.locallySubmittedUserSignatures.add(`${text}\u0000${images?.length ?? 0}`);
-				await this.ctx.session.prompt(text, { streamingBehavior: "steer", images });
+				await this.ctx.withLocalSubmission(
+					text,
+					() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+					{ imageCount: images?.length ?? 0 },
+				);
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
 				return;
@@ -420,7 +423,9 @@ export class InputController {
 	}
 
 	handleCtrlD(): void {
-		// Only called when editor is empty (enforced by CustomEditor)
+		// Editor text (if any) is snapshotted at the start of shutdown() and
+		// persisted as a draft for the next resume. Empty text is also fine —
+		// shutdown clears any stale sidecar in that case.
 		void this.ctx.shutdown();
 	}
 
@@ -460,7 +465,9 @@ export class InputController {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");
-			await this.ctx.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.ctx.withLocalSubmission(text, () =>
+				this.ctx.session.prompt(text, { streamingBehavior: "followUp" }),
+			);
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
 			return;
@@ -469,7 +476,7 @@ export class InputController {
 		// Not streaming — just submit normally
 		this.ctx.editor.addToHistory(text);
 		this.ctx.editor.setText("");
-		await this.ctx.session.prompt(text);
+		await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text));
 	}
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
@@ -720,6 +727,7 @@ export class InputController {
 	toggleThinkingBlockVisibility(): void {
 		this.ctx.hideThinkingBlock = !this.ctx.hideThinkingBlock;
 		settings.set("hideThinkingBlock", this.ctx.hideThinkingBlock);
+		this.ctx.session.agent.hideThinkingSummary = this.ctx.hideThinkingBlock;
 
 		// Rebuild chat from session messages
 		this.ctx.chatContainer.clear();
