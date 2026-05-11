@@ -508,6 +508,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
 					activeResponse.body!,
 					options?.signal,
+					event => options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
 				)) {
 					const responseData = chunk.response;
 					if (!responseData) continue;
@@ -747,7 +748,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error("An unknown error occurred");
+				throw new Error(output.errorMessage ?? "An unknown error occurred");
 			}
 
 			output.duration = Date.now() - startTime;

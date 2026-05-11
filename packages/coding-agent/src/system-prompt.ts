@@ -4,7 +4,6 @@
 
 import * as os from "node:os";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
-import { FileType, glob } from "@oh-my-pi/pi-natives";
 import { $env, getGpuCachePath, getProjectDir, hasFsCode, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { contextFileCapability } from "./capability/context-file";
@@ -13,9 +12,11 @@ import { Settings, type SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
+import nowPromptTemplate from "./prompts/system/now-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
-import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
+import { shortenPath } from "./tools/render-utils";
+import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
 interface AlwaysApplyRule {
 	name: string;
@@ -84,69 +85,7 @@ function parseWmicTable(output: string, header: string): string | null {
 	return filtered[0] ?? null;
 }
 
-const AGENTS_MD_MIN_DEPTH = 1;
-const AGENTS_MD_MAX_DEPTH = 4;
-const AGENTS_MD_LIMIT = 200;
-const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 45000;
-const AGENTS_MD_EXCLUDED_DIRS = new Set(["node_modules", ".git"]);
-
-export interface AgentsMdSearch {
-	scopePath: string;
-	limit: number;
-	pattern: string;
-	files: string[];
-}
-
-async function listAgentsMdFiles(root: string, limit: number): Promise<string[]> {
-	try {
-		const t0 = Date.now();
-		const result = await glob({
-			pattern: "**/AGENTS.md",
-			path: root,
-			fileType: FileType.File,
-			recursive: true,
-			hidden: false,
-			gitignore: true,
-			maxResults: limit * 4,
-			cache: true,
-		});
-		const globMs = Date.now() - t0;
-		const files: string[] = [];
-		for (const m of result.matches) {
-			const rel = m.path.replace(/\\/g, "/");
-			if (!rel?.endsWith("AGENTS.md")) continue;
-			const segments = rel.split("/");
-			const depth = segments.length - 1;
-			if (depth < AGENTS_MD_MIN_DEPTH || depth > AGENTS_MD_MAX_DEPTH) continue;
-			const dirSegments = segments.slice(0, -1);
-			if (dirSegments.some(seg => AGENTS_MD_EXCLUDED_DIRS.has(seg) || seg.startsWith("."))) continue;
-			files.push(rel);
-			if (files.length >= limit) break;
-		}
-		logger.debug(
-			`[system-prompt] buildAgentsMdSearch: glob=${globMs}ms candidates=${result.matches.length} accepted=${files.length} root=${root}`,
-			{ source: "system-prompt" },
-		);
-		return Array.from(new Set(files)).sort().slice(0, limit);
-	} catch {
-		return [];
-	}
-}
-
-export async function buildAgentsMdSearch(cwd: string): Promise<AgentsMdSearch> {
-	const t0 = Date.now();
-	const files = await listAgentsMdFiles(cwd, AGENTS_MD_LIMIT);
-	logger.debug(
-		`[system-prompt] buildAgentsMdSearch done: ${Date.now() - t0}ms files=${files.length}`,
-		{ source: "system-prompt" },
-	);
-	return {
-		scopePath: ".",
-		limit: AGENTS_MD_LIMIT,
-		pattern: `AGENTS.md depth ${AGENTS_MD_MIN_DEPTH}-${AGENTS_MD_MAX_DEPTH}`,
-		files,
-	};
-}
+const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
 
 async function getGpuModel(): Promise<string | null> {
 	switch (process.platform) {
@@ -455,8 +394,6 @@ export interface BuildSystemPromptOptions {
 	alwaysApplyRules?: AlwaysApplyRule[];
 	/** Whether secret obfuscation is active. When true, explains the redaction format in the prompt. */
 	secretsEnabled?: boolean;
-	/** Pre-loaded AGENTS.md search (skips discovery if provided). May be a Promise to allow early kick-off. */
-	agentsMdSearch?: AgentsMdSearch | Promise<AgentsMdSearch>;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
 }
@@ -490,7 +427,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		mcpDiscoveryServerSummaries = [],
 		eagerTasks = false,
 		secretsEnabled = false,
-		agentsMdSearch: providedAgentsMdSearch,
 		workspaceTree: providedWorkspaceTree,
 	} = options;
 	const resolvedCwd = cwd ?? getProjectDir();
@@ -500,18 +436,13 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedAppendPrompt: undefined as string | undefined,
 		systemPromptCustomization: null as string | null,
 		contextFiles: dedupeExactContextFiles(providedContextFiles ?? []),
-		agentsMdSearch: {
-			scopePath: ".",
-			limit: AGENTS_MD_LIMIT,
-			pattern: `AGENTS.md depth ${AGENTS_MD_MIN_DEPTH}-${AGENTS_MD_MAX_DEPTH}`,
-			files: [] as string[],
-		} satisfies AgentsMdSearch,
 		skills: providedSkills ?? ([] as Skill[]),
 		workspaceTree: {
 			rootPath: resolvedCwd,
 			rendered: "",
 			truncated: false,
 			totalLines: 0,
+			agentsMdFiles: [],
 		} satisfies WorkspaceTree,
 	};
 
@@ -549,14 +480,12 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const contextFilesPromise = providedContextFiles
 		? Promise.resolve(providedContextFiles)
 		: logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
-	const agentsMdSearchPromise =
-		providedAgentsMdSearch !== undefined
-			? Promise.resolve(providedAgentsMdSearch)
-			: logger.time("buildAgentsMdSearch", buildAgentsMdSearch, resolvedCwd);
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined
 			? Promise.resolve(providedWorkspaceTree)
-			: logger.time("buildWorkspaceTree", buildWorkspaceTree, resolvedCwd);
+			: logger.time("buildWorkspaceTree", () =>
+					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
+				);
 	const skillsPromise: Promise<Skill[]> =
 		providedSkills !== undefined
 			? Promise.resolve(providedSkills)
@@ -564,33 +493,30 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				? loadSkills({ ...skillsSettings, cwd: resolvedCwd }).then(result => result.skills)
 				: Promise.resolve([]);
 
-	const [
-		resolvedCustomPrompt,
-		resolvedAppendPrompt,
-		systemPromptCustomization,
-		contextFiles,
-		agentsMdSearch,
-		skills,
-		workspaceTree,
-	] = await Promise.all([
-		withDeadline(
-			"customPrompt",
-			resolvePromptInput(customPrompt, "system prompt"),
-			prepDefaults.resolvedCustomPrompt,
-		),
-		withDeadline(
-			"appendSystemPrompt",
-			resolvePromptInput(appendSystemPrompt, "append system prompt"),
-			prepDefaults.resolvedAppendPrompt,
-		),
-		withDeadline("loadSystemPromptFiles", systemPromptCustomizationPromise, prepDefaults.systemPromptCustomization),
-		withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
-			dedupeExactContextFiles,
-		),
-		withDeadline("buildAgentsMdSearch", agentsMdSearchPromise, prepDefaults.agentsMdSearch),
-		withDeadline("loadSkills", skillsPromise, prepDefaults.skills),
-		withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
-	]);
+	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, skills, workspaceTree] =
+		await Promise.all([
+			withDeadline(
+				"customPrompt",
+				resolvePromptInput(customPrompt, "system prompt"),
+				prepDefaults.resolvedCustomPrompt,
+			),
+			withDeadline(
+				"appendSystemPrompt",
+				resolvePromptInput(appendSystemPrompt, "append system prompt"),
+				prepDefaults.resolvedAppendPrompt,
+			),
+			withDeadline(
+				"loadSystemPromptFiles",
+				systemPromptCustomizationPromise,
+				prepDefaults.systemPromptCustomization,
+			),
+			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
+				dedupeExactContextFiles,
+			),
+			withDeadline("loadSkills", skillsPromise, prepDefaults.skills),
+			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
+		]);
+	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
 		logger.warn("System prompt preparation steps timed out; using minimal fallback for those steps", {
@@ -614,7 +540,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 
 	const date = new Date().toISOString().slice(0, 10);
 	const dateTime = date;
-	const promptCwd = resolvedCwd.replace(/\\/g, "/");
+	const promptCwd = shortenPath(resolvedCwd.replace(/\\/g, "/"));
 
 	// Build tool metadata for system prompt rendering
 	// Priority: explicit list > tools map > defaults
@@ -652,7 +578,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
 	const environment = await logger.time("getEnvironmentInfo", getEnvironmentInfo);
-	const reportToolIssueToolName = toolPromptNames.get("report_tool_issue") ?? "report_tool_issue";
 	const data = {
 		systemPromptCustomization: effectiveSystemPromptCustomization,
 		customPrompt: resolvedCustomPrompt,
@@ -663,7 +588,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolRefs,
 		environment,
 		contextFiles,
-		agentsMdSearch,
+		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
 		skills: filteredSkills,
 		rules: rules ?? [],
@@ -679,17 +604,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		eagerTasks,
 		secretsEnabled,
 	};
-	let rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
-
-	// When autoqa is active the report_tool_issue tool is in the tool set — nudge the agent.
-	if (toolNames.includes("report_tool_issue")) {
-		rendered += `\n\n<critical>\nThe \`${reportToolIssueToolName}\` tool is available for automated QA. If ANY tool you call returns output that is unexpected, incorrect, malformed, or otherwise inconsistent with what you anticipated given the tool's described behavior and your parameters, call \`${reportToolIssueToolName}\` with the tool name and a concise description of the discrepancy. Do not hesitate to report — false positives are acceptable.\n</critical>`;
-	}
-
+	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];
 	const projectPrompt = resolvedCustomPrompt ? "" : prompt.render(projectPromptTemplate, data).trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
+	}
+	const nowPrompt = prompt.render(nowPromptTemplate, data).trim();
+	if (nowPrompt) {
+		systemPrompt.push(nowPrompt);
 	}
 
 	return { systemPrompt };

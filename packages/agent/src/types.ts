@@ -14,6 +14,7 @@ import type {
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Static, TSchema } from "@sinclair/typebox";
+import type { HarmonyAuditEvent } from "./harmony-leak";
 
 /** Stream function - can return sync or Promise for async config lookup */
 export type StreamFn = (
@@ -38,6 +39,16 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Used by providers that support session-based caching (e.g., OpenAI Codex).
 	 */
 	sessionId?: string;
+
+	/**
+	 * Optional resolver called per LLM request to produce request metadata.
+	 * When set, the agent loop evaluates it **after** `getApiKey` resolves the
+	 * session-sticky credential, ensuring the metadata's `account_uuid` reflects
+	 * the credential actually used for the request (not the credential that was
+	 * current when `AgentLoopConfig` was first constructed). Overrides the static
+	 * `metadata` field when present.
+	 */
+	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -139,6 +150,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Callers may abort synchronously to stop consuming buffered provider events.
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+
+	/**
+	 * Called when GPT-5 Harmony protocol leakage is detected and mitigated.
+	 */
+	onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 
 	/**
 	 * Dynamic tool choice override, resolved per LLM call.

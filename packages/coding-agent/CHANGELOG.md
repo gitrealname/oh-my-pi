@@ -1,6 +1,72 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+
+- Fixed subagents launched in the same parallel batch not seeing each other in their initial `# IRC Peers` system-prompt block by pre-registering the agent in the global `AgentRegistry` before `rebuildSystemPrompt` runs and attaching the live session afterwards
+
+## [14.9.3] - 2026-05-10
+### Breaking Changes
+
+- Changed the `eval` tool input format to canonical `*** Begin <LANG>` ... `*** End <LANG>` cells with `*** Title`, `*** Timeout`, and `*** Reset` directives, so legacy `===== ... =====` eval inputs are no longer accepted for execution
+- Removed the `sectionSeparator` re-export from `config/prompt-templates`, so existing imports from `@oh-my-pi/pi-coding-agent/config/prompt-templates` now need to resolve `sectionSeparator` from its utility package
+
+### Added
+
+- Added support for the `*** Abort` recovery marker in eval and hashline parsing to terminate processing safely when stream corruption is detected
+- Added support for wrapping hashline edits in `*** Begin Patch` and `*** End Patch` markers so patch input with these envelopes is parsed and applied
+- Added support in the HTML export renderer for the new `*** Begin`/`*** End` eval cell format
+- Added a dedicated `[now]` prompt block to `buildSystemPrompt` output containing current date, current working directory, and required end-of-turn continuation/verification guidance
+- Added a new `[project]` prompt block wrapper around workstation and workspace context and ensured it is emitted as a separate system prompt segment
+- Added dedicated HTML rendering for `eval` tool calls, including cell-by-cell parsing of `===== ... =====` blocks with inferred Python/JS/TypeScript highlighting
+- Added dedicated rendering support for `search`, `recipe`, and `irc` tool calls in transcript exports
+- Added a collapsible `Available Tools` section with a tool count and chip-style compact tool names
+- Added macOS power assertion settings `power.preventIdleSleep`, `power.preventSystemSleep`, `power.declareUserActive`, and `power.preventDisplaySleep` so users can control what types of sleep are blocked during sessions
+
+### Changed
+
+- Kept legacy `===== ... =====` eval transcripts renderable in HTML while adding parsing for the new `*** Begin` format for newer transcripts
+- Changed the system prompt’s Bash usage guidance to explicitly forbid specific anti-patterns (`sed`/`awk` line-range reads, stderr redirects, and `| head|tail` pagination) and require using dedicated tools for those operations
+- Changed delegated subagent prompts so shared task context is now rendered only in the system-level `[context]` block, while the user-facing task message now contains only the assignment prompt text
+- Changed system prompt rendering to use block markers such as `[env]`, `[contract]`, `[role]`, `[coop]`, and `[closure]` for more explicit structural instructions
+- Changed the working-directory value in rendered prompts to use `shortenPath` before interpolation
+- Updated subagent prompt assembly to compose prompt blocks and place the `[now]` block after the subagent-specific instructions
+- Changed GitHub (`gh`) tool cards to include operation, PR, branch, and truncated query/title/body details
+- Changed tool-call output to display internal `_i` intent separately and hide it from rendered argument JSON
+- Changed `ast_edit` and `find`/`search` rendering to show resolved path values and option flags such as `limit`, `no-hidden`, and `no-reply`
+- Changed power assertion behavior to take effect only while a prompt is in flight, replacing session-level persistent assertions
+
+### Removed
+
+- Removed the unused `head` and `tail` parameters from the `bash` tool schema, along with the dead `normalizeBashCommand` / `applyHeadTail` post-processing module — output truncation is already handled by the harness's streaming tail buffer and artifact spillover, so the agent should rely on `read` (or the artifact link) instead of inline truncation pipes.
+
+### Fixed
+
+- Fixed eval tool outputs to append a truncation warning and ask users to re-issue remaining work when parsing is aborted by `*** Abort`
+- Fixed hashline parsing and input splitting to stop at `*** Abort` and ignore trailing edits after the marker
+- Fixed subagent task prompt construction so a trailing `[now]` block in the base prompts is preserved and not swallowed when rendering `subagent-system-prompt`
+- Fixed edit rendering so provided `input` text is shown in the export even without a file path
+- Fixed `args.paths` handling in `ast_edit` and `find` so multiple paths are shown as a comma-separated list
+- Fixed power assertion state handling so subsequent prompts are no longer blocked after an aborted or canceled prompt
+- Fixed IRC background exchange poll loop leaking after session disposal: `#scheduleBackgroundExchangeFlush` now stops immediately when `dispose()` is called, preventing stale `setTimeout` callbacks from firing against a torn-down agent
+
+## [14.9.2] - 2026-05-10
+### Added
+
+- Added `agentsMdFiles` to `WorkspaceTree` so AGENTS.md discovery results are returned with the workspace scan output
+
+### Changed
+
+- Changed startup workspace discovery to use one native `listWorkspace` walk for both the rendered tree and AGENTS.md directory-context candidates, removing the layered `git ls-files` orchestration and secondary AGENTS.md glob.
+
+### Fixed
+
+- Fixed AGENTS.md context discovery to include AGENTS.md files that are explicitly gitignored while still excluding AGENTS.md files under ignored directories
+- Fixed task tool renderer spamming `Tool renderer failed: undefined is not an object (evaluating 'args.tasks.length')` warnings while a `task` call was streaming in (the `tasks` array is undefined until the partial JSON parser closes it); the renderer now tolerates an absent `tasks` field and shows `0 agents` until the array arrives ([#985](https://github.com/can1357/oh-my-pi/issues/985)).
+- Fixed MCP HTTP streamable transport spamming `HTTP SSE stream error: ReadableStream already has a controller` after every JSON-RPC request whose response was returned as `text/event-stream`. The transport used to break out of the SSE iterator once the matching response was captured and then re-open `response.body` for a background drain, but the body had already been piped through a `TransformStream` and could not be re-read. The drain now runs from a single iterator that resolves the response promise inline and continues to dispatch piggybacked notifications on the same stream.
+
+## [14.9.0] - 2026-05-10
 ### Breaking Changes
 
 - Moved hashline APIs to the dedicated `@oh-my-pi/pi-coding-agent/hashline` module, moved hash helpers to `@oh-my-pi/pi-coding-agent/hashline/hash`, and removed the legacy `edit/modes/hashline` and `edit/line-hash` source subpaths.
@@ -11,8 +77,32 @@
 
 ### Fixed
 
+- Fixed compaction crashing with `auth_unavailable` when the current model's provider has no credentials configured; compaction now falls back to an available model role (or fails fast with a clear error) instead of attempting a doomed provider call ([#986](https://github.com/can1357/oh-my-pi/issues/986)).
 - Fixed top-level static import rewriting in JS evaluation to use parser-based detection so only real import declarations are rewritten and `import` text inside strings, comments, or template literals is preserved
 - Fixed `import ... with` attribute handling in rewritten ESM imports so static imports with module attributes now become dynamic imports with matching `with` options
+- Fixed model resolution silently falling back to a different provider (e.g. Amazon Bedrock) when `modelRoles` specified a fully-qualified `<provider>/<id>` whose exact pair was not in the bundled catalog. Explicit provider prefixes are now honored or surface a clear error ([#980](https://github.com/can1357/oh-my-pi/issues/980)).
+- Fixed session count inflation on Anthropic backend caused by a fresh random `metadata.user_id` being generated on every API request; all requests within one conversation now share a stable `metadata.user_id` derived from the session ID, matching the expected one-session-per-conversation counting
+- Fixed plan mode review resubmits to append each refreshed `local://PLAN.md` preview to the chat history, preserving the full refined plan in terminal scrollback.
+- Fixed compaction requests (manual and auto) not carrying `metadata.user_id`, leaving them unattributed on the backend
+- Fixed direct session-bound LLM calls (`/btw` ephemeral turns via `runEphemeralTurn`, branch summarization, session title generation) bypassing the agent and emitting a fresh random `metadata.user_id` per request on Anthropic OAuth: the session-level `prepareSimpleStreamOptions` helper now stamps the agent's session metadata onto direct calls, and `generateBranchSummary` plus `generateSessionTitle` accept and forward an explicit `metadata` option from the call site
+- Fixed `metadata.user_id` lacking the authenticated `account_uuid` on Anthropic OAuth requests; sessions now install a dynamic resolver via `Agent#setMetadataResolver` that builds `{ session_id, account_uuid? }` per request, looking the live OAuth account UUID up from `AuthStorage` so it stays in sync with token refreshes and login/logout transitions instead of stranding a stale value
+- Fixed multi-file legacy Pi extensions failing to load when sibling `.ts` files import each other via relative paths ([#983](https://github.com/can1357/oh-my-pi/issues/983)).
+- Fixed sub-agent dispatch silently routing to a model whose provider has no working credentials (e.g. an unqualified `modelRoles.task` id like `qwen3.6-plus-free` resolving to a provider the user is not authenticated against). Task dispatch now falls back to the parent session's active model — which by definition has working auth — when the resolved subagent model has none ([#985](https://github.com/can1357/oh-my-pi/issues/985)).
+
+### Added
+
+- Added a debug-panel raw SSE stream viewer so stuck model/tool-call streams can be inspected live from the TUI.
+
+### Fixed
+
+- Fixed legacy Pi plugin extensions failing to load on Windows when their entry path contains a drive letter ([#990](https://github.com/can1357/oh-my-pi/pull/990) by [@jiwangyihao](https://github.com/jiwangyihao)).
+
+### Added
+
+- Added `get_login_providers` RPC command to list registered OAuth providers with their current authentication status (`id`, `name`, `available`, `authenticated`)
+- Added `login` RPC command to trigger OAuth login for a given provider; emits an `open_url` extension UI event (fire-and-forget) carrying the auth URL and optional instructions so headless clients can open the browser, then resolves when the callback-server flow completes
+- Added `open_url` variant to `RpcExtensionUIRequest` for the above
+- Added `getLoginProviders()` and `login(providerId)` methods to `RpcClient`
 
 ## [14.8.0] - 2026-05-09
 ### Added

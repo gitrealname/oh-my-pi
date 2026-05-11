@@ -10,7 +10,7 @@ import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { TSchema } from "@sinclair/typebox";
 import Ajv, { type ValidateFunction } from "ajv";
 import { ModelRegistry } from "../config/model-registry";
-import { resolveModelOverride } from "../config/model-resolver";
+import { resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
@@ -28,7 +28,6 @@ import { createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
-import type { AgentsMdSearch } from "../system-prompt";
 import { type ContextFileEntry, truncateTail } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -140,10 +139,16 @@ export interface ExecutorOptions {
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
+	context?: string;
 	description?: string;
 	index: number;
 	id: string;
 	modelOverride?: string | string[];
+	/**
+	 * Active model selector of the parent session, used as an auth-aware fallback
+	 * if the resolved subagent model has no working credentials. See #985.
+	 */
+	parentActiveModelPattern?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
@@ -160,7 +165,6 @@ export interface ExecutorOptions {
 	contextFiles?: ContextFileEntry[];
 	skills?: Skill[];
 	promptTemplates?: PromptTemplate[];
-	agentsMdSearch?: AgentsMdSearch;
 	workspaceTree?: WorkspaceTree;
 	mcpManager?: MCPManager;
 	authStorage?: AuthStorage;
@@ -936,15 +940,34 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			checkAbort();
 			const authStorage = options.authStorage ?? (await discoverAuthStorage());
 			checkAbort();
+			const registryFromParent = options.modelRegistry !== undefined;
 			const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage);
-			await modelRegistry.refresh();
+			if (!registryFromParent) {
+				await modelRegistry.refresh();
+			} else {
+				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
+			}
 			checkAbort();
 
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
-			} = resolveModelOverride(modelPatterns, modelRegistry, settings);
+				authFallbackUsed,
+			} = await resolveModelOverrideWithAuthFallback(
+				modelPatterns,
+				options.parentActiveModelPattern,
+				modelRegistry,
+				settings,
+			);
+			if (authFallbackUsed && model) {
+				logger.warn("Subagent model has no working credentials; falling back to parent session model", {
+					requested: modelPatterns,
+					parentModel: options.parentActiveModelPattern,
+					resolvedProvider: model.provider,
+					resolvedModel: model.id,
+				});
+			}
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
@@ -971,19 +994,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				contextFiles: options.contextFiles,
 				skills: options.skills,
 				promptTemplates: options.promptTemplates,
-				agentsMdSearch: options.agentsMdSearch,
 				workspaceTree: options.workspaceTree,
-				systemPrompt: defaultPrompt => [
-					prompt.render(subagentSystemPromptTemplate, {
-						base: defaultPrompt.join("\n\n"),
+				systemPrompt: defaultPrompt => {
+					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 						agent: agent.systemPrompt,
+						context: options.context?.trim() ?? "",
 						worktree: worktree ?? "",
 						outputSchema: normalizedOutputSchema,
 						contextFile: options.contextFile,
 						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
 						ircSelfId: ircEnabled ? id : "",
-					}),
-				],
+					});
+					return defaultPrompt.length === 0
+						? [subagentPrompt]
+						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+				},
 				sessionManager,
 				hasUI: false,
 				spawns: spawnsEnv,

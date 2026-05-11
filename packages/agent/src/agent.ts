@@ -21,6 +21,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import { agentLoop, agentLoopContinue } from "./agent-loop";
+import type { HarmonyAuditEvent } from "./harmony-leak";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -136,10 +137,19 @@ export interface AgentOptions {
 	 */
 	onResponse?: SimpleStreamOptions["onResponse"];
 	/**
+	 * Inspect raw Server-Sent Events from HTTP streaming providers.
+	 */
+	onSseEvent?: SimpleStreamOptions["onSseEvent"];
+	/**
 	 * Inspect assistant streaming events before they are emitted to subscribers.
 	 * Use this when abort decisions must happen before buffered events continue flowing.
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+
+	/**
+	 * Called when GPT-5 Harmony protocol leakage is detected and mitigated.
+	 */
+	onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	/**
 	 * Custom token budgets for thinking levels (token-based providers only).
 	 */
@@ -233,6 +243,8 @@ export class Agent {
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
 	#sessionId?: string;
+	#metadata?: Record<string, unknown>;
+	#metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	#providerSessionState?: Map<string, ProviderSessionState>;
 	#thinkingBudgets?: ThinkingBudgets;
 	#temperature?: number;
@@ -256,7 +268,9 @@ export class Agent {
 	#getToolChoice?: () => ToolChoice | undefined;
 	#onPayload?: SimpleStreamOptions["onPayload"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
+	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -287,6 +301,7 @@ export class Agent {
 		this.getApiKey = opts.getApiKey;
 		this.#onPayload = opts.onPayload;
 		this.#onResponse = opts.onResponse;
+		this.#onSseEvent = opts.onSseEvent;
 		this.#getToolContext = opts.getToolContext;
 		this.#cursorExecHandlers = opts.cursorExecHandlers;
 		this.#cursorOnToolResult = opts.cursorOnToolResult;
@@ -296,6 +311,7 @@ export class Agent {
 		this.#intentTracing = opts.intentTracing === true;
 		this.#getToolChoice = opts.getToolChoice;
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
+		this.#onHarmonyLeak = opts.onHarmonyLeak;
 	}
 
 	/**
@@ -311,6 +327,48 @@ export class Agent {
 	 */
 	set sessionId(value: string | undefined) {
 		this.#sessionId = value;
+	}
+
+	/**
+	 * Static metadata forwarded to every API request when no resolver is installed
+	 * (e.g. `metadata.user_id` for Anthropic session attribution). Setting this
+	 * clears any installed resolver.
+	 *
+	 * For live/provider-aware metadata (e.g. Anthropic OAuth `account_uuid` that
+	 * must reflect the credential selected per-request), use
+	 * {@link setMetadataResolver} and read via {@link metadataForProvider}.
+	 */
+	get metadata(): Record<string, unknown> | undefined {
+		return this.#metadata;
+	}
+
+	set metadata(value: Record<string, unknown> | undefined) {
+		this.#metadata = value;
+		this.#metadataResolver = undefined;
+	}
+
+	/**
+	 * Resolve request metadata for the given provider at call time. When a
+	 * resolver is installed via {@link setMetadataResolver}, it is invoked with
+	 * the provider string so the result can be scoped (e.g. `account_uuid` is
+	 * only included for `"anthropic"` requests). Falls back to the static
+	 * {@link metadata} value when no resolver is set.
+	 */
+	metadataForProvider(provider: string): Record<string, unknown> | undefined {
+		if (this.#metadataResolver) return this.#metadataResolver(provider);
+		return this.#metadata;
+	}
+
+	/**
+	 * Install a function that resolves request metadata at call time. The
+	 * resolver receives the target provider string and can gate provider-specific
+	 * fields (e.g. `account_uuid` only for `"anthropic"`). Invoked per LLM
+	 * request by `agent-loop` after `getApiKey` selects the session-sticky
+	 * credential. Pass `undefined` to clear and revert to the static
+	 * {@link metadata} value.
+	 */
+	setMetadataResolver(resolver: ((provider: string) => Record<string, unknown> | undefined) | undefined): void {
+		this.#metadataResolver = resolver;
 	}
 
 	/**
@@ -433,6 +491,14 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
+		this.#onResponse = fn;
+	}
+
+	setRawSseEventInterceptor(fn: SimpleStreamOptions["onSseEvent"] | undefined): void {
+		this.#onSseEvent = fn;
 	}
 
 	setAssistantMessageEventInterceptor(
@@ -777,6 +843,8 @@ export class Agent {
 			hideThinkingSummary: this.#hideThinkingSummary,
 			interruptMode: this.#interruptMode,
 			sessionId: this.#sessionId,
+			metadata: this.#metadataResolver ? undefined : this.#metadata,
+			metadataResolver: this.#metadataResolver,
 			providerSessionState: this.#providerSessionState,
 			thinkingBudgets: this.#thinkingBudgets,
 			maxRetryDelayMs: this.#maxRetryDelayMs,
@@ -786,6 +854,7 @@ export class Agent {
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
+			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
 			syncContextBeforeModelCall: async context => {
@@ -800,6 +869,7 @@ export class Agent {
 			transformToolCallArguments: this.#transformToolCallArguments,
 			intentTracing: this.#intentTracing,
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
+			onHarmonyLeak: this.#onHarmonyLeak,
 			getToolChoice,
 			getReasoning: () => this.#state.thinkingLevel,
 			getSteeringMessages: async () => {

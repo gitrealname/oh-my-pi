@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [14.9.3] - 2026-05-10
+### Added
+
+- Added `idle`, `system`, and `user` options to `MacOSPowerAssertion` so callers can request specific macOS sleep-prevention modes (`caffeinate -i`, `-s`, and `-u`) in addition to the existing `display` option
+- Added support for combining multiple macOS power assertion flags in a single `MacOSPowerAssertion` handle
+
+### Changed
+
+- Changed `MacOSPowerAssertion.stop()` documentation to indicate it releases all held assertions and is safe to call repeatedly as a no-op
+
+## [14.9.2] - 2026-05-10
+
+### Added
+
+- Added `listWorkspace`, a native single-pass workspace walker that returns bounded tree entries and AGENTS.md directory-context candidates together.
+
 ## [14.7.1] - 2026-05-06
 
 ### Added

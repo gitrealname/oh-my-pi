@@ -55,6 +55,7 @@ import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry, extractHttpStatusFromError } from "../utils/retry";
 import { adaptSchemaForStrict, NO_STRICT } from "../utils/schema";
+import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
 import {
 	buildCopilotDynamicHeaders,
@@ -63,6 +64,7 @@ import {
 } from "./github-copilot-headers";
 import { detectOpenAICompat, type ResolvedOpenAICompat, resolveOpenAICompat } from "./openai-completions-compat";
 import { transformMessages } from "./transform-messages";
+import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
 /**
  * Normalize tool call ID for Mistral.
@@ -367,7 +369,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				requestHeaders,
 				getCapturedErrorResponse: captureErrorResponse,
 				clearCapturedErrorResponse,
-			} = await createClient(model, context, apiKey, options?.headers, options?.initiatorOverride);
+			} = await createClient(
+				model,
+				context,
+				apiKey,
+				options?.headers,
+				options?.initiatorOverride,
+				options?.onSseEvent,
+			);
 			getCapturedErrorResponse = captureErrorResponse;
 			let appliedToolStrictMode: AppliedToolStrictMode = "mixed";
 			const providerSessionState = getOpenAICompletionsProviderSessionState(
@@ -775,6 +784,7 @@ async function createClient(
 	apiKey?: string,
 	extraHeaders?: Record<string, string>,
 	initiatorOverride?: MessageAttribution,
+	onSseEvent?: OpenAICompletionsOptions["onSseEvent"],
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -871,6 +881,7 @@ async function createClient(
 		},
 		{ preconnect: fetch.preconnect },
 	);
+	const debugFetch = onSseEvent ? wrapFetchForSseDebug(wrappedFetch, event => onSseEvent(event, model)) : wrappedFetch;
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -879,7 +890,7 @@ async function createClient(
 			maxRetries: 5,
 			defaultHeaders: headers,
 			defaultQuery: azureDefaultQuery,
-			fetch: wrappedFetch,
+			fetch: debugFetch,
 		}),
 		copilotPremiumRequests,
 		baseUrl,
@@ -1244,7 +1255,9 @@ export function convertMessages(
 					content: text,
 				});
 			} else {
+				const supportsImages = model.input.includes("image");
 				const content: ChatCompletionContentPart[] = [];
+				let omittedImages = false;
 				for (const item of msg.content) {
 					if (item.type === "text") {
 						const text = item.text.toWellFormed();
@@ -1253,22 +1266,27 @@ export function convertMessages(
 							type: "text",
 							text,
 						} satisfies ChatCompletionContentPartText);
-					} else {
+					} else if (supportsImages) {
 						content.push({
 							type: "image_url",
 							image_url: {
 								url: `data:${item.mimeType};base64,${item.data}`,
 							},
 						} satisfies ChatCompletionContentPartImage);
+					} else {
+						omittedImages = true;
 					}
 				}
-				const filteredContent = !model.input.includes("image")
-					? content.filter(c => c.type !== "image_url")
-					: content;
-				if (filteredContent.length === 0) continue;
+				if (omittedImages) {
+					content.push({
+						type: "text",
+						text: NON_VISION_IMAGE_PLACEHOLDER,
+					} satisfies ChatCompletionContentPartText);
+				}
+				if (content.length === 0) continue;
 				params.push({
 					role: "user",
-					content: filteredContent,
+					content,
 				});
 			}
 		} else if (msg.role === "assistant") {
@@ -1463,19 +1481,27 @@ export function convertMessages(
 				// Extract text and image content
 				const textResult = toolMsg.content
 					.filter(c => c.type === "text")
-					.map(c => (c as any).text)
+					.map(c => (c as TextContent).text)
 					.join("\n");
+				const supportsImages = model.input.includes("image");
 				const hasImages = toolMsg.content.some(c => c.type === "image");
+				const omittedImages = hasImages && !supportsImages;
 
 				// Always send tool result with text (or placeholder if only images)
 				const hasText = textResult.length > 0;
-				// Some providers (e.g. Mistral) require the 'name' field in tool results
 				const remappedToolCallId = consumeToolCallId(toolMsg.toolCallId);
 				const resolvedToolCallId =
 					remappedToolCallId ?? ensureToolCallId(toolMsg.toolCallId, `${j}:${toolMsg.toolName ?? "tool"}`);
+				const toolResultContent = omittedImages
+					? joinTextWithImagePlaceholder(textResult, true)
+					: hasText
+						? textResult
+						: hasImages
+							? "(see attached image)"
+							: "";
 				const toolResultMsg: ChatCompletionToolMessageParam = {
 					role: "tool",
-					content: (hasText ? textResult : "(see attached image)").toWellFormed(),
+					content: toolResultContent.toWellFormed(),
 					tool_call_id: normalizeMistralToolId(resolvedToolCallId, compat.requiresMistralToolIds),
 				};
 				if (compat.requiresToolResultName && toolMsg.toolName) {
@@ -1483,13 +1509,13 @@ export function convertMessages(
 				}
 				params.push(toolResultMsg);
 
-				if (hasImages && model.input.includes("image")) {
+				if (hasImages && supportsImages) {
 					for (const block of toolMsg.content) {
 						if (block.type === "image") {
 							imageBlocks.push({
 								type: "image_url",
 								image_url: {
-									url: `data:${(block as any).mimeType};base64,${(block as any).data}`,
+									url: `data:${block.mimeType};base64,${block.data}`,
 								},
 							});
 						}

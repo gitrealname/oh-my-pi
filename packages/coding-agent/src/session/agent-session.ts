@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -67,6 +68,7 @@ import {
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
+import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import {
 	disposeKernelSessionsByOwner,
@@ -148,7 +150,9 @@ import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { buildNamedToolChoice } from "../utils/tool-choice";
+import type { AuthStorage } from "./auth-storage";
 import {
+	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	calculatePromptTokens,
@@ -157,6 +161,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	type SummaryOptions,
 	shouldCompact,
 } from "./compaction";
 import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "./compaction/pruning";
@@ -249,6 +254,10 @@ export interface AgentSessionConfig {
 	onPayload?: SimpleStreamOptions["onPayload"];
 	/** Provider response hook used by the active session request path */
 	onResponse?: SimpleStreamOptions["onResponse"];
+	/** Raw SSE hook used by the active session request path */
+	onSseEvent?: SimpleStreamOptions["onSseEvent"];
+	/** Per-session raw SSE diagnostic buffer */
+	rawSseDebugBuffer?: RawSseDebugBuffer;
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
@@ -280,6 +289,13 @@ export interface AgentSessionConfig {
 	agentId?: string;
 	/** Shared agent registry (for forwarding IRC observations to the main session UI). */
 	agentRegistry?: AgentRegistry;
+	/**
+	 * Override the provider-facing session ID for all API requests from this session.
+	 * When absent, `sessionManager.getSessionId()` is used. Needed when benchmark or
+	 * SDK callers issue probes / prewarming with an explicit `--provider-session-id`
+	 * so that credential sticky selection is consistent with the session's streaming calls.
+	 */
+	providerSessionId?: string;
 }
 
 /** Options for AgentSession.prompt() */
@@ -400,6 +416,56 @@ function todoClearKey(phaseName: string, taskContent: string): string {
 	return `${phaseName}\u0000${taskContent}`;
 }
 
+/**
+ * Build the per-request `metadata` payload for the Anthropic provider, shaped
+ * like real Claude Code's `getAPIMetadata` output (`{ session_id, account_uuid,
+ * device_id }`) so the backend buckets requests under one session and attributes
+ * them to the authenticated OAuth account when available. Resolved at request
+ * time so token refreshes and login/logout transitions don't strand a stale
+ * account UUID in memory. `account_uuid` and `device_id` are omitted for
+ * non-Anthropic providers to avoid leaking the user's Claude identity to
+ * third-party APIs (including Anthropic-format-compatible proxies such as
+ * cloudflare-ai-gateway or gitlab-duo).
+ *
+ * `provider` is the target provider string (e.g. `"anthropic"`) and gates the
+ * `account_uuid` and `device_id` lookups — only `"anthropic"` requests carry them.
+ *
+ * `sessionId` is forwarded to the auth-storage session-sticky lookup so that
+ * multi-credential setups attribute to the same OAuth account used for the
+ * actual API request rather than always picking the first credential.
+ *
+ * `authStorage` is treated as optional so test fixtures that stub `modelRegistry`
+ * without a real storage layer still work; the resolver simply skips the lookup
+ * and emits `{ session_id }` alone, matching the no-OAuth-credential path.
+ */
+function buildSessionMetadata(
+	sessionId: string,
+	provider: string,
+	authStorage: AuthStorage | undefined,
+): Record<string, unknown> {
+	const userId: Record<string, string> = { session_id: sessionId };
+	// Only look up account_uuid when the request is going to Anthropic. Injecting
+	// a Claude OAuth account_uuid into requests bound for other providers (including
+	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
+	// would leak the user's Anthropic identity to unrelated third-party APIs.
+	if (provider === "anthropic") {
+		const accountUuid = authStorage?.getOAuthAccountId("anthropic", sessionId);
+		if (typeof accountUuid === "string" && accountUuid.length > 0) {
+			userId.account_uuid = accountUuid;
+			// Derive device_id from account_uuid so the payload matches the real CC
+			// getAPIMetadata shape without hardware fingerprinting. A SHA-256 of a
+			// namespaced account UUID produces a stable 64-hex value that is
+			// indistinguishable from a randomly generated device ID on the wire, is
+			// deterministic per account (survives reinstalls), and is auditable: it
+			// is derived solely from the OAuth UUID the user already consented to
+			// share with Anthropic. Omitted when no OAuth credential is available
+			// (API-key callers) to avoid sending a hash of an empty string.
+			userId.device_id = crypto.createHash("sha256").update(`omp-device-id-v1:${accountUuid}`).digest("hex");
+		}
+	}
+	return { user_id: JSON.stringify(userId) };
+}
+
 const noOpUIContext: ExtensionUIContext = {
 	select: async (_title, _options, _dialogOptions) => undefined,
 	confirm: async (_title, _message, _dialogOptions) => false,
@@ -506,6 +572,8 @@ export class AgentSession {
 	// Agent identity + registry for IRC relay forwarding to the main session UI.
 	#agentId: string | undefined;
 	#agentRegistry: AgentRegistry | undefined;
+	#providerSessionId: string | undefined;
+	#isDisposed = false;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#turnIndex = 0;
@@ -528,6 +596,7 @@ export class AgentSession {
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
+	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#rebuildSystemPrompt:
 		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
@@ -581,24 +650,34 @@ export class AgentSession {
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	/** Opaque state slot for the mmemory MemoryBackend. Avoids circular import. */
 	#mmemoryBackendState: unknown = undefined;
+	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
-	#startPowerAssertion(): void {
-		if (process.platform !== "darwin") {
-			return;
-		}
+	#acquirePowerAssertion(): void {
+		if (process.platform !== "darwin") return;
+		if (this.#powerAssertion) return;
+		const idle = this.settings.get("power.preventIdleSleep");
+		const system = this.settings.get("power.preventSystemSleep");
+		const user = this.settings.get("power.declareUserActive");
+		const display = this.settings.get("power.preventDisplaySleep");
+		// All four off → user opted out; do nothing.
+		if (!idle && !system && !user && !display) return;
 		try {
-			this.#powerAssertion = MacOSPowerAssertion.start({ reason: "Oh My Pi agent session" });
+			this.#powerAssertion = MacOSPowerAssertion.start({
+				reason: "Oh My Pi agent session",
+				idle,
+				system,
+				user,
+				display,
+			});
 		} catch (error) {
 			logger.warn("Failed to acquire macOS power assertion", { error: String(error) });
 		}
 	}
 
-	#stopPowerAssertion(): void {
+	#releasePowerAssertion(): void {
 		const assertion = this.#powerAssertion;
 		this.#powerAssertion = undefined;
-		if (!assertion) {
-			return;
-		}
+		if (!assertion) return;
 		try {
 			assertion.stop();
 		} catch (error) {
@@ -606,11 +685,30 @@ export class AgentSession {
 		}
 	}
 
+	#beginInFlight(): void {
+		this.#promptInFlightCount++;
+		if (this.#promptInFlightCount === 1) {
+			this.#acquirePowerAssertion();
+		}
+	}
+
+	#endInFlight(): void {
+		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+		if (this.#promptInFlightCount === 0) {
+			this.#releasePowerAssertion();
+		}
+	}
+
+	#resetInFlight(): void {
+		this.#promptInFlightCount = 0;
+		this.#releasePowerAssertion();
+	}
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
-		this.#startPowerAssertion();
+		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#asyncJobManager = config.asyncJobManager;
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#scopedModels = config.scopedModels ?? [];
@@ -627,7 +725,19 @@ export class AgentSession {
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#onPayload = config.onPayload;
-		this.#onResponse = config.onResponse;
+		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
+		const configuredOnResponse = config.onResponse;
+		this.#onResponse = async (response, model) => {
+			this.rawSseDebugBuffer.recordResponse(response, model);
+			await configuredOnResponse?.(response, model);
+		};
+		const configuredOnSseEvent = config.onSseEvent;
+		this.#onSseEvent = (event, model) => {
+			this.rawSseDebugBuffer.recordEvent(event, model);
+			configuredOnSseEvent?.(event, model);
+		};
+		this.agent.setProviderResponseInterceptor(this.#onResponse);
+		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
 		this.#getMcpServerInstructions = config.getMcpServerInstructions;
@@ -657,6 +767,7 @@ export class AgentSession {
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
 		this.#agentRegistry = config.agentRegistry;
+		this.#providerSessionId = config.providerSessionId;
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
 				type: "message_update",
@@ -667,6 +778,7 @@ export class AgentSession {
 			this.#maybeAbortStreamingEdit(event);
 		});
 		this.agent.providerSessionState = this.#providerSessionState;
+		this.#syncAgentSessionId();
 		this.#syncTodoPhasesFromBranch();
 
 		// Always subscribe to agent events for internal handling
@@ -1999,7 +2111,24 @@ export class AgentSession {
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 	}
 
-	/** Keep Hindsight metadata aligned when the underlying agent session id changes. */
+	/**
+	 * Set agent.sessionId from the session manager and install a dynamic
+	 * metadata resolver so every API request carries `metadata.user_id` shaped
+	 * like real Claude Code's `getAPIMetadata` output: `{ session_id,
+	 * account_uuid }` (the latter only when an Anthropic OAuth credential with
+	 * a known account UUID is loaded). Resolving live keeps the value in sync
+	 * with auth-state changes (login/logout, token refresh that surfaces a new
+	 * account uuid) without needing to re-call `#syncAgentSessionId()` on every
+	 * such event.
+	 */
+	#syncAgentSessionId(sessionId?: string): void {
+		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
+		this.agent.sessionId = sid;
+		this.agent.setMetadataResolver((provider: string) =>
+			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
+		);
+	}
+
 	#rekeyHindsightMemoryForCurrentSessionId(): void {
 		if (resolveMemoryBackend(this.settings).id !== "hindsight") return;
 		const sid = this.agent.sessionId;
@@ -2020,6 +2149,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	async dispose(): Promise<void> {
+		this.#isDisposed = true;
+		this.#pendingBackgroundExchanges = [];
 		this.#evalExecutionDisposing = true;
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
@@ -2042,7 +2173,7 @@ export class AgentSession {
 			);
 		}
 		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
-		this.#stopPowerAssertion();
+		this.#releasePowerAssertion();
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.setHindsightSessionState(undefined);
@@ -2704,12 +2835,21 @@ export class AgentSession {
 	}
 
 	/** Apply session-level stream hooks to a direct side request. */
-	prepareSimpleStreamOptions(options: SimpleStreamOptions): SimpleStreamOptions {
+	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
 		const sessionOnPayload = this.#onPayload;
 		const sessionOnResponse = this.#onResponse;
-		if (!sessionOnPayload && !sessionOnResponse) return options;
+		const sessionMetadata = this.agent.metadataForProvider(provider);
+		const sessionOnSseEvent = this.#onSseEvent;
+		if (!sessionOnPayload && !sessionOnResponse && !sessionMetadata && !sessionOnSseEvent) return options;
 
 		const preparedOptions: SimpleStreamOptions = { ...options };
+
+		// Stamp session metadata (e.g. user_id={session_id}) onto direct-call requests so
+		// they share the same session bucket as Agent.prompt-routed requests on Anthropic
+		// OAuth. Caller-provided metadata wins so explicit overrides are respected.
+		if (sessionMetadata && !options.metadata) {
+			preparedOptions.metadata = sessionMetadata;
+		}
 
 		if (sessionOnPayload) {
 			if (!options.onPayload) {
@@ -2733,6 +2873,18 @@ export class AgentSession {
 				preparedOptions.onResponse = async (response, model) => {
 					await sessionOnResponse(response, model);
 					await requestOnResponse(response, model);
+				};
+			}
+		}
+
+		if (sessionOnSseEvent) {
+			if (!options.onSseEvent) {
+				preparedOptions.onSseEvent = sessionOnSseEvent;
+			} else {
+				const requestOnSseEvent = options.onSseEvent;
+				preparedOptions.onSseEvent = (event, model) => {
+					sessionOnSseEvent(event, model);
+					requestOnSseEvent(event, model);
 				};
 			}
 		}
@@ -2762,7 +2914,7 @@ export class AgentSession {
 
 	/** Current session ID */
 	get sessionId(): string {
-		return this.sessionManager.getSessionId();
+		return this.#providerSessionId ?? this.sessionManager.getSessionId();
 	}
 
 	/** Current session display name, if set */
@@ -3062,7 +3214,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void> {
-		this.#promptInFlightCount++;
+		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
 			// Flush any pending bash messages before the new prompt
@@ -3182,7 +3334,7 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery();
 			}
 		} finally {
-			this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+			this.#endInFlight();
 		}
 	}
 
@@ -3772,7 +3924,7 @@ export class AgentSession {
 		// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 		// a subsequent prompt() can incorrectly observe the session as busy after an abort.
-		this.#promptInFlightCount = 0;
+		this.#resetInFlight();
 		// Safety net: if the agent loop aborted without producing an assistant
 		// message (e.g. failed before the first stream), the in-flight yield was
 		// never resolved or rejected by the normal message_end path. Reject it now
@@ -3826,7 +3978,7 @@ export class AgentSession {
 		}
 		await this.sessionManager.newSession(options);
 		this.setTodoPhases([]);
-		this.agent.sessionId = this.sessionManager.getSessionId();
+		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#resetHindsightConversationTrackingIfHindsight();
 		this.#steeringMessages = [];
@@ -3921,7 +4073,7 @@ export class AgentSession {
 		}
 
 		// Update agent session ID
-		this.agent.sessionId = this.sessionManager.getSessionId();
+		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 
 		// Emit session_switch event with reason "fork" to hooks
@@ -4302,14 +4454,7 @@ export class AgentSession {
 			}
 
 			const compactionSettings = this.settings.getGroup("compaction");
-			const compactionModel = this.model;
-			const apiKey = await this.#modelRegistry.getApiKey(compactionModel, this.sessionId);
-			if (!apiKey) {
-				throw new Error(`No API key for ${compactionModel.provider}`);
-			}
-
 			const pathEntries = this.sessionManager.getBranch();
-
 			const preparation = prepareCompaction(pathEntries, compactionSettings);
 			if (!preparation) {
 				// Check why we can't compact
@@ -4379,10 +4524,8 @@ export class AgentSession {
 				preserveData ??= hookCompaction.preserveData;
 			} else {
 				// Generate compaction result
-				const result = await compact(
+				const result = await this.#compactWithFallbackModel(
 					preparation,
-					compactionModel,
-					apiKey,
 					customInstructions,
 					compactionAbortController.signal,
 					{
@@ -4603,7 +4746,7 @@ export class AgentSession {
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
 			}
-			this.#promptInFlightCount++;
+			this.#beginInFlight();
 			try {
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				await this.#promptAgentWithIdleRetry([
@@ -4615,7 +4758,7 @@ export class AgentSession {
 					},
 				]);
 			} finally {
-				this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+				this.#endInFlight();
 			}
 			await completionPromise;
 
@@ -4632,7 +4775,7 @@ export class AgentSession {
 			this.#asyncJobManager?.cancelAll();
 			await this.sessionManager.newSession(previousSessionFile ? { parentSession: previousSessionFile } : undefined);
 			this.agent.reset();
-			this.agent.sessionId = this.sessionManager.getSessionId();
+			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
 			this.#steeringMessages = [];
@@ -5302,6 +5445,50 @@ export class AgentSession {
 
 		return candidates;
 	}
+	#isCompactionAuthFailure(error: unknown): boolean {
+		if (!(error instanceof Error)) return false;
+		return /auth_unavailable|no auth available/i.test(error.message);
+	}
+
+	#buildCompactionAuthError(): Error {
+		const currentModel = this.model;
+		if (!currentModel) {
+			return new Error(
+				"Compaction requires a model with usable credentials, but no authenticated compaction model is available.",
+			);
+		}
+		return new Error(
+			`Compaction requires usable credentials for ${currentModel.provider}/${currentModel.id}. ` +
+				`Configure ${currentModel.provider} credentials or assign an authenticated fallback role such as modelRoles.smol.`,
+		);
+	}
+
+	async #compactWithFallbackModel(
+		preparation: CompactionPreparation,
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		options?: SummaryOptions,
+	): Promise<CompactionResult> {
+		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+
+		for (const candidate of candidates) {
+			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
+			if (!apiKey) continue;
+
+			try {
+				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
+					...options,
+					metadata: this.agent.metadataForProvider(candidate.provider),
+				});
+			} catch (error) {
+				if (!this.#isCompactionAuthFailure(error)) {
+					throw error;
+				}
+			}
+		}
+
+		throw this.#buildCompactionAuthError();
+	}
 
 	/**
 	 * Internal: Run auto-compaction with events.
@@ -5503,6 +5690,7 @@ export class AgentSession {
 								promptOverride: hookPrompt,
 								extraContext: hookContext,
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+								metadata: this.agent.metadataForProvider(candidate.provider),
 								initiatorOverride: "agent",
 							});
 							break;
@@ -5512,6 +5700,10 @@ export class AgentSession {
 							}
 
 							const message = error instanceof Error ? error.message : String(error);
+							if (this.#isCompactionAuthFailure(error)) {
+								lastError = this.#buildCompactionAuthError();
+								break;
+							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
 							const shouldRetry =
 								retrySettings.enabled &&
@@ -6652,15 +6844,18 @@ export class AgentSession {
 			systemPrompt: this.systemPrompt,
 			messages: llmMessages,
 		};
-		const options = this.prepareSimpleStreamOptions({
-			apiKey,
-			sessionId: this.sessionId,
-			reasoning: toReasoningEffort(this.thinkingLevel),
-			hideThinkingSummary: this.agent.hideThinkingSummary,
-			serviceTier: this.serviceTier,
-			signal: args.signal,
-			toolChoice: "none",
-		});
+		const options = this.prepareSimpleStreamOptions(
+			{
+				apiKey,
+				sessionId: this.sessionId,
+				reasoning: toReasoningEffort(this.thinkingLevel),
+				hideThinkingSummary: this.agent.hideThinkingSummary,
+				serviceTier: this.serviceTier,
+				signal: args.signal,
+				toolChoice: "none",
+			},
+			model.provider,
+		);
 
 		let replyText = "";
 		let assistantMessage: AssistantMessage | undefined;
@@ -6735,7 +6930,8 @@ export class AgentSession {
 		if (this.#scheduledBackgroundExchangeFlush) return;
 		this.#scheduledBackgroundExchangeFlush = true;
 		const attempt = (): void => {
-			if (this.#pendingBackgroundExchanges.length === 0) {
+			if (this.#pendingBackgroundExchanges.length === 0 || this.#isDisposed) {
+				this.#pendingBackgroundExchanges = [];
 				this.#scheduledBackgroundExchangeFlush = false;
 				return;
 			}
@@ -6837,7 +7033,7 @@ export class AgentSession {
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
-			this.agent.sessionId = this.sessionManager.getSessionId();
+			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
 			const sessionContext = this.buildDisplaySessionContext();
@@ -6915,7 +7111,7 @@ export class AgentSession {
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
-			this.agent.sessionId = previousSessionState.sessionId;
+			this.#syncAgentSessionId(previousSessionState.sessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			let restoreMcpError: unknown;
 			try {
@@ -7007,7 +7203,7 @@ export class AgentSession {
 			this.sessionManager.createBranchedSession(selectedEntry.parentId);
 		}
 		this.#syncTodoPhasesFromBranch();
-		this.agent.sessionId = this.sessionManager.getSessionId();
+		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#resetHindsightConversationTrackingIfHindsight();
 
@@ -7128,6 +7324,7 @@ export class AgentSession {
 				signal: this.#branchSummaryAbortController.signal,
 				customInstructions: options.customInstructions,
 				reserveTokens: branchSummarySettings.reserveTokens,
+				metadata: this.agent.metadataForProvider(model.provider),
 			});
 			this.#branchSummaryAbortController = undefined;
 			if (result.aborted) {
