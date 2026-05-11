@@ -1,9 +1,8 @@
-import { RANGE_INTERIOR_HASH } from "./constants";
-import { describeAnchorExamples, HL_EDIT_SEP, HL_EDIT_SEP_RE_RAW, HL_HASH_CAPTURE_RE_RAW } from "./hash";
+import { ABORT_MARKER, ABORT_WARNING, BEGIN_PATCH_MARKER, END_PATCH_MARKER, RANGE_INTERIOR_HASH } from "./constants";
+import { describeAnchorExamples, HL_EDIT_SEP, HL_HASH_CAPTURE_RE_RAW } from "./hash";
 import type { Anchor, HashlineCursor, HashlineEdit } from "./types";
 import { stripTrailingCarriageReturn } from "./utils";
 
-const HL_EDIT_SEPARATOR_RE = HL_EDIT_SEP_RE_RAW;
 const LID_CAPTURE_RE = new RegExp(`^${HL_HASH_CAPTURE_RE_RAW}$`);
 
 function parseLid(raw: string, lineNum: number): Anchor {
@@ -23,10 +22,23 @@ interface ParsedRange {
 }
 
 function parseRange(raw: string, lineNum: number): ParsedRange {
-	const [startRaw, endRaw] = raw.split("..");
-	if (!startRaw) throw new Error(`line ${lineNum}: range is missing its first anchor.`);
+	if (!raw.includes("..")) {
+		throw new Error(
+			`line ${lineNum}: explicit ranges are required for delete/replace. ` +
+				`Repeat the same anchor on both sides for a one-line edit (for example, ` +
+				`${describeAnchorExamples("119")}..${describeAnchorExamples("119")}); ` +
+				`got ${JSON.stringify(raw)}.`,
+		);
+	}
+	const [startRaw, endRaw, extra] = raw.split("..");
+	if (extra !== undefined || !startRaw || !endRaw) {
+		throw new Error(
+			`line ${lineNum}: range must include exactly two full anchors separated by "..". ` +
+				`For a one-line edit, repeat the same anchor on both sides.`,
+		);
+	}
 	const start = parseLid(startRaw, lineNum);
-	const end = endRaw === undefined ? { ...start } : parseLid(endRaw, lineNum);
+	const end = parseLid(endRaw, lineNum);
 	if (end.line < start.line) {
 		throw new Error(`line ${lineNum}: range ${startRaw}..${endRaw} ends before it starts.`);
 	}
@@ -57,8 +69,6 @@ const INSERT_BEFORE_OP_RE = /^<\s*(\S+)$/;
 const INSERT_AFTER_OP_RE = /^\+\s*(\S+)$/;
 const DELETE_OP_RE = /^-\s*(\S+)$/;
 const REPLACE_OP_RE = /^=\s*(\S+)$/;
-const INLINE_BEFORE_OP_RE = new RegExp(`^<\\s*${HL_HASH_CAPTURE_RE_RAW}${HL_EDIT_SEPARATOR_RE}(.*)$`);
-const INLINE_AFTER_OP_RE = new RegExp(`^\\+\\s*${HL_HASH_CAPTURE_RE_RAW}${HL_EDIT_SEPARATOR_RE}(.*)$`);
 
 export function cloneCursor(cursor: HashlineCursor): HashlineCursor {
 	if (cursor.kind === "before_anchor") return { kind: "before_anchor", anchor: { ...cursor.anchor } };
@@ -108,44 +118,19 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 			i++;
 			continue;
 		}
+		if (line === END_PATCH_MARKER) {
+			break;
+		}
+		if (line === ABORT_MARKER) {
+			warnings.push(ABORT_WARNING);
+			break;
+		}
+		if (line === BEGIN_PATCH_MARKER) {
+			i++;
+			continue;
+		}
 		if (line.startsWith(HL_EDIT_SEP)) {
 			throw new Error(`line ${lineNum}: payload line has no preceding +, <, or = operation.`);
-		}
-
-		const inlineBeforeMatch = INLINE_BEFORE_OP_RE.exec(line);
-		if (inlineBeforeMatch) {
-			const anchor = parseLid(`${inlineBeforeMatch[1]}${inlineBeforeMatch[2]}`, lineNum);
-			edits.push({
-				kind: "modify",
-				anchor,
-				prefix: inlineBeforeMatch[3],
-				suffix: "",
-				lineNum,
-				index: editIndex++,
-			});
-			const cursor: HashlineCursor = { kind: "before_anchor", anchor };
-			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, false);
-			for (const text of payload) pushInsert(cursor, text, lineNum);
-			i = nextIndex;
-			continue;
-		}
-
-		const inlineAfterMatch = INLINE_AFTER_OP_RE.exec(line);
-		if (inlineAfterMatch) {
-			const anchor = parseLid(`${inlineAfterMatch[1]}${inlineAfterMatch[2]}`, lineNum);
-			edits.push({
-				kind: "modify",
-				anchor,
-				prefix: "",
-				suffix: inlineAfterMatch[3],
-				lineNum,
-				index: editIndex++,
-			});
-			const cursor: HashlineCursor = { kind: "after_anchor", anchor };
-			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, false);
-			for (const text of payload) pushInsert(cursor, text, lineNum);
-			i = nextIndex;
-			continue;
 		}
 
 		const insertBeforeMatch = INSERT_BEFORE_OP_RE.exec(line);

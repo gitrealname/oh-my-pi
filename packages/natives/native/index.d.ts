@@ -21,14 +21,21 @@ export declare class MacAppearanceObserver {
 /**
  * Long-lived macOS power assertion.
  *
- * On macOS this acquires an `IOKit` assertion that prevents idle sleep until
- * the handle is stopped or dropped. On other platforms it is a no-op handle so
- * the caller can keep one cross-platform code path.
+ * On macOS this acquires one or more `IOKit` assertions that prevent the
+ * requested sleep modes until the handle is stopped or dropped. On other
+ * platforms it is a no-op handle so the caller can keep one cross-platform
+ * code path.
  */
 export declare class MacOSPowerAssertion {
-  /** Acquire a macOS power assertion. */
+  /**
+   * Acquire a macOS power assertion. On non-macOS platforms returns a
+   * no-op handle so callers can stay cross-platform.
+   */
   static start(options?: MacOSPowerAssertionOptions | undefined | null): MacOSPowerAssertion
-  /** Release the power assertion early. */
+  /**
+   * Release every assertion held by this handle. Safe to call multiple
+   * times; subsequent calls are a no-op.
+   */
   stop(): void
 }
 
@@ -769,6 +776,50 @@ export declare enum KeyEventType {
 }
 
 /**
+ * Walk the workspace once and return tree entries plus AGENTS.md candidates.
+ *
+ * File-level ignore rules for AGENTS.md are bypassed by checking each
+ * traversed directory directly when `collectAgentsMd` is enabled, but ignored
+ * directories are still pruned by the walker and are not searched.
+ */
+export declare function listWorkspace(options: ListWorkspaceOptions): Promise<ListWorkspaceResult>
+
+/** Input options for `listWorkspace`, the single-pass workspace startup scan. */
+export interface ListWorkspaceOptions {
+  /** Directory to scan. */
+  path: string
+  /** Maximum depth for returned tree entries. Root children are depth 1. */
+  maxDepth: number
+  /** Include hidden files and directories. Default: false. */
+  hidden?: boolean
+  /** Respect .gitignore files. Default: true. */
+  gitignore?: boolean
+  /**
+   * Also surface AGENTS.md files in directories at depth 1..=4, even when
+   * gitignore would otherwise hide the file. Walks deeper than `maxDepth`
+   * to find them. Default: false.
+   */
+  collectAgentsMd?: boolean
+  /** Timeout in milliseconds for the operation. */
+  timeoutMs?: number
+  /** Abort signal for cancelling the operation. */
+  signal?: unknown
+}
+
+/** Result payload returned by a workspace scan. */
+export interface ListWorkspaceResult {
+  /** Entries within `maxDepth`, with mtime and regular-file size metadata. */
+  entries: Array<GlobMatch>
+  /**
+   * Directory-scoped AGENTS.md files within depth 1..=4 (capped at 200).
+   * Always empty when `collectAgentsMd` is false.
+   */
+  agentsMdFiles: Array<string>
+  /** True when any output cap was hit. */
+  truncated: boolean
+}
+
+/**
  * System UI appearance reported by native macOS APIs (`detectMacOSAppearance`
  * and observer).
  */
@@ -779,11 +830,27 @@ export declare enum MacOSAppearance {
   Light = 'light'
 }
 
-/** Options for starting a macOS power assertion. */
+/**
+ * Options for starting a macOS power assertion.
+ *
+ * Each boolean maps to a `caffeinate(8)` flag and a corresponding IOKit
+ * `IOPMAssertion` type. Multiple flags can be combined; when set, one
+ * assertion is taken per flag and all are released together when the
+ * handle is stopped or dropped.
+ *
+ * If every flag is unset (or omitted), the handle behaves as if `idle`
+ * were `true` — preserving the historical default of `caffeinate -i`.
+ */
 export interface MacOSPowerAssertionOptions {
   /** Human-readable reason shown in macOS power diagnostics. */
   reason?: string
-  /** Keep the display awake in addition to preventing idle system sleep. */
+  /** `caffeinate -i`: prevent the system from idle-sleeping. */
+  idle?: boolean
+  /** `caffeinate -s`: prevent the system from sleeping (AC power only). */
+  system?: boolean
+  /** `caffeinate -u`: declare the user is active (wakes the display). */
+  user?: boolean
+  /** `caffeinate -d`: prevent the display from idle-sleeping. */
   display?: boolean
 }
 

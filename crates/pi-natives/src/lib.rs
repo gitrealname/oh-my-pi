@@ -37,7 +37,7 @@ pub mod highlight;
 pub mod html;
 pub mod image;
 pub mod keys;
-pub mod language;
+pub use pi_ast::language;
 
 pub mod power;
 
@@ -51,3 +51,4 @@ pub mod task;
 pub mod text;
 pub mod tokens;
 pub(crate) mod utils;
+pub mod workspace;

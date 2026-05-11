@@ -12,10 +12,9 @@ import type { HindsightSessionState } from "../hindsight/state";
 import type { InternalUrlRouter } from "../internal-urls";
 import { LspTool } from "../lsp";
 import type { PlanModeState } from "../plan-mode/state";
-import type { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
-import type { AgentsMdSearch } from "../system-prompt";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
@@ -129,8 +128,6 @@ export interface ToolSession {
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
 	contextFiles?: ContextFileEntry[];
-	/** Pre-loaded AGENTS.md search (forwarded to subagents to skip re-scanning) */
-	agentsMdSearch?: AgentsMdSearch;
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
@@ -464,7 +461,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "calc") return session.settings.get("calc.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
-		if (name === "irc") return session.settings.get("irc.enabled");
+		if (name === "irc") {
+			if (!session.settings.get("irc.enabled")) return false;
+			// Main agent only needs `irc` when subagents may run concurrently (async).
+			// In sync mode main blocks on `task`, so peer messaging from main is dead weight.
+			if (!session.settings.get("async.enabled") && session.getAgentId?.() === MAIN_AGENT_ID) return false;
+			return true;
+		}
 		if (name === "recipe") return session.settings.get("recipe.enabled");
 		if (name === "retain" || name === "recall" || name === "reflect") {
 			return session.settings.get("memory.backend") === "hindsight";

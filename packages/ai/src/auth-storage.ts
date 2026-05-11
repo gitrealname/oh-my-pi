@@ -82,6 +82,21 @@ export interface StoredAuthCredential {
 // AuthStorage Options
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Event payload describing a credential that was just soft-disabled.
+ *
+ * Today the only call site is OAuth refresh failures with a definitive cause
+ * (`invalid_grant`, `401/403` not from a network blip, etc.) — the
+ * disabled_cause string is the verbatim error captured for forensics.
+ *
+ * Subscribers can use this to surface a notification, banner, or auto-launch
+ * a re-login flow instead of letting the credential silently disappear.
+ */
+export interface CredentialDisabledEvent {
+	provider: string;
+	disabledCause: string;
+}
+
 export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
@@ -94,6 +109,14 @@ export type AuthStorageOptions = {
 	 * - Default: checks environment variable first, then treats as literal
 	 */
 	configValueResolver?: (config: string) => Promise<string | undefined>;
+	/**
+	 * Optional callback fired when AuthStorage automatically disables a
+	 * credential because something detected it as no longer usable — today
+	 * that's the OAuth refresh-failure path in `getApiKey`. NOT fired for
+	 * user-initiated `remove()` (the user already knows) or dedup of
+	 * duplicate credentials (uninteresting hygiene).
+	 */
+	onCredentialDisabled?: (event: CredentialDisabledEvent) => void | Promise<void>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +283,7 @@ export class AuthStorage {
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string) => Promise<string | undefined>;
+	#onCredentialDisabled?: (event: CredentialDisabledEvent) => void | Promise<void>;
 	#closed = false;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
@@ -270,6 +294,7 @@ export class AuthStorage {
 		this.#usageCache = new AuthStorageUsageCache(this.#store);
 		this.#usageFetch = options.usageFetch ?? fetch;
 		this.#usageRequestTimeoutMs = options.usageRequestTimeoutMs ?? DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
+		this.#onCredentialDisabled = options.onCredentialDisabled;
 		this.#usageLogger =
 			options.usageLogger ??
 			({
@@ -601,6 +626,23 @@ export class AuthStorage {
 		const updated = entries.filter((_value, idx) => idx !== index);
 		this.#setStoredCredentials(provider, updated);
 		this.#resetProviderAssignments(provider);
+		this.#emitCredentialDisabled({ provider, disabledCause });
+	}
+
+	#emitCredentialDisabled(event: CredentialDisabledEvent): void {
+		const handler = this.#onCredentialDisabled;
+		if (!handler) return;
+		const logHandlerError = (error: unknown): void => {
+			logger.warn("onCredentialDisabled handler threw", { provider: event.provider, error: String(error) });
+		};
+		try {
+			const result = handler(event);
+			if (result && typeof (result as PromiseLike<void>).then === "function") {
+				(result as Promise<void>).catch(logHandlerError);
+			}
+		} catch (error) {
+			logHandlerError(error);
+		}
 	}
 
 	/**
@@ -682,6 +724,44 @@ export class AuthStorage {
 		return this.#getCredentialsForProvider(provider).find(
 			(credential): credential is OAuthCredential => credential.type === "oauth",
 		);
+	}
+
+	/**
+	 * Get the OAuth `accountId` for a provider, preferring the credential that is
+	 * session-sticky for `sessionId` when multiple OAuth credentials are configured.
+	 * Falls back to the first OAuth credential when no session preference exists (e.g.
+	 * first call before any `getApiKey` has been issued, or single-credential setups).
+	 * Returns `undefined` when no OAuth credential carries an `accountId`.
+	 */
+	getOAuthAccountId(provider: string, sessionId?: string): string | undefined {
+		const allCredentials = this.#getCredentialsForProvider(provider);
+		const oauthCredentials = allCredentials.filter((c): c is OAuthCredential => c.type === "oauth");
+		if (oauthCredentials.length === 0) return undefined;
+
+		// Runtime override always returns before recording a session credential.
+		if (this.#runtimeOverrides.has(provider)) return undefined;
+
+		// Prefer the session-sticky credential when available.
+		const sessionPref = this.#getSessionCredential(provider, sessionId);
+		// If the session has been routed to a stored API key, do not inject OAuth account_uuid.
+		if (sessionPref !== undefined && sessionPref.type !== "oauth") return undefined;
+
+		// When no session-sticky credential is recorded yet (first call before any getApiKey,
+		// or all stored credentials are unavailable), the request falls through to the env-key
+		// or fallback-resolver path in getApiKey() — neither is OAuth-authenticated, so
+		// account_uuid injection would misattribute traffic. Only apply this guard when
+		// sessionPref is absent; a recorded OAuth sticky (sessionPref.type === "oauth") must
+		// NOT be blocked even if an env key also happens to exist.
+		if (!sessionPref && (getEnvApiKey(provider) || this.#fallbackResolver?.(provider))) return undefined;
+		// Resolve the sticky index against the full credential list — the index is
+		// recorded against the unfiltered provider array (by #recordSessionCredential /
+		// #tryOAuthCredential), not the OAuth-only subset, so dereferencing it into the
+		// filtered array would be off-by-N when any non-OAuth credential precedes the
+		// OAuth ones (e.g. [api_key, oauth_A, oauth_B] stored order).
+		const stickyCredential = sessionPref?.type === "oauth" ? allCredentials[sessionPref.index] : undefined;
+		const preferred = stickyCredential?.type === "oauth" ? stickyCredential : oauthCredentials[0];
+		const accountId = preferred?.accountId;
+		return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
 	}
 
 	/**
@@ -1992,7 +2072,11 @@ export class AuthStorage {
 			return oauthKey;
 		}
 
-		// Fall back to environment variable
+		// Fall back to environment variable or custom resolver. If we reach here after
+		// an OAuth miss, the session sticky (if any) is stale — the request will
+		// authenticate via env/fallback, not OAuth, so clear the sticky now so that
+		// getOAuthAccountId() correctly suppresses account_uuid for this session.
+		if (sessionId) this.#sessionLastCredential.get(provider)?.delete(sessionId);
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
 

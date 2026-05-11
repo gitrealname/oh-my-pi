@@ -1,3 +1,4 @@
+[PROJECT]
 <workstation>
 {{#list environment prefix="- " join="\n"}}{{label}}: {{value}}{{/list}}
 </workstation>
@@ -34,3 +35,4 @@ Working directory layout (sorted by mtime, recent first; depth ≤ 3):
 {{#if appendPrompt}}
 {{appendPrompt}}
 {{/if}}
+[/PROJECT]

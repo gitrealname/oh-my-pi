@@ -10,16 +10,16 @@ Purely textual format. The tool has NO awareness of language, indentation, brack
 @PATH            header: subsequent ops apply to PATH
 + ANCHOR         insert lines AFTER  the anchored line (or EOF); payload follows as `{{hsep}}TEXT` lines
 < ANCHOR         insert lines BEFORE the anchored line (or BOF); payload follows as `{{hsep}}TEXT` lines
-- A..B           delete the line range (inclusive); `- A` for one line
-= A..B           replace the range with payload `{{hsep}}TEXT` lines, or with one blank line if no payload follows
+- A..B           delete the line range (inclusive).
+= A..B           replace the range with payload `{{hsep}}TEXT` lines, or with one blank line if no payload follows.
 </ops>
 
 <rules>
 - Every line of inserted/replacement content **MUST** be emitted as a payload line starting with `{{hsep}}`.
 - `{{hsep}}` is syntax, not content. The inserted text begins after the first `{{hsep}}`; use a bare `{{hsep}}` to insert a blank line.
 - `< A` inserts before line A; `+ A` inserts after line A. `< BOF` / `+ BOF` both prepend; `< EOF` / `+ EOF` both append.
-- `= A..B` replaces the inclusive range with the following payload lines. `= A` (or `= A..B`) with no payload blanks the range to a single empty line.
-- `- A..B` deletes the inclusive range; omit `..B` for one line.
+- `= A..B` replaces the inclusive range with the following payload lines. `= A..B` with no payload blanks the range to a single empty line.
+- `- A..B` deletes the inclusive range; `A..A` for one line.
 - **Choose a self-contained syntactic unit first.** If the change touches part of a multiline call, destructuring assignment, control-flow header, wrapper, or other construct, widen the range to include the whole construct before optimizing for size.
 - Only after the range is self-contained, pick the smallest op for the change: pure addition → `+`/`<`; pure deletion → `-`; `= A..B` ONLY when content inside `A..B` is actually being modified or removed.
 </rules>
@@ -37,6 +37,7 @@ When your edit involves brace boundaries (`{` / `}`), prefer these shapes:
 - **Do not duplicate chunks inside one payload.** When emitting a long `=` payload, never paste the same multi-line block twice. If you catch yourself re-emitting an earlier run of lines, stop and rewrite the op.
 - **Anchor only inside the visible region.** If the read output around your `=`/`-` end anchor is truncated (you cannot see the line at B+1), issue a fresh `read` before editing — anchoring blind drops or duplicates the boundary line.
 - **Prefer the narrowest self-contained edit.** Once your range cleanly contains the construct you are changing, a `+`/`<` insert plus a small `-` delete is almost always clearer and safer than a single wide `= A..B` that re-emits unchanged context.
+- **Anchors always reference the file as you last read it.** When stacking multiple `+`/`<`/`-`/`=` ops in one patch, do **NOT** mentally shift line numbers to account for prior ops in the same patch. Every op resolves against the original line numbering.
 </common-failures>
 
 <case file="a.ts">
@@ -63,7 +64,7 @@ When your edit involves brace boundaries (`{` / `}`), prefer these shapes:
 <examples>
 # Replace one line (preserve the leading tab from the original)
 @a.ts
-= {{hrefr 5}}
+= {{hrefr 5}}..{{hrefr 5}}
 {{hsep}}	return clean.trim().toUpperCase();
 
 # Replace a contiguous range with multiple lines
@@ -95,10 +96,6 @@ When your edit involves brace boundaries (`{` / `}`), prefer these shapes:
 + {{hrefr 4}}
 {{hsep}}	if (clean.length === 0) return DEF;
 
-# Append WITHIN a line
-@a.ts
-+ {{hrefr 4}}{{hsep}} // first run
-
 # Append to end of file
 @a.ts
 + EOF
@@ -106,11 +103,11 @@ When your edit involves brace boundaries (`{` / `}`), prefer these shapes:
 
 # Delete a single line
 @a.ts
-- {{hrefr 2}}
+- {{hrefr 2}}..{{hrefr 2}}
 
 # Blank a line in place (no payload required)
 @a.ts
-= {{hrefr 2}}
+= {{hrefr 2}}..{{hrefr 2}}
 </examples>
 
 <anti-pattern>
