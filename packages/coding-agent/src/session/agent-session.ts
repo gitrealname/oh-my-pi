@@ -496,6 +496,9 @@ export class AgentSession {
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
+	// Task execution state
+	#taskAbortControllers = new Set<AbortController>();
+
 	// Background-channel IRC exchanges queued while the recipient was streaming.
 	// Drained into history (via emitExternalEvent) once the recipient becomes idle.
 	#pendingBackgroundExchanges: CustomMessage[][] = [];
@@ -3761,6 +3764,7 @@ export class AgentSession {
 		this.abortHandoff();
 		this.abortBash();
 		this.abortEval();
+		this.abortTask();
 		const postPromptDrain = this.#cancelPostPromptTasks();
 		this.agent.abort();
 		await postPromptDrain;
@@ -6448,6 +6452,36 @@ export class AgentSession {
 	/** Whether a Python execution is currently running */
 	get isEvalRunning(): boolean {
 		return this.#evalAbortControllers.size > 0;
+	}
+
+	/**
+	 * Track task execution started by the task tool so ESC can abort it independently.
+	 */
+	trackTaskExecution<T>(execution: Promise<T>, abortController: AbortController): Promise<T> {
+		this.#taskAbortControllers.add(abortController);
+		void execution.then(
+			() => {
+				this.#taskAbortControllers.delete(abortController);
+			},
+			() => {
+				this.#taskAbortControllers.delete(abortController);
+			},
+		);
+		return execution;
+	}
+
+	/**
+	 * Cancel all running task executions.
+	 */
+	abortTask(): void {
+		for (const abortController of this.#taskAbortControllers) {
+			abortController.abort();
+		}
+	}
+
+	/** Whether a task execution is currently running */
+	get isTaskRunning(): boolean {
+		return this.#taskAbortControllers.size > 0;
 	}
 
 	/** Whether there are pending Python messages waiting to be flushed */

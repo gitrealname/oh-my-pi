@@ -1008,12 +1008,23 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				}
 			};
 
-			// Execute in parallel with concurrency limit
-			const { results: partialResults, aborted } = await mapWithConcurrencyLimit(
+			// Execute in parallel with concurrency limit.
+			// Register an AbortController with the session so ESC can abort task execution
+			// independently via abortTask() without waiting for the full agent loop to drain.
+			const taskAbortController = new AbortController();
+			const effectiveSignal = signal
+				? AbortSignal.any([signal, taskAbortController.signal])
+				: taskAbortController.signal;
+			const parallelExecution = mapWithConcurrencyLimit(
 				tasksWithContext,
 				maxConcurrency,
 				runTask,
-				signal,
+				effectiveSignal,
+			);
+			const { results: partialResults, aborted } = await (
+				this.session.trackTaskExecution
+					? this.session.trackTaskExecution(parallelExecution, taskAbortController)
+					: parallelExecution
 			);
 
 			// Fill in skipped tasks (undefined entries from abort) with placeholder results
