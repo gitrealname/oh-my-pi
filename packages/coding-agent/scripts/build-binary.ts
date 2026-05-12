@@ -40,6 +40,11 @@ async function main(): Promise<void> {
 					"--external", "mupdf",
 					"--root", "../..",
 					"./src/cli.ts",
+					// Worker entrypoints: Bun --compile must list workers explicitly so
+					// they are embedded in the binary at the path the spawn sites expect.
+					"../stats/src/sync-worker.ts",
+					"./src/tools/browser/tab-worker-entry.ts",
+					"./src/eval/js/worker-entry.ts",
 					"--outfile", "dist/omp",
 				],
 				buildEnv,
