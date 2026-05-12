@@ -553,6 +553,10 @@ async function buildSessionOptions(
 		options.enableLsp = false;
 	}
 
+	if (parsed.noMemory) {
+		settings.set("mmemory.enabled" as SettingPath, false);
+	}
+
 	// Skills
 	if (parsed.noSkills) {
 		options.skills = [];
@@ -880,10 +884,17 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 	};
 
 	if (mode === "rpc") {
-		await runRpcMode(session);
+		await runRpcMode(session, eventBus);
 	} else if (mode === "acp") {
 		await runAcpMode(session, createAcpSession);
 	} else if (isInteractive) {
+		// If --rpc-pipe is present, start the RPC command handler as a parallel
+		// background task alongside the TUI. runRpcMode() detects --rpc-pipe
+		// internally and connects to the pipe instead of using stdin/stdout.
+		if (process.argv.includes("--rpc-pipe")) {
+			void runRpcMode(session, eventBus);
+		}
+
 		const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 		const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
 

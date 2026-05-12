@@ -41,10 +41,7 @@ import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
 import { NotebookTool } from "./notebook";
-import { MReviewTool } from "./mreview/tool";
-import { MmemoryRecallTool } from "./mmemory/recall-tool";
-import { MmemoryReflectTool } from "./mmemory/reflect-tool";
-import { MmemoryRetainTool } from "./mmemory/retain-tool";
+import { MCommandTool } from "./mcommand";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import { RecipeTool } from "./recipe";
@@ -294,7 +291,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
 	mbrowser: s => new MBrowserTool(s),
-	mreview: MReviewTool.createIf,
+	mcommand: MCommandTool.createIf,
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	task: TaskTool.create,
@@ -308,9 +305,6 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	retain: HindsightRetainTool.createIf,
 	recall: HindsightRecallTool.createIf,
 	reflect: HindsightReflectTool.createIf,
-	mmemory_retain: MmemoryRetainTool.createIf,
-	mmemory_recall: MmemoryRecallTool.createIf,
-	mmemory_reflect: MmemoryReflectTool.createIf,
 };
 
 export const HIDDEN_TOOLS: Record<string, ToolFactory> = {

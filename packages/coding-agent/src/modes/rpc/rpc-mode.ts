@@ -11,6 +11,9 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
+import { connectToPipe } from "./pipe-transport";
+import { handleRpcInjectCommand } from "./rpc-inject-handler";
+import type { EventBus } from "../../utils/event-bus";
 import { $env, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
 import type {
 	ExtensionUIContext,
@@ -154,11 +157,28 @@ export function requestRpcEditor(
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(session: AgentSession): Promise<never> {
-	// Signal to RPC clients that the server is ready to accept commands
-	process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
+export async function runRpcMode(session: AgentSession, eventBus?: EventBus): Promise<never> {
+	// Detect --rpc-pipe: use named pipe side-channel instead of stdin/stdout.
+	// Arg value is either a Unix socket path or a TCP port number (Windows).
+	const rpcPipeArg = process.argv.indexOf("--rpc-pipe");
+	const pipeArg = rpcPipeArg !== -1 ? process.argv[rpcPipeArg + 1] : undefined;
+
+	let pipeSocket: Awaited<ReturnType<typeof connectToPipe>> | null = null;
+	if (pipeArg) {
+		pipeSocket = await connectToPipe(pipeArg);
+	}
+
+	// Signal ready: to pipe client if connected, otherwise to stdout
+	const writeReady = () => {
+		const msg = `${JSON.stringify({ type: "ready" })}\n`;
+		if (pipeSocket) pipeSocket.writeFrame({ type: "ready", pid: process.pid });
+		else process.stdout.write(msg);
+	};
+	writeReady();
+
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(`${JSON.stringify(obj)}\n`);
+		if (pipeSocket) pipeSocket.writeFrame(obj);
+		else process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -822,6 +842,8 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			}
 
 			default: {
+				const ext = await handleRpcInjectCommand(command, session, success as never, error, eventBus);
+				if (ext) return ext;
 				const unknownCommand = command as { type: string };
 				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
@@ -842,8 +864,12 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		process.exit(0);
 	}
 
-	// Listen for JSON input using Bun's stdin
-	for await (const parsed of readJsonl(Bun.stdin.stream())) {
+	// Listen for JSON input from pipe (headed mode) or stdin (headless mode)
+	const inputStream = pipeSocket
+		? pipeSocket.readLines()
+		: readJsonl(Bun.stdin.stream());
+
+	for await (const parsed of inputStream) {
 		try {
 			// Handle extension UI responses
 			if ((parsed as RpcExtensionUIResponse).type === "extension_ui_response") {
@@ -877,7 +903,8 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		}
 	}
 
-	// stdin closed — RPC client is gone, exit cleanly
+	// Connection closed — RPC client is gone, exit cleanly (pipe or stdin)
+	if (pipeSocket) pipeSocket.destroy();
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
 	process.exit(0);
 }

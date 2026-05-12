@@ -5,7 +5,7 @@
  */
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
-import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { BashResult } from "../../exec/bash-executor";
 import type { SessionStats } from "../../session/agent-session";
 import type { CompactionResult } from "../../session/compaction";
@@ -154,6 +154,10 @@ export class RpcClient {
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
 	#abortController = new AbortController();
 
+	/** Protected accessor so RpcPipeClient subclass can read/write the child process. */
+	protected get process(): ptree.ChildProcess | null { return this.#process; }
+	protected set process(v: ptree.ChildProcess | null) { this.#process = v; }
+
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
 	}
@@ -188,25 +192,40 @@ export class RpcClient {
 			stdin: "pipe",
 		});
 
-		// Wait for the "ready" signal or process exit
+		await this._startHandshake(
+			readJsonl(this.#process.stdout, this.#abortController.signal),
+			false,
+		);
+	}
+
+	/**
+	 * Run the ready handshake on an already-established line source.
+	 * Called by start() (stdio) and RpcPipeClient.start() (pipe).
+	 * isPipe=true skips the process.exited race (launcher exits immediately in pipe mode).
+	 */
+	protected async _startHandshake(
+		lines: AsyncGenerator<unknown>,
+		isPipe: boolean,
+	): Promise<void> {
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
 		let readySettled = false;
 
-		// Process lines in background, intercepting the ready signal
-		const lines = readJsonl(this.#process.stdout, this.#abortController.signal);
 		void (async () => {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					readySettled = true;
+					this._onReadyFrame(line as Record<string, unknown>);
 					readyResolve();
 					continue;
 				}
 				this.#handleLine(line);
 			}
-			// Stream ended without ready signal — process exited
+			// Stream ended without ready signal — process exited (or pipe closed)
 			if (!readySettled) {
 				readySettled = true;
 				readyReject(new Error(`Agent process exited before ready. Stderr: ${this.#process?.peekStderr() ?? ""}`));
+			} else if (!isPipe) {
+				// Natural stream end after ready in stdio mode — no-op (process.exited handles it)
 			}
 		})().catch((err: Error) => {
 			if (!readySettled) {
@@ -215,17 +234,18 @@ export class RpcClient {
 			}
 		});
 
-		// Also race against process exit (in case stdout closes before we read it)
-		void this.#process.exited.then((exitCode: number) => {
-			if (!readySettled) {
-				readySettled = true;
-				readyReject(
-					new Error(`Agent process exited with code ${exitCode}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
-				);
-			}
-		});
+		// Race against process exit — skip in pipe mode (launcher exits immediately)
+		if (!isPipe) {
+			void this.#process!.exited.then((exitCode: number) => {
+				if (!readySettled) {
+					readySettled = true;
+					readyReject(
+						new Error(`Agent process exited with code ${exitCode}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+					);
+				}
+			});
+		}
 
-		// Timeout to prevent hanging forever
 		const readyTimeout = this.#startTimeout(30000, () => {
 			if (readySettled) return;
 			readySettled = true;
@@ -236,13 +256,24 @@ export class RpcClient {
 
 		try {
 			await readyPromise;
+			logger.debug("[rpc-client] agent ready");
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
+		} catch (e) {
+			logger.error("[rpc-client] agent failed to start", { err: String(e) });
+			throw e;
 		} finally {
 			clearTimeout(readyTimeout);
 		}
 	}
+
+	/**
+	 * Called when the ready frame arrives. Subclass may override to capture
+	 * extra fields (e.g. child pid in RpcPipeClient).
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	protected _onReadyFrame(_data: Record<string, unknown>): void {}
 
 	/**
 	 * Stop the RPC agent process.
@@ -258,6 +289,11 @@ export class RpcClient {
 			pendingCall.controller.abort();
 		}
 		this.#pendingHostToolCalls.clear();
+	}
+
+	/** Escape hatch for extension commands not in the base RpcCommand union. */
+	_sendCommand(command: object, timeoutMs = 30_000): Promise<unknown> {
+	    return this.#send(command as Parameters<typeof this.#send>[0], timeoutMs);
 	}
 
 	/**
@@ -589,24 +625,35 @@ export class RpcClient {
 	 * Resolves when agent_end event is received.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			if (event.type === "agent_end") {
-				settled = true;
-				unsubscribe();
-				clearTimeout(timeoutId);
-				resolve();
-			}
-		});
+	    const { promise, resolve, reject } = Promise.withResolvers<void>();
+	    let settled = false;
 
-		const timeoutId = this.#startTimeout(timeout, () => {
-			if (settled) return;
-			settled = true;
-			unsubscribe();
-			reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`));
-		});
-		return promise;
+	    const settle = (ok: boolean, err?: Error) => {
+	        if (settled) return;
+	        settled = true;
+	        unsubscribe();
+	        clearTimeout(timeoutId);
+	        if (ok) resolve(); else reject(err!);
+	    };
+
+	    // Register listener BEFORE checking state — no race with agent_end
+	    const unsubscribe = this.onEvent(event => {
+	        if (event.type === "agent_end") settle(true);
+	    });
+
+	    const timeoutId = this.#startTimeout(timeout, () =>
+	        settle(false, new Error(`Timeout waiting for agent to become idle. Stderr: ${this.#process?.peekStderr() ?? ""}`)),
+	    );
+
+	    // Also check if already idle — resolves immediately if not streaming
+	    void this.#send({ type: "get_state" })
+	        .then(resp => {
+	            const state = this.#getData<RpcSessionState>(resp);
+	            if (!state.streaming) settle(true);
+	        })
+	        .catch(() => { /* fall through to agent_end listener */ });
+
+	    return promise;
 	}
 
 	/**
@@ -686,7 +733,7 @@ export class RpcClient {
 	}
 
 	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
-		if (!this.#process?.stdin) {
+		if (!this.#process) {
 			throw new Error("Client not started");
 		}
 
@@ -718,7 +765,7 @@ export class RpcClient {
 			},
 		});
 
-		this.#writeFrame(fullCommand, err => {
+		this.writeFrame(fullCommand, err => {
 			this.#pendingRequests.delete(id);
 			if (settled) return;
 			settled = true;
@@ -731,7 +778,7 @@ export class RpcClient {
 	async #handleHostToolCall(request: RpcHostToolCallRequest): Promise<void> {
 		const tool = this.#customTools.find(candidate => candidate.name === request.toolName);
 		if (!tool) {
-			this.#writeFrame({
+			this.writeFrame({
 				type: "host_tool_result",
 				id: request.id,
 				result: {
@@ -748,7 +795,7 @@ export class RpcClient {
 
 		const sendUpdate = (partialResult: RpcClientToolResult<unknown>): void => {
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
+			this.writeFrame({
 				type: "host_tool_update",
 				id: request.id,
 				partialResult: normalizeToolResult(partialResult),
@@ -762,14 +809,14 @@ export class RpcClient {
 				sendUpdate,
 			});
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
+			this.writeFrame({
 				type: "host_tool_result",
 				id: request.id,
 				result: normalizeToolResult(result),
 			} satisfies RpcHostToolResult);
 		} catch (error) {
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
+			this.writeFrame({
 				type: "host_tool_result",
 				id: request.id,
 				result: {
@@ -783,7 +830,7 @@ export class RpcClient {
 		}
 	}
 
-	#writeFrame(frame: RpcCommand | RpcHostToolResult | RpcHostToolUpdate, onError?: (error: Error) => void): void {
+	protected writeFrame(frame: RpcCommand | RpcHostToolResult | RpcHostToolUpdate, onError?: (error: Error) => void): void {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}

@@ -1,9 +1,11 @@
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { registerInputController } from "../../modes/rpc/rpc-inject-handler";
 import { sanitizeText } from "@oh-my-pi/pi-natives";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env, logger } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
 import { runScriptSlot } from "./input-controller-m-scripts";
+import { injectKey as injectKeyIntoTui, injectText as injectTextIntoEditor, injectCommand as injectCommandIntoEditor } from "./input-controller-inject";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
@@ -832,4 +834,19 @@ export class InputController {
 			});
 		}
 	}
+
+	/**
+ 	 * Inject a keypress — delegates to input-controller-inject.ts.
+ 	 * Routes through full TUI pipeline; ESC works in both editor and panel contexts.
+ 	 */
+	injectKey(key: string): void { injectKeyIntoTui(key, this.ctx); }
+
+	/** Inject text into the editor at cursor position (triggers render). */
+	injectText(text: string): void { injectTextIntoEditor(text, this.ctx); }
+
+	/**
+ 	 * Inject a command as if the user typed it and pressed Enter.
+ 	 * TUI handles slash commands natively — LLM never sees them.
+ 	 */
+	injectCommand(text: string): void { injectCommandIntoEditor(text, this.ctx); }
 }

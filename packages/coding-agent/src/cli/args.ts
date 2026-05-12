@@ -40,6 +40,7 @@ export interface Args {
 	noExtensions?: boolean;
 	pluginDirs?: string[];
 	print?: boolean;
+	noMemory?: boolean;
 	export?: string;
 	noSkills?: boolean;
 	skills?: string[];
@@ -121,6 +122,8 @@ export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {
 			result.noLsp = true;
+		} else if (arg === "--no-memory") {
+			result.noMemory = true;
 		} else if (arg === "--no-pty") {
 			result.noPty = true;
 		} else if (arg === "--tools" && i + 1 < args.length) {

@@ -30,6 +30,7 @@ import { createMmemoryExtension } from "./mmemory-extension";
 import { createPromptTemplateExtension, setMPromptTemplateRoleResolver } from "./m-prompt-template/activate";
 import { resolveTemplateModelSpec } from "./utils/m-utils";
 import { createMpruneExtension } from "./extensibility/extensions/m-prune-extension";
+import { createMtuicontrolExtension } from "./extensibility/extensions/m-mtuicontrol-extension";
 import { createPromptEngine } from "./prompt-engine";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability } from "./capability/rule";
@@ -1211,6 +1212,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (settings.get("promptTemplates.enabled" as SettingPath) !== false) {
 			setMPromptTemplateRoleResolver((spec) => resolveTemplateModelSpec(spec, settings));
 			inlineExtensions.push(createPromptTemplateExtension);
+		}
+		if (settings.get("mtuicontrol.enabled" as SettingPath) === true) {
+			inlineExtensions.push(createMtuicontrolExtension);
 		}
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
