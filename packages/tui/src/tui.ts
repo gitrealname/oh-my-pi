@@ -404,6 +404,15 @@ export class TUI extends Container {
 		};
 	}
 
+	/**
+	 * Inject a raw input sequence as if it came from the terminal.
+	 * Routes through the full TUI input pipeline to the currently focused component.
+	 * Use this for navigation keys (arrows, home/end, F-keys, etc.).
+	 */
+	simulateInput(data: string): void {
+		this.#handleInput(data);
+	}
+
 	removeInputListener(listener: InputListener): void {
 		this.#inputListeners.delete(listener);
 	}

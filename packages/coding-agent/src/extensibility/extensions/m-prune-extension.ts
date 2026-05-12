@@ -194,6 +194,7 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 	// ── turn_end: flush on agent-message (text-only) turn ─────────────────────
 	api.on("turn_end", async (event, ctx) => {
 		if (event.toolResults.length > 0) return;
+
 		const state = getOrCreateState(ctx);
 		if (!state || state.pendingBatches.length === 0) return;
 
@@ -290,6 +291,7 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 	// ── turn_end: image aging ──────────────────────────────────────────────────
 	api.on("turn_end", async (event, ctx) => {
 		if (!settings.get("mprune.enabled")) return;
+
 		const keepTurns = settings.get("mprune.images.keepTurns");
 		if (!keepTurns) return;
 		if (ctx.taskDepth > 0) return;

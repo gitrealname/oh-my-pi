@@ -1995,6 +1995,15 @@ export const SETTINGS_SCHEMA = {
 				"Enable memory extension tools (mmemory_recall, mmemory_retain, mmemory_reflect). Requires Python + fastembed + safetensors.",
 		},
 	},
+	"mtuicontrol.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "mtuicontrol",
+			description: "Enable /mtuicontrol extension command for programmatic TUI/RPC session control (testing and automation). Defaults to off.",
+		},
+	},
 	...MMEMORY_SCHEMA_ENTRIES,
 	// Tool execution
 	"tools.intentTracing": {

@@ -69,6 +69,7 @@ import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
 import { ExtensionUiController } from "./controllers/extension-ui-controller";
 import { InputController } from "./controllers/input-controller";
+import { registerInputController } from "./rpc/rpc-inject-handler";
 import { MCPCommandController } from "./controllers/mcp-command-controller";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
@@ -436,6 +437,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
+		// Register with RPC inject handler so --rpc-pipe sessions can inject keys
+		registerInputController(this.#inputController);
 
 		// Wire observer registry to EventBus
 		if (this.#eventBus) {
@@ -1249,6 +1252,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#eventBusUnsubscribers = [];
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
+		registerInputController(null);
 		this.statusLine.dispose();
 		if (this.#resizeHandler) {
 			process.stdout.removeListener("resize", this.#resizeHandler);

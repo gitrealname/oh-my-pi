@@ -38,7 +38,6 @@ enterprise and workflow extensions baked into the binary.
 Current base: upstream v14.8.1 (`d4bb2f3f3`)
 Upstream: `origin/main` → periodically merged into `aws-corp`. Last merge: 2026-05-09.
 See [MERGE-INSTRUCTIONS.md](MERGE-INSTRUCTIONS.md) for merge checklist.
->>>>>>> feature/prompt-template-integration
 
 ---
 
@@ -522,6 +521,100 @@ Files:
 - `packages/coding-agent/src/config/settings-schema-m-scripts.ts`
 
 ---
+
+### 15. mcommand — Generic Slash-Command Proxy Tool
+
+Single LLM-callable tool that replaced the per-feature private tools
+(`MReviewTool`, `MmemoryRecallTool`, `MmemoryReflectTool`, `MmemoryRetainTool`),
+each of which duplicated the same 3-line `SCHEDULE_SLASH_CHANNEL` emit pattern.
+
+- `mcommand({ command: "/any-slash-command args" })` — emits on `SCHEDULE_SLASH_CHANNEL` via `session.eventBus`
+- `InteractiveMode` executes the slash command at next idle tick; result arrives as a `followUp` turn
+- Tool description deliberately short to prevent fuzzy matching; instructs LLM to stay silent after calling
+- Only registered when `session.eventBus` is live (interactive mode); skipped in subagents
+- Retired tools replaced by skills that teach the LLM to call `mcommand` instead
+
+Files:
+- `packages/coding-agent/src/tools/mcommand.ts` — tool implementation
+- `packages/coding-agent/src/tools/index.ts` — `mcommand: MCommandTool.createIf` registered
+- `packages/coding-agent/src/tools/mmemory/SKILL.md` — mmemory skill (recall/reflect/retain via mcommand)
+- `packages/coding-agent/src/tools/mreview/SKILL.md` — mreview skill (review via mcommand)
+
+---
+
+### 16. ESC Cancellation Fix (parallel.ts abort race)
+
+When the `task` tool dispatches subagents running long bash calls, pressing ESC
+previously waited for full subprocess teardown (30s+). Fix makes it respond in <2s.
+
+**Fixes:**
+1. `parallel.ts` — `mapWithConcurrencyLimit` workers race against `AbortSignal` via `Promise.race`; in-flight tasks return immediately on abort, teardown continues in background
+2. `executor.ts` — after 5s `dispose()` timeout, calls `session.abort()` as force-stop escalation
+3. `agent-session.ts` — `#taskAbortControllers` set, `trackTaskExecution()`, `abortTask()`, `isTaskRunning` getter — mirrors the bash/eval abort pattern
+4. `tools/index.ts` — `ToolSession` interface gains `trackTaskExecution?`, `abortTask?`, `isTaskRunning?`
+5. `task/index.ts` — registers `AbortController` with `session.trackTaskExecution` so ESC aborts independently of agent loop
+6. `input-controller.ts` — ESC handler gains `isTaskRunning` fast-path; `loadingAnimation?.setMessage("cancelling...")` on all three abort paths (bash/eval/task)
+7. `m-prune-extension.ts` — flush guard: scans session for unpaired `tool_use` blocks before injecting steer message; prevents `"Expected toolResult blocks at messages[N].content"` after interrupted tasks
+
+Files:
+- `packages/coding-agent/src/task/parallel.ts`
+- `packages/coding-agent/src/task/executor.ts`
+- `packages/coding-agent/src/session/agent-session.ts`
+- `packages/coding-agent/src/tools/index.ts`
+- `packages/coding-agent/src/task/index.ts`
+- `packages/coding-agent/src/modes/controllers/input-controller.ts`
+- `packages/coding-agent/src/extensibility/extensions/m-prune-extension.ts`
+- `packages/coding-agent/test/task-parallel-abort.test.ts` — unit tests (5 pass)
+- `packages/coding-agent/test/agent-session-task-abort.test.ts` — unit tests (9 pass)
+
+---
+
+### 17. mtuicontrol — Programmatic TUI/RPC Session Control
+
+Spawn and drive child OMP sessions from the master agent. Used for E2E testing
+and automation requiring real user-input simulation (ESC, modal dialogs, slash
+command chains).
+
+**Architecture:**
+- Master calls `mcommand({ command: "/mtuicontrol spawn --cmd ..." })`
+- Extension creates TCP pipe server (Windows) or Unix socket (Unix), spawns child with `--rpc-pipe <port/path>` appended to user-supplied command
+- Child calls `connectToPipe()` and exchanges JSONL over socket; `runRpcMode()` runs in parallel with child TUI
+- Master drives child via subsequent `/mtuicontrol` commands; results arrive as `followUp`
+
+**Commands:**
+- `spawn --cmd <full command>` — user owns entire command line; `--rpc-pipe` appended automatically; use `cmd /c start o --new` for a visible window
+- `prompt [id] <message>` — send text as RPC prompt to child agent
+- `keypress [id] <ESC><CTRL-C><CTRL-ALT-D>...` — inject keyboard sequences only; full chord support
+- `command [id] <slash command>` — inject slash command into child via `SCHEDULE_SLASH_CHANNEL`
+- `wait [id] [--timeout N]` — wait for idle; auto-injects ESC on timeout, terminates if still stuck
+- `stop [id]` — clean shutdown
+- `list` — active session ids
+- `[id]` defaults to last spawned/used session
+
+**Key design decisions:**
+- `--rpc-pipe <arg>`: port number (Windows TCP shim) or socket path (Unix) — one arg, platform-detected
+- Bun named-pipe server broken on Windows (issues #11820, #24682, #30265) — TCP loopback on random port as shim
+- No `--headed` flag — user controls window creation via `--cmd` content
+- `keypress` accepts `<CTRL-A..Z>` dynamically, `<ALT-X>`, `<CTRL-ALT-X>`, named keys, F-keys
+- Session pool is module-level singleton (survives across slash command invocations)
+
+Files:
+- `packages/coding-agent/src/extensibility/extensions/m-mtuicontrol-extension.ts` — all commands, session pool
+- `packages/coding-agent/src/modes/rpc/pipe-transport.ts` — `createPipeServer()` + `connectToPipe()` + Windows TCP shim
+- `packages/coding-agent/src/modes/rpc/rpc-inject.ts` — inject_key/text/slash command types
+- `packages/coding-agent/src/modes/rpc/rpc-inject-handler.ts` — server-side handler; `registerInputController()` for headed mode
+- `packages/coding-agent/src/modes/rpc/rpc-inject-client.ts` — `RpcInjectClient` wrapper
+- `packages/coding-agent/src/modes/rpc/rpc-client.ts` — `rpcPipe` option; `_sendCommand` escape hatch
+- `packages/coding-agent/src/modes/rpc/rpc-mode.ts` — `--rpc-pipe` detection; inject command dispatch
+- `packages/coding-agent/src/main.ts` — `void runRpcMode(session)` when `--rpc-pipe` present
+- `packages/coding-agent/src/modes/interactive-mode.ts` — `registerInputController()` after init
+- `packages/coding-agent/src/modes/controllers/input-controller.ts` — `injectKey()` + `injectText()`
+- `packages/coding-agent/src/cli/args.ts` — `--no-memory` flag
+- `.omp/skills/mtuicontrol/SKILL.md` — skill teaching LLM the command interface
+- `packages/coding-agent/test/mtuicontrol-esc.test.ts` — 7 RPC inject command tests (all pass)
+- See `mtuicontrol-design.md` for full reference including keypress table and test scenarios
+
+Config key: `mtuicontrol.enabled` (default: `false`).
 
 ## Config Surface
 
