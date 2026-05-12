@@ -56,7 +56,7 @@
     },
     "packages/coding-agent": {
       "name": "@oh-my-pi/pi-coding-agent",
-      "version": "14.9.3",
+      "version": "14.9.9",
       "bin": {
         "omp": "src/cli.ts",
       },
@@ -115,13 +115,13 @@
         "react": "catalog:",
         "react-chartjs-2": "catalog:",
         "react-dom": "catalog:",
+        "tailwindcss": "catalog:",
       },
       "devDependencies": {
         "@types/bun": "catalog:",
         "@types/react": "catalog:",
         "@types/react-dom": "catalog:",
         "postcss": "catalog:",
-        "tailwindcss": "catalog:",
       },
     },
     "packages/swarm-extension": {
@@ -1325,6 +1325,8 @@
     "@aws-sdk/xml-builder/fast-xml-parser": ["fast-xml-parser@5.7.2", "", { "dependencies": { "@nodable/entities": "^2.1.0", "fast-xml-builder": "^1.1.5", "path-expression-matcher": "^1.5.0", "strnum": "^2.2.3" }, "bin": { "fxparser": "src/cli/cli.js" } }, "sha512-P7oW7tLbYnhOLQk/Gv7cZgzgMPP/XN03K02/Jy6Y/NHzyIAIpxuZIM/YqAkfiXFPxA2CTm7NtCijK9EDu09u2w=="],
 
     "@bufbuild/protoplugin/typescript": ["typescript@5.4.5", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-vcI4UpRgg81oIRUFwR0WSIHKt11nJ7SAVlYNIu+QpqeyXP+gpQJy/Z4+F0aGxSE4MqwjyXvW/TzgkLAx2AGHwQ=="],
+
+    "@oh-my-pi/typescript-edit-benchmark/@oh-my-pi/pi-coding-agent": ["@oh-my-pi/pi-coding-agent@14.9.3", "", { "dependencies": { "@agentclientprotocol/sdk": "0.21.0", "@babel/parser": "^7.29.3", "@mozilla/readability": "^0.6.0", "@oh-my-pi/omp-stats": "14.9.3", "@oh-my-pi/pi-agent-core": "14.9.3", "@oh-my-pi/pi-ai": "14.9.3", "@oh-my-pi/pi-natives": "14.9.3", "@oh-my-pi/pi-tui": "14.9.3", "@oh-my-pi/pi-utils": "14.9.3", "@puppeteer/browsers": "^2.13.0", "@sinclair/typebox": "^0.34.49", "@types/turndown": "5.0.6", "@xterm/headless": "^6.0.0", "ajv": "^8.20.0", "chalk": "^5.6.2", "diff": "^9.0.0", "fflate": "0.8.2", "handlebars": "^4.7.9", "linkedom": "^0.18.12", "lru-cache": "11.3.6", "markit-ai": "0.5.3", "puppeteer-core": "^24.42.0", "turndown": "7.2.4", "turndown-plugin-gfm": "1.0.2", "zod": "4.4.3" }, "bin": { "omp": "src/cli.ts" } }, "sha512-C7KTP58OgqjwazfBe2qBQFw4FLfN5ocuEsjngmud1IkJ0yga0hA1Lu5P7voTiDMbJI5/JYCCvuYU/ickISf2+Q=="],
 
     "@puppeteer/browsers/proxy-agent": ["proxy-agent@6.5.0", "", { "dependencies": { "agent-base": "^7.1.2", "debug": "^4.3.4", "http-proxy-agent": "^7.0.1", "https-proxy-agent": "^7.0.6", "lru-cache": "^7.14.1", "pac-proxy-agent": "^7.1.0", "proxy-from-env": "^1.1.0", "socks-proxy-agent": "^8.0.5" } }, "sha512-TmatMXdr2KlRiA2CyDu8GqR8EjahTG3aY3nXjdzFyoZbmB8hrBsTyMezhULIXKnC0jpfjlmiZ3+EaCzoInSu/A=="],
 
