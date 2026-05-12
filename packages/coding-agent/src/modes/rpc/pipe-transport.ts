@@ -163,8 +163,8 @@ function wrapSocket(socket: net.Socket): PipeSocket {
  * - JS/TS modules (`cliPath` ends in .js/.ts): prefix with "bun"; mode args injected.
  * - Shell executables (batch files, .exe, scripts): run directly; no mode args.
  * - On Windows: normalises backslashes to forward slashes.
- * - On Windows: if command is `cmd.exe /c <something>` (not already `start`),
- *   injects `start ""` so the child opens in a visible console window.
+  *   injects `start /WAIT ""` so the child opens in a visible console window and
+  *   cmd.exe remains alive until the child exits (required for process lifetime tracking).
  */
 export function buildSpawnCmd(
 	cliPath: string,
@@ -175,8 +175,10 @@ export function buildSpawnCmd(
 	const raw = isBunModule ? ["bun", cliPath, ...args] : [cliPath, ...args];
 	// Normalize path separators — Bun.spawn on Windows handles forward slashes fine
 	const cmd = raw.map(s => s.replace(/\\/g, "/"));
-	// On Windows, inject `start ""` after `cmd.exe /c` (if not already present) so the
-	// child process opens in a new visible console window instead of running hidden.
+	// On Windows, inject `start /WAIT ""` after `cmd.exe /c` (if not already present).
+	// /WAIT keeps cmd.exe alive until the child window exits — without it, cmd.exe returns
+	// immediately after spawning the visible window, and RpcClient's onExit fires prematurely,
+	// removing the session from the pool while the child is still running.
 	if (
 		!isBunModule &&
 		process.platform === "win32" &&
@@ -184,7 +186,7 @@ export function buildSpawnCmd(
 		cmd[1] === "/c" &&
 		cmd[2] !== "start"
 	) {
-		cmd.splice(2, 0, "start", "");
+		cmd.splice(2, 0, "start", "/WAIT", "");
 	}
 	void headedMode; // reserved for future use (currently affects stdin/stdout in caller)
 	return cmd;
@@ -248,8 +250,18 @@ export class PipeConnection implements RpcTransport {
 			env: { ...Bun.env, ...options.env },
 			stdin: options.isBunModule ? (options.headedMode ? "inherit" : "pipe") : "ignore",
 			stdout: options.isBunModule ? (options.headedMode ? "inherit" : "pipe") : "ignore",
+			// Non-bun executables (e.g. omp.exe via cmd.exe) have their own console
+			// window (opened by `start /WAIT ""`); stdin/stdout are not used.
 		});
-		const socket = await server.waitForClient();
+		// Fail fast if the child never connects (crash, wrong args, etc.)
+		// rather than hanging forever on waitForClient().
+		const socket = await Promise.race([
+			server.waitForClient(),
+			Bun.sleep(15_000).then((): never => {
+				server.close();
+				throw new Error("RPC pipe handshake timed out after 15s — child did not connect");
+			}),
+		]);
 		logger.debug("[pipe-transport] pipe client connected");
 		server.close();
 		return new PipeConnection(proc, socket);

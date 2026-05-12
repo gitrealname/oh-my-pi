@@ -26,18 +26,13 @@ import {
 import chalk from "chalk";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { createAutoresearchExtension } from "./autoresearch";
-import { createMmemoryExtension } from "./mmemory-extension";
-import { createPromptTemplateExtension, setMPromptTemplateRoleResolver } from "./m-prompt-template/activate";
-import { resolveTemplateModelSpec } from "./utils/m-utils";
-import { createMpruneExtension } from "./extensibility/extensions/m-prune-extension";
-import { createMtuicontrolExtension } from "./extensibility/extensions/m-mtuicontrol-extension";
-import { createPromptEngine } from "./prompt-engine";
+import { populateCorpSkillRoles, registerCorpExtensions, applyCorpExtensionRunner } from "./corp-sdk-extensions";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability } from "./capability/rule";
 import { ModelRegistry } from "./config/model-registry";
 import { formatModelString, parseModelPattern, parseModelString, resolveModelRoleValue } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
-import { Settings, type SettingPath, type SkillsSettings } from "./config/settings";
+import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
 import "./discovery";
 import { resolveConfigValue } from "./config/resolve-config-value";
@@ -1070,22 +1065,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 			asyncJobManager,
 		};
-
-
-		// Populate activeSkillRoles from skills that declare role+tools frontmatter
-		// Skills with role: "slow" and tools: ["recall","reflect"] route those tools to that role
-		const activeSkillRoles = new Map<string, string>();
-		for (const skill of skills as Array<{ frontmatter?: Record<string, unknown> }>) {
-			if (!skill.frontmatter) continue;
-			const role = skill.frontmatter["role"] as string | undefined;
-			const tools = skill.frontmatter["tools"] as string[] | undefined;
-			if (role && Array.isArray(tools)) {
-				for (const toolName of tools) {
-					activeSkillRoles.set(toolName, role);
-				}
-			}
-		}
-		toolSession.activeSkillRoles = activeSkillRoles;
+		populateCorpSkillRoles(skills, toolSession);
 		// Initialize internal URL router for internal protocols (agent://, artifact://, memory://, skill://, rule://, mcp://, local://)
 		const internalRouter = new InternalUrlRouter();
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
@@ -1197,25 +1177,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const inlineExtensions: ExtensionFactory[] = options.extensions ? [...options.extensions] : [];
-		if (settings.get("autoresearch.enabled" as SettingPath) !== false) {
-			inlineExtensions.push(createAutoresearchExtension);
-		}
-		if (settings.get("promptEngine.enabled" as SettingPath) !== false) {
-			inlineExtensions.push(createPromptEngine);
-		}
-		if (settings.get("mmemory.enabled" as SettingPath) !== false) {
-			inlineExtensions.push(createMmemoryExtension);
-		}
-		if (settings.get("mprune.enabled" as SettingPath) !== false) {
-			inlineExtensions.push(createMpruneExtension);
-		}
-		if (settings.get("promptTemplates.enabled" as SettingPath) !== false) {
-			setMPromptTemplateRoleResolver((spec) => resolveTemplateModelSpec(spec, settings));
-			inlineExtensions.push(createPromptTemplateExtension);
-		}
-		if (settings.get("mtuicontrol.enabled" as SettingPath) === true) {
-			inlineExtensions.push(createMtuicontrolExtension);
-		}
+		inlineExtensions.push(createAutoresearchExtension);
+		registerCorpExtensions(inlineExtensions, settings);
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
@@ -1336,7 +1299,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				modelRegistry,
 			);
 		}
-		extensionRunner?.setTaskDepth(taskDepth);
+		applyCorpExtensionRunner(extensionRunner, taskDepth);
 
 		const getSessionContext = () => ({
 			sessionManager,
