@@ -12,17 +12,17 @@
  */
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import { connectToPipe } from "./pipe-transport";
-import { handleRpcInjectCommand } from "./rpc-inject-handler";
-import type { EventBus } from "../../utils/event-bus";
-import { $env, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
+import { handleRpcExecCommand, registerExecOutputFn } from "./rpc-inject-handler";
+import { type EventBus, PIPE_TUI_OUTPUT_CHANNEL } from "../../utils/event-bus";
+import { $env, readJsonl, Snowflake, VERSION } from "@oh-my-pi/pi-utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../extensibility/extensions";
-import { runExtensionCompact, runExtensionSetModel } from "../../extensibility/extensions/compact-handler";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
+import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import type {
 	RpcCommand,
@@ -157,7 +157,11 @@ export function requestRpcEditor(
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(session: AgentSession, eventBus?: EventBus): Promise<never> {
+export async function runRpcMode(
+	session: AgentSession,
+	eventBus?: EventBus,
+	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
+): Promise<never> {
 	// Detect --rpc-pipe: use named pipe side-channel instead of stdin/stdout.
 	// Arg value is either a Unix socket path or a TCP port number (Windows).
 	const rpcPipeArg = process.argv.indexOf("--rpc-pipe");
@@ -168,18 +172,22 @@ export async function runRpcMode(session: AgentSession, eventBus?: EventBus): Pr
 		pipeSocket = await connectToPipe(pipeArg);
 	}
 
+	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
+	// process.stdout with no newline, which the reader merges with the next JSON line and
+	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
+	// may write there.
+	process.env.PI_NOTIFICATIONS = "off";
+
 	// Signal ready: to pipe client if connected, otherwise to stdout
-	const writeReady = () => {
-		const msg = `${JSON.stringify({ type: "ready" })}\n`;
-		if (pipeSocket) pipeSocket.writeFrame({ type: "ready", pid: process.pid });
-		else process.stdout.write(msg);
-	};
-	writeReady();
+	if (pipeSocket) pipeSocket.writeFrame({ type: "ready", pid: process.pid });
+	else process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		if (pipeSocket) pipeSocket.writeFrame(obj);
 		else process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
+	// Register pipe write fn with exec queue — slave uses it to send exec_step_result frames.
+	registerExecOutputFn(output);
 	const emitRpcTitles = shouldEmitRpcTitles();
 
 	const success = <T extends RpcCommand["type"]>(
@@ -425,97 +433,52 @@ export async function runRpcMode(session: AgentSession, eventBus?: EventBus): Pr
 		}
 	}
 
+	// Wire up UI context for tool execution (ask tool, etc.) and extensions.
+	// A single shared instance routes all responses received on stdin to the
+	// correct waiting promise regardless of which code path created the request.
+	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
+	setToolUIContext?.(rpcUiContext, true);
+
 	// Set up extensions with RPC-based UI context
-	const extensionRunner = session.extensionRunner;
-	if (extensionRunner) {
-		extensionRunner.initialize(
-			// ExtensionActions
-			{
-				sendMessage: (message, options) => {
-					session.sendCustomMessage(message, options).catch(e => {
-						output(error(undefined, "extension_send", e.message));
-					});
-				},
-				sendUserMessage: (content, options) => {
-					session.sendUserMessage(content, options).catch(e => {
-						output(error(undefined, "extension_send_user", e.message));
-					});
-				},
-				appendEntry: (customType, data) => {
-					session.sessionManager.appendCustomEntry(customType, data);
-				},
-				setLabel: (targetId, label) => {
-					session.sessionManager.appendLabelChange(targetId, label);
-				},
-				getActiveTools: () => session.getActiveToolNames(),
-				getAllTools: () => session.getAllToolNames(),
-				setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
-				getCommands: () => [],
-				setModel: model => runExtensionSetModel(session, model),
-				getThinkingLevel: () => session.thinkingLevel,
-				setThinkingLevel: level => session.setThinkingLevel(level),
-				getSessionName: () => session.sessionManager.getSessionName(),
-				setSessionName: async name => {
-					await session.sessionManager.setSessionName(name, "user");
-				},
-			},
-			// ExtensionContextActions
-			{
-				getModel: () => session.agent.state.model,
-				isIdle: () => !session.isStreaming,
-				abort: () => session.abort(),
-				hasPendingMessages: () => session.queuedMessageCount > 0,
-				shutdown: () => {
-					shutdownState.requested = true;
-				},
-				getContextUsage: () => session.getContextUsage(),
-				getSystemPrompt: () => session.systemPrompt,
-				compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
-			},
-			// ExtensionCommandContextActions - commands invokable via prompt("/command")
-			{
-				getContextUsage: () => session.getContextUsage(),
-				waitForIdle: () => session.agent.waitForIdle(),
-				newSession: async options => {
-					const success = await session.newSession({ parentSession: options?.parentSession });
-					// Note: setup callback runs but no UI feedback in RPC mode
-					if (success && options?.setup) {
-						await options.setup(session.sessionManager);
-					}
-					return { cancelled: !success };
-				},
-				branch: async entryId => {
-					const result = await session.branch(entryId);
-					return { cancelled: result.cancelled };
-				},
-				navigateTree: async (targetId, options) => {
-					const result = await session.navigateTree(targetId, { summarize: options?.summarize });
-					return { cancelled: result.cancelled };
-				},
-				switchSession: async sessionPath => {
-					const success = await session.switchSession(sessionPath);
-					return { cancelled: !success };
-				},
-				reload: async () => {
-					await session.reload();
-				},
-				compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
-			},
-			new RpcExtensionUIContext(pendingExtensionRequests, output),
-		);
-		extensionRunner.onError(err => {
+	await initializeExtensions(session, {
+		reportSendError: (action, err) => {
+			output(error(undefined, action, err.message));
+		},
+		reportRuntimeError: err => {
 			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		});
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
-		});
-	}
+		},
+		onShutdown: () => {
+			shutdownState.requested = true;
+		},
+		uiContext: rpcUiContext,
+	});
 
 	// Output all agent events as JSON
 	session.subscribe(event => {
 		output(event);
 	});
+
+	// Forward TUI output (showStatus/showError/showWarning) through the pipe.
+	// Only fires in headed+pipe mode (InteractiveMode emits when #eventBus is set).
+	if (eventBus) {
+		eventBus.on(PIPE_TUI_OUTPUT_CHANNEL, (data) => {
+			output({ type: "tui_output", ...(data as import("../../utils/event-bus").TuiOutputPayload) });
+		});
+	}
+
+	// Signal slave is fully ready — master counter=1 at spawn drops to 0 on this frame.
+	// Triggers LLM turn so agent knows the slave is live without polling or separate check.
+	if (pipeSocket) {
+		output({
+			type: "exec_step_result",
+			stepIndex: 0,
+			stepType: "startup",
+			remaining: 0,   // counter drops to 0 on master → scheduleInput("slave(s) responded")
+			sections: {
+				system: `pid=${process.pid} version=${VERSION}`,  // pid and version in system label
+			},
+		});
+	}
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -842,10 +805,11 @@ export async function runRpcMode(session: AgentSession, eventBus?: EventBus): Pr
 			}
 
 			default: {
-				const ext = await handleRpcInjectCommand(command, session, success as never, error, eventBus);
-				if (ext) return ext;
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+
+			const exec = await handleRpcExecCommand(command, session, success as never, error as never);
+			if (exec) return exec as RpcResponse;
+			const unknownCommand = command as { type: string };
+			return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};
@@ -857,8 +821,8 @@ export async function runRpcMode(session: AgentSession, eventBus?: EventBus): Pr
 	async function checkShutdownRequested(): Promise<void> {
 		if (!shutdownState.requested) return;
 
-		if (extensionRunner?.hasHandlers("session_shutdown")) {
-			await extensionRunner.emit({ type: "session_shutdown" });
+		if (session.extensionRunner?.hasHandlers("session_shutdown")) {
+			await session.extensionRunner.emit({ type: "session_shutdown" });
 		}
 
 		process.exit(0);

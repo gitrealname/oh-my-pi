@@ -216,7 +216,6 @@ const nativeBindings = loadNative();
 // classes
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
-export const PhotonImage = nativeBindings.PhotonImage;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
 export const Shell = nativeBindings.Shell;
@@ -239,15 +238,19 @@ export const hasMatch = nativeBindings.hasMatch;
 export const highlightCode = nativeBindings.highlightCode;
 export const htmlToMarkdown = nativeBindings.htmlToMarkdown;
 export const invalidateFsScanCache = nativeBindings.invalidateFsScanCache;
+export const isoBackend = nativeBindings.isoBackend;
+export const isoDiff = nativeBindings.isoDiff;
+export const isoIsUnavailableError = nativeBindings.isoIsUnavailableError;
+export const isoProbe = nativeBindings.isoProbe;
+export const isoResolve = nativeBindings.isoResolve;
+export const isoStart = nativeBindings.isoStart;
+export const isoStop = nativeBindings.isoStop;
 export const listWorkspace = nativeBindings.listWorkspace;
 export const matchesKey = nativeBindings.matchesKey;
 export const matchesKittySequence = nativeBindings.matchesKittySequence;
 export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
-export const projfsOverlayProbe = nativeBindings.projfsOverlayProbe;
-export const projfsOverlayStart = nativeBindings.projfsOverlayStart;
-export const projfsOverlayStop = nativeBindings.projfsOverlayStop;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
 export const sanitizeText = nativeBindings.sanitizeText;
 export const search = nativeBindings.search;
@@ -286,11 +289,20 @@ export const GrepOutputMode = {
 	Count: "count",
 	FilesWithMatches: "filesWithMatches",
 };
-export const ImageFormat = {
-	PNG: 0,
-	JPEG: 1,
-	WEBP: 2,
-	GIF: 3,
+export const IsoBackendKind = {
+	Apfs: 0,
+	Btrfs: 1,
+	Zfs: 2,
+	LinuxReflink: 3,
+	Overlayfs: 4,
+	WindowsBlockClone: 5,
+	Projfs: 6,
+	Rcopy: 7,
+};
+export const IsoChangeKind = {
+	Added: 0,
+	Modified: 1,
+	Removed: 2,
 };
 export const KeyEventType = {
 	Press: 1,
@@ -304,12 +316,5 @@ export const MacOSAppearance = {
 export const ProcessStatus = {
 	Running: "running",
 	Exited: "exited",
-};
-export const SamplingFilter = {
-	Nearest: 1,
-	Triangle: 2,
-	CatmullRom: 3,
-	Gaussian: 4,
-	Lanczos3: 5,
 };
 // --- end generated native exports ---

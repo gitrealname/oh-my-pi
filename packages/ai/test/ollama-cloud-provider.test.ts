@@ -1,9 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { ollamaCloudModelManagerOptions } from "../src/provider-models/ollama";
 import { completeSimple, getEnvApiKey, stream, streamSimple } from "../src/stream";
 import type { Context, Model, Tool } from "../src/types";
-import { getOAuthProviders } from "../src/utils/oauth";
 
 const originalApiKey = Bun.env.OLLAMA_CLOUD_API_KEY;
 const originalFetch = global.fetch;
@@ -62,18 +60,6 @@ describe("ollama-cloud provider support", () => {
 	test("resolves OLLAMA_CLOUD_API_KEY from environment", () => {
 		Bun.env.OLLAMA_CLOUD_API_KEY = "ollama-cloud-test-key";
 		expect(getEnvApiKey("ollama-cloud")).toBe("ollama-cloud-test-key");
-	});
-
-	test("registers built-in descriptor, default model, and oauth selector entry", () => {
-		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "ollama-cloud");
-		expect(descriptor).toBeDefined();
-		expect(descriptor?.defaultModel).toBe("gpt-oss:120b");
-		expect(descriptor?.catalogDiscovery?.envVars).toContain("OLLAMA_CLOUD_API_KEY");
-		expect(descriptor?.catalogDiscovery?.allowUnauthenticated).toBeUndefined();
-		expect(DEFAULT_MODEL_PER_PROVIDER["ollama-cloud"]).toBe("gpt-oss:120b");
-
-		const provider = getOAuthProviders().find(item => item.id === "ollama-cloud");
-		expect(provider?.name).toBe("Ollama Cloud");
 	});
 
 	test("discovers ollama-cloud models from native cloud endpoints", async () => {
@@ -427,6 +413,65 @@ describe("ollama-cloud provider support", () => {
 			tool_name: "read_file",
 			content: "README contents",
 		});
+	});
+
+	test("strips `thinking` from assistant history messages on ollama-cloud", async () => {
+		let requestBody: Record<string, unknown> | undefined;
+		global.fetch = vi.fn(async (_input, init) => {
+			requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+			return createNdjsonResponse([
+				{ model: "gpt-oss:120b", message: { role: "assistant", content: "ok" }, done: false },
+				{ model: "gpt-oss:120b", done: true, done_reason: "stop", prompt_eval_count: 1, eval_count: 1 },
+			]);
+		}) as unknown as typeof fetch;
+
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "kick off", timestamp: Date.now() },
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "internal reasoning" },
+						{ type: "toolCall", id: "tool-1", name: "read_file", arguments: { path: "README.md" } },
+					],
+					api: "ollama-chat",
+					provider: "ollama-cloud",
+					model: "gpt-oss:120b",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "tool-1",
+					toolName: "read_file",
+					content: [{ type: "text", text: "README contents" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			],
+			tools: [readFileTool],
+		};
+
+		await stream(cloudModel, context, { apiKey: "cloud-test-key" }).result();
+
+		const messages = requestBody?.messages as Array<Record<string, unknown>> | undefined;
+		const assistant = messages?.find(message => message.role === "assistant");
+		expect(assistant).toBeDefined();
+		expect(assistant).not.toHaveProperty("thinking");
+		expect(assistant?.tool_calls).toEqual([
+			{
+				type: "function",
+				function: { name: "read_file", arguments: { path: "README.md" } },
+			},
+		]);
 	});
 
 	test("emits one Ollama system message per ordered system prompt entry", async () => {

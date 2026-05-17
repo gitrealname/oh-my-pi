@@ -1,5 +1,13 @@
 #!/usr/bin/env bun
+import { installH2Fetch } from "@oh-my-pi/pi-ai";
 import { APP_NAME, MIN_BUN_VERSION, procmgr, VERSION } from "@oh-my-pi/pi-utils";
+
+// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
+// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
+// can't toggle from JS, so we patch globalThis.fetch to pass
+// `protocol: "http2"` per request, with transparent HTTP/1.1 fallback on
+// `HTTP2Unsupported`. See @oh-my-pi/pi-ai/utils/h2-fetch for details.
+installH2Fetch();
 
 // Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
 // Otherwise every child bun process (subagents, plugin installs, ptree spawns,
@@ -12,37 +20,10 @@ procmgr.scrubProcessEnv();
  */
 import { type CommandEntry, run } from "@oh-my-pi/pi-utils/cli";
 
-function parseSemver(version: string): [number, number, number] {
-	function toint(value: string): number {
-		const int = Number.parseInt(value, 10);
-		if (Number.isNaN(int) || !Number.isFinite(int)) return 0;
-		return int;
-	}
-	const [majorRaw, minorRaw, patchRaw] = version.split(".").map(toint);
-	return [majorRaw, minorRaw, patchRaw];
-}
-
-function isAtLeastBunVersion(minimum: string): boolean {
-	const ver = parseSemver(Bun.version);
-	const min = parseSemver(minimum);
-	for (let i = 0; i < 3; i++) {
-		if (ver[i] !== min[i]) {
-			return ver[i] > min[i];
-		}
-	}
-	return true;
-}
-
-if (typeof Bun.JSONL?.parseChunk !== "function" || !isAtLeastBunVersion(MIN_BUN_VERSION)) {
+if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
-		`error: Bun runtime must be >= ${MIN_BUN_VERSION} (found v${Bun.version}). Please update Bun: bun upgrade\n`,
+		`error: Bun runtime must be >= ${MIN_BUN_VERSION} (found v${Bun.version}). Please upgrade: bun upgrade\n`,
 	);
-	process.exit(1);
-}
-
-// Detect known Bun errata that cause TUI crashes (e.g. Bun.stringWidth mishandling OSC sequences).
-if (Bun.stringWidth("\x1b[0m\x1b]8;;\x07") !== 0) {
-	process.stderr.write(`error: Bun runtime errata detected (v${Bun.version}). Please update Bun: bun upgrade\n`);
 	process.exit(1);
 }
 
@@ -50,12 +31,12 @@ process.title = APP_NAME;
 
 const commands: CommandEntry[] = [
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
+	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "agents", load: () => import("./commands/agents").then(m => m.default) },
 	{ name: "commit", load: () => import("./commands/commit").then(m => m.default) },
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "grep", load: () => import("./commands/grep").then(m => m.default) },
 	{ name: "grievances", load: () => import("./commands/grievances").then(m => m.default) },
-	{ name: "jupyter", load: () => import("./commands/jupyter").then(m => m.default) },
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
 	{ name: "shell", load: () => import("./commands/shell").then(m => m.default) },
@@ -85,8 +66,30 @@ function isSubcommand(first: string | undefined): boolean {
 	return commands.some(e => e.name === first || e.aliases?.includes(first));
 }
 
+/**
+ * Smoke-test entry. Spawns the stats sync worker, pings it, exits.
+ *
+ * Purpose: catch the silent worker-load regressions that hit compiled
+ * binaries (issues #1011 and #1027). Neither `--version` nor
+ * `stats --summary` actually spawns a Worker on a fresh install — the
+ * sync path early-returns when no session files exist. This probe is the
+ * minimal end-to-end test that proves `new Worker(...)` resolves and the
+ * bundled worker module evaluates successfully. Wired into
+ * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball
+ * installs all exercise it on every CI run.
+ */
+async function runSmokeTest(): Promise<void> {
+	const { smokeTestSyncWorker } = await import("@oh-my-pi/omp-stats");
+	await smokeTestSyncWorker();
+	process.stdout.write("smoke-test: ok\n");
+}
+
 /** Run the CLI with the given argv (no `process.argv` prefix). */
-export function runCli(argv: string[]): Promise<void> {
+export async function runCli(argv: string[]): Promise<void> {
+	if (argv[0] === "--smoke-test") {
+		await runSmokeTest();
+		return;
+	}
 	// --help and --version are handled by run() directly, don't rewrite those.
 	// Everything else that isn't a known subcommand routes to "launch".
 	const first = argv[0];

@@ -465,6 +465,46 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"tools.artifactHeadBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "tools",
+			label: "Artifact head size (KB)",
+			description:
+				"Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+			options: [
+				{ value: "0", label: "0 KB", description: "Disabled; tail-only truncation" },
+				{ value: "1", label: "1 KB", description: "~250 tokens" },
+				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "200", label: "200 KB", description: "~50K tokens" },
+			],
+		},
+	},
+	"tools.outputMaxColumns": {
+		type: "number",
+		default: 768,
+		ui: {
+			tab: "tools",
+			label: "Output column cap",
+			description:
+				"Per-line byte cap for streaming tool outputs (bash, ssh, python, js eval) and `read`. Lines wider than this are ellipsis-truncated; remaining bytes up to the next newline are dropped. 0 disables.",
+			options: [
+				{ value: "0", label: "Off", description: "No per-line cap" },
+				{ value: "256", label: "256", description: "Tight" },
+				{ value: "512", label: "512" },
+				{ value: "768", label: "768", description: "Default" },
+				{ value: "1024", label: "1024" },
+				{ value: "2048", label: "2048" },
+				{ value: "4096", label: "4096", description: "Loose" },
+			],
+		},
+	},
 	"tools.artifactTailLines": {
 		type: "number",
 		default: 500,
@@ -910,7 +950,7 @@ export const SETTINGS_SCHEMA = {
 
 	"ask.timeout": {
 		type: "number",
-		default: 30,
+		default: 0,
 		ui: {
 			tab: "interaction",
 			label: "Ask Timeout",
@@ -1504,7 +1544,7 @@ export const SETTINGS_SCHEMA = {
 
 	"read.defaultLimit": {
 		type: "number",
-		default: 500,
+		default: 300,
 		ui: {
 			tab: "editing",
 			label: "Default Read Limit",
@@ -1665,16 +1705,6 @@ export const SETTINGS_SCHEMA = {
 			tab: "editing",
 			label: "Python Kernel Mode",
 			description: "Whether to keep IPython kernel alive across calls",
-		},
-	},
-
-	"python.sharedGateway": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "editing",
-			label: "Shared Python Gateway",
-			description: "Share IPython kernel gateway across pi instances",
 		},
 	},
 
@@ -1877,6 +1907,37 @@ export const SETTINGS_SCHEMA = {
 			label: "GitHub CLI",
 			description:
 				"Enable the github tool (op-based dispatch for repository, issue, pull request, diff, search, checkout, push, and Actions watch workflows)",
+		},
+	},
+
+	"github.cache.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "GitHub view cache",
+			description: "Cache rendered issue/PR view output in ~/.omp/cache/github-cache.db so repeated reads are free",
+		},
+	},
+
+	"github.cache.softTtlSec": {
+		type: "number",
+		default: 300,
+		ui: {
+			tab: "tools",
+			label: "GitHub cache soft TTL (seconds)",
+			description: "Within this window, cached issue/PR view rows are returned directly. Default 5 minutes.",
+		},
+	},
+
+	"github.cache.hardTtlSec": {
+		type: "number",
+		default: 604800,
+		ui: {
+			tab: "tools",
+			label: "GitHub cache hard TTL (seconds)",
+			description:
+				"Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
 		},
 	},
 
@@ -2172,25 +2233,46 @@ export const SETTINGS_SCHEMA = {
 	// Delegation
 	"task.isolation.mode": {
 		type: "enum",
-		values: ["none", "worktree", "fuse-overlay", "fuse-projfs"] as const,
+		values: [
+			"none",
+			"auto",
+			"apfs",
+			"btrfs",
+			"zfs",
+			"reflink",
+			"overlayfs",
+			"projfs",
+			"block-clone",
+			"rcopy",
+		] as const,
 		default: "none",
 		ui: {
 			tab: "tasks",
 			label: "Isolation Mode",
 			description:
-				"Isolation mode for subagents (none, git worktree, fuse-overlayfs on Unix, or ProjFS on Windows via fuse-projfs; unsupported modes fall back to worktree)",
+				'Isolation backend for subagents. "auto" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).',
 			options: [
 				{ value: "none", label: "None", description: "No isolation" },
-				{ value: "worktree", label: "Worktree", description: "Git worktree isolation" },
+				{ value: "auto", label: "Auto", description: "Let the PAL pick the best available backend" },
+				{ value: "apfs", label: "APFS", description: "macOS clonefile reflink (APFS)" },
+				{ value: "btrfs", label: "btrfs", description: "btrfs subvolume snapshot" },
+				{ value: "zfs", label: "ZFS", description: "ZFS snapshot + clone" },
+				{ value: "reflink", label: "Reflink", description: "Linux FICLONE per-file reflink" },
 				{
-					value: "fuse-overlay",
-					label: "Fuse Overlay",
-					description: "COW overlay via fuse-overlayfs (Unix only)",
+					value: "overlayfs",
+					label: "Overlayfs",
+					description: "Linux kernel overlay (or fuse-overlayfs fallback)",
+				},
+				{ value: "projfs", label: "ProjFS", description: "Windows Projected File System" },
+				{
+					value: "block-clone",
+					label: "Block clone",
+					description: "Windows FSCTL_DUPLICATE_EXTENTS_TO_FILE (NTFS/ReFS)",
 				},
 				{
-					value: "fuse-projfs",
-					label: "Fuse ProjFS",
-					description: "COW overlay via ProjFS (Windows only; falls back to worktree if unavailable)",
+					value: "rcopy",
+					label: "Recursive copy",
+					description: "git worktree if available, otherwise recursive copy",
 				},
 			],
 		},

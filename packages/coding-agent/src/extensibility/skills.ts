@@ -6,14 +6,20 @@ import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
+import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
-
 export interface Skill {
 	name: string;
 	description: string;
 	filePath: string;
 	baseDir: string;
 	source: string;
+	/**
+	 * When `true`, the skill is loaded and reachable via `skill://<name>` and
+	 * (when enabled) `/skill:<name>`, but is excluded from the rendered system
+	 * prompt's `<skills>` listing.
+	 */
+	hide?: boolean;
 	/** Source metadata for display */
 	_source?: SourceMeta;
 }
@@ -26,6 +32,26 @@ export interface SkillWarning {
 export interface LoadSkillsResult {
 	skills: Skill[];
 	warnings: SkillWarning[];
+}
+
+let activeSkills: readonly Skill[] = [];
+
+/**
+ * Process-global snapshot of skills the active session loaded.
+ * Read by internal URL protocol handlers (skill://).
+ */
+export function getActiveSkills(): readonly Skill[] {
+	return activeSkills;
+}
+
+/** Replace the active skill snapshot. Called once per top-level session. */
+export function setActiveSkills(value: readonly Skill[]): void {
+	activeSkills = value;
+}
+
+/** Reset the active skill snapshot. Test-only. */
+export function resetActiveSkillsForTests(): void {
+	activeSkills = [];
 }
 
 export interface LoadSkillsFromDirOptions {
@@ -56,6 +82,7 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 			filePath: capSkill.path,
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: options.source,
+			hide: capSkill.frontmatter?.hide === true,
 			_source: capSkill._source,
 		})),
 		warnings: (result.warnings ?? []).map(message => ({ skillPath: options.dir, message })),
@@ -170,6 +197,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				filePath: capSkill.path,
 				baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 				source: `${capSkill._source.provider}:${capSkill.level}`,
+				hide: capSkill.frontmatter?.hide === true,
 				_source: capSkill._source,
 			});
 			realPathSet.add(resolvedPath);
@@ -206,6 +234,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 					filePath: capSkill.path,
 					baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 					source: "custom:user",
+					hide: capSkill.frontmatter?.hide === true,
 					_source: { ...capSkill._source, providerName: "Custom" },
 				},
 				path: capSkill.path,
@@ -248,5 +277,37 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	return {
 		skills,
 		warnings: [...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })), ...collisionWarnings],
+	};
+}
+
+export interface BuiltSkillPromptMessage {
+	message: string;
+	details: SkillPromptDetails;
+}
+
+export function getSkillSlashCommandName(skill: Pick<Skill, "name">): string {
+	return `skill:${skill.name}`;
+}
+
+export async function buildSkillPromptMessage(
+	skill: Pick<Skill, "name" | "filePath">,
+	args: string,
+): Promise<BuiltSkillPromptMessage> {
+	const content = await Bun.file(skill.filePath).text();
+	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+	const metaLines = [`Skill: ${skill.filePath}`];
+	const trimmedArgs = args.trim();
+	if (trimmedArgs) {
+		metaLines.push(`User: ${trimmedArgs}`);
+	}
+	const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
+	return {
+		message,
+		details: {
+			name: skill.name,
+			path: skill.filePath,
+			args: trimmedArgs || undefined,
+			lineCount: body ? body.split("\n").length : 0,
+		},
 	};
 }

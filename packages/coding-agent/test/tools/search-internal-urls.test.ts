@@ -3,11 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ArtifactProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/artifact-protocol";
-import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
-import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
+import { InternalUrlRouter, LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/find";
 import { SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
+import { AgentRegistry } from "../../src/registry/agent-registry";
 
 function getResultText(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
@@ -24,10 +24,27 @@ describe("SearchTool internal URL resolution", () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "grep-test-"));
 		artifactsDir = path.join(tmpDir, "artifacts");
 		await fs.mkdir(artifactsDir);
+
+		AgentRegistry.resetGlobalForTests();
+		LocalProtocolHandler.resetOverrideForTests();
+		InternalUrlRouter.resetForTests();
+
+		// Register a synthetic main session so artifact:// can derive
+		// `artifactsDir` from its sessionFile (sessionFile.slice(0,-6)).
+		AgentRegistry.global().register({
+			id: "test-main",
+			displayName: "test",
+			kind: "main",
+			session: null,
+			sessionFile: `${artifactsDir}.jsonl`,
+		});
 	});
 
 	afterEach(async () => {
 		await fs.rm(tmpDir, { recursive: true, force: true });
+		AgentRegistry.resetGlobalForTests();
+		LocalProtocolHandler.resetOverrideForTests();
+		InternalUrlRouter.resetForTests();
 	});
 
 	function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
@@ -41,18 +58,11 @@ describe("SearchTool internal URL resolution", () => {
 		};
 	}
 
-	function createRouterWithArtifacts(): InternalUrlRouter {
-		const router = new InternalUrlRouter();
-		router.register(new ArtifactProtocolHandler({ getArtifactsDir: () => artifactsDir }));
-		return router;
-	}
-
 	it("resolves artifact:// URL to backing file and greps it", async () => {
 		const content = "line one\nfound the needle here\nline three\n";
 		await Bun.write(path.join(artifactsDir, "5.bash.log"), content);
 
-		const router = createRouterWithArtifacts();
-		const session = createSession({ internalRouter: router });
+		const session = createSession();
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -68,8 +78,7 @@ describe("SearchTool internal URL resolution", () => {
 		const content = "ERROR: connection refused\nWARN: timeout\nERROR: disk full\nINFO: ok\n";
 		await Bun.write(path.join(artifactsDir, "3.python.log"), content);
 
-		const router = createRouterWithArtifacts();
-		const session = createSession({ internalRouter: router });
+		const session = createSession();
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -85,31 +94,18 @@ describe("SearchTool internal URL resolution", () => {
 	});
 
 	it("throws when internal URL has no sourcePath", async () => {
-		const router = new InternalUrlRouter();
-		router.register({
-			scheme: "agent",
-			immutable: true,
-			async resolve() {
-				return {
-					url: "agent://0",
-					content: "some content",
-					contentType: "text/plain" as const,
-				};
-			},
-		});
-
-		const session = createSession({ internalRouter: router });
+		const session = createSession();
 		const tool = new SearchTool(session);
 
-		expect(tool.execute("test-call", { pattern: "foo", paths: ["agent://0"] })).rejects.toThrow(
-			"Cannot search internal URL without a backing file",
+		expect(tool.execute("test-call", { pattern: "foo", paths: ["artifact://999"] })).rejects.toThrow(
+			"Artifact 999 not found",
 		);
 	});
 
 	it("falls back to normal path resolution when no internalRouter", async () => {
 		await Bun.write(path.join(tmpDir, "test.txt"), "hello world\n");
 
-		const session = createSession(); // no internalRouter
+		const session = createSession();
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -124,8 +120,7 @@ describe("SearchTool internal URL resolution", () => {
 	it("falls back to normal resolution for non-internal URLs", async () => {
 		await Bun.write(path.join(tmpDir, "data.log"), "some data here\n");
 
-		const router = createRouterWithArtifacts();
-		const session = createSession({ internalRouter: router });
+		const session = createSession();
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -141,8 +136,7 @@ describe("SearchTool internal URL resolution", () => {
 		const content = "alpha line\nbeta needle line\ngamma line\n";
 		await Bun.write(path.join(artifactsDir, "9.bash.log"), content);
 
-		const router = createRouterWithArtifacts();
-		const session = createSession({ internalRouter: router, hasEditTool: true });
+		const session = createSession({ hasEditTool: true });
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -156,19 +150,32 @@ describe("SearchTool internal URL resolution", () => {
 		expect(text).not.toMatch(/^\*?\s*\d+[a-z]{2}\|/m);
 	});
 
+	it("resolves local:// URLs before file-name lookup", async () => {
+		const localRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(localRoot, { recursive: true });
+		await Bun.write(path.join(localRoot, "PLAN.md"), "# Plan\n");
+
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const session = createSession();
+		const tool = new FindTool(session);
+
+		const result = await tool.execute("test-call", {
+			paths: ["local://PLAN.md"],
+		});
+
+		const text = getResultText(result);
+		expect(text).toContain("PLAN.md");
+	});
+
 	it("keeps hashline anchors when searching mutable local:// sources", async () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "plan.md"), "alpha line\nbeta needle line\ngamma line\n");
 
-		const router = new InternalUrlRouter();
-		router.register(
-			new LocalProtocolHandler({
-				getArtifactsDir: () => artifactsDir,
-				getSessionId: () => "session",
-			}),
-		);
-		const session = createSession({ internalRouter: router, hasEditTool: true });
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
+
+		const session = createSession({ hasEditTool: true });
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -187,8 +194,7 @@ describe("SearchTool internal URL resolution", () => {
 		await Bun.write(path.join(artifactsDir, "11.bash.log"), content);
 		await Bun.write(path.join(tmpDir, "mixed.txt"), "mixed needle line\n");
 
-		const router = createRouterWithArtifacts();
-		const session = createSession({ internalRouter: router, hasEditTool: true });
+		const session = createSession({ hasEditTool: true });
 		const tool = new SearchTool(session);
 
 		const result = await tool.execute("test-call", {
@@ -203,8 +209,7 @@ describe("SearchTool internal URL resolution", () => {
 	});
 
 	it("throws on nonexistent artifact ID", async () => {
-		const router = createRouterWithArtifacts();
-		const session = createSession({ internalRouter: router });
+		const session = createSession();
 		const tool = new SearchTool(session);
 
 		expect(tool.execute("test-call", { pattern: "foo", paths: ["artifact://999"] })).rejects.toThrow(

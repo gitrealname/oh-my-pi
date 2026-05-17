@@ -64,7 +64,7 @@ type _CheckExhaustive =
 			? true
 			: ["ApiOptionsMap is missing some KnownApi values", Exclude<KnownApi, keyof ApiOptionsMap>]
 		: ["ApiOptionsMap doesn't extend Record<KnownApi, StreamOptions>"];
-const _exhaustive: _CheckExhaustive = true;
+true satisfies _CheckExhaustive;
 export type OptionsForApi<TApi extends Api> =
 	| StreamOptions
 	| (TApi extends keyof ApiOptionsMap ? ApiOptionsMap[TApi] : never);
@@ -173,6 +173,18 @@ export function shouldSendServiceTier(
 		return false;
 	}
 	return serviceTier === "flex" || serviceTier === "scale" || serviceTier === "priority";
+}
+
+/**
+ * Premium-request weight contributed by sending a `priority` service tier to
+ * a provider that supports it. Mirrors GitHub Copilot's `premiumRequests`
+ * accounting so the "premium requests" stat aggregates priority traffic too.
+ *
+ * Returns 1 per priority request, 0 otherwise. Non-priority tiers (`flex`,
+ * `scale`) and providers that ignore `service_tier` always return 0.
+ */
+export function getPriorityPremiumRequests(serviceTier?: ServiceTier | null, provider?: Provider): number {
+	return shouldSendServiceTier(serviceTier, provider) && serviceTier === "priority" ? 1 : 0;
 }
 
 export interface ProviderSessionState {

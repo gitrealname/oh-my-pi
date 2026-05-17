@@ -4,7 +4,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type Agent, type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type Agent, type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import {
 	type AssistantMessage,
 	type ImageContent,
@@ -39,17 +39,23 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import { BUILTIN_SLASH_COMMANDS, getBuiltinSlashCommands, loadSlashCommands } from "../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import { renameApprovedPlanFile } from "../plan-mode/approved-plan";
+import { normalizePlanTitle, type PlanApprovalDetails, renameApprovedPlanFile } from "../plan-mode/approved-plan";
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
+	type: "text",
+};
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { CompactionOutcome } from "../session/compaction";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
 import { STTController, type SttState } from "../stt";
-import type { ExitPlanModeDetails, LspStartupServerInfo } from "../tools";
+import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
+import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
-import { type EventBus, SCHEDULE_SLASH_CHANNEL } from "../utils/event-bus";
+import { ToolError } from "../tools/tool-errors";
+import { type EventBus, PIPE_TUI_OUTPUT_CHANNEL, type TuiOutputPayload, SCHEDULE_SLASH_CHANNEL } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
@@ -267,7 +273,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				}),
 				eventBus.on(SCHEDULE_SLASH_CHANNEL, data => {
 					const command = typeof data === "string" ? data : null;
-					if (command) void this.session.waitForIdle().then(() => this.editor.onSubmit?.(command));
+					logger.debug("[interactive] SCHEDULE_SLASH_CHANNEL", { command, hasOnSubmit: !!this.editor.onSubmit });
+					if (command) void this.session.waitForIdle().then(() => {
+						logger.debug("[interactive] SCHEDULE_SLASH executing", { command });
+						this.editor.onSubmit?.(command);
+					});
 				}),
 			);
 		}
@@ -935,8 +945,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		const planFilePath = options?.planFilePath ?? (await this.#getPlanFilePath());
 		const previousTools = this.session.getActiveToolNames();
-		const hasExitTool = this.session.getToolByName("exit_plan_mode") !== undefined;
-		const planTools = hasExitTool ? [...previousTools, "exit_plan_mode"] : previousTools;
+		const hasResolveTool = this.session.getToolByName("resolve") !== undefined;
+		const planTools = hasResolveTool ? [...previousTools, "resolve"] : previousTools;
 		const uniquePlanTools = [...new Set(planTools)];
 
 		this.#planModePreviousTools = previousTools;
@@ -950,6 +960,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			workflow: options?.workflow ?? "parallel",
 			reentry: this.#planModeHasEntered,
 		});
+		this.session.setStandingResolveHandler?.(input => this.#runPlanApprovalResolve(input));
 		if (this.session.isStreaming) {
 			await this.session.sendPlanModeContext({ deliverAs: "steer" });
 		}
@@ -958,6 +969,47 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#updatePlanModeStatus();
 		this.sessionManager.appendModeChange("plan", { planFilePath });
 		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+	}
+
+	/** Standing resolve dispatcher registered while plan mode is active. The agent
+	 *  submits the finalized plan by calling `resolve { action: "apply", extra: { title } }`;
+	 *  this handler validates the plan file exists, normalizes the title, and shapes the
+	 *  payload that `event-controller` forwards to `handlePlanApproval`. */
+	#runPlanApprovalResolve(input: unknown): Promise<AgentToolResult<ResolveToolDetails>> {
+		return runResolveInvocation(input as Parameters<typeof runResolveInvocation>[0], {
+			sourceToolName: "plan_approval",
+			label: "Plan ready for approval",
+			apply: async (_reason, extra) => {
+				const state = this.session.getPlanModeState?.();
+				if (!state?.enabled) {
+					throw new ToolError("Plan mode is not active.");
+				}
+				const title = extra?.title;
+				if (typeof title !== "string" || title.trim() === "") {
+					throw new ToolError(
+						'Plan approval requires `extra: { title: "<PLAN_TITLE>" }`. Provide a title with letters, numbers, underscores, or hyphens only.',
+					);
+				}
+				const normalized = normalizePlanTitle(title);
+				const planFilePath = state.planFilePath;
+				const planContent = await this.#readPlanFile(planFilePath);
+				if (planContent === null) {
+					throw new ToolError(
+						`Plan file not found at ${planFilePath}. Write the finalized plan to ${planFilePath} before requesting approval.`,
+					);
+				}
+				const details: PlanApprovalDetails = {
+					planFilePath,
+					finalPlanFilePath: `local://${normalized.fileName}`,
+					title: normalized.title,
+					planExists: true,
+				};
+				return {
+					content: [{ type: "text" as const, text: "Plan ready for approval." }],
+					details,
+				};
+			},
+		});
 	}
 
 	async #exitPlanMode(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
@@ -995,6 +1047,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 			}
 		}
+		this.session.setStandingResolveHandler?.(null);
 		this.session.setPlanModeState(undefined);
 		this.planModeEnabled = false;
 		this.planModePaused = options?.paused ?? false;
@@ -1118,7 +1171,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #approvePlan(
 		planContent: string,
-		options: { planFilePath: string; finalPlanFilePath: string; preserveContext?: boolean },
+		options: {
+			planFilePath: string;
+			finalPlanFilePath: string;
+			preserveContext?: boolean;
+			compactBeforeExecute?: boolean;
+		},
 	): Promise<void> {
 		await renameApprovedPlanFile({
 			planFilePath: options.planFilePath,
@@ -1127,21 +1185,80 @@ export class InteractiveMode implements InteractiveModeContext {
 			getSessionId: () => this.sessionManager.getSessionId(),
 		});
 		const previousTools = this.#planModePreviousTools ?? this.session.getActiveToolNames();
-		await this.#exitPlanMode({ silent: true, paused: false });
-		if (!options.preserveContext) {
-			await this.handleClearCommand();
-			// The new session has a fresh local:// root — persist the approved plan there
-			// so `local://<title>.md` resolves correctly in the execution session.
-			const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
-				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-				getSessionId: () => this.sessionManager.getSessionId(),
-			});
-			await Bun.write(newLocalPath, planContent);
+
+		// Mark the pending abort caused by the plan-mode → compaction transition as
+		// silent BEFORE #exitPlanMode raises it. The `finally` below clears the
+		// flag on every terminal compaction outcome (ok / cancelled / failed /
+		// throw) so a leaked flag cannot silence a later unrelated abort.
+		// Branchless mark+clear when !compactBeforeExecute: mark is gated; clear
+		// is unconditional and idempotent.
+		if (options.compactBeforeExecute) {
+			this.session.markPlanCompactAbortPending();
 		}
+		let compactOutcome: CompactionOutcome | undefined;
+		try {
+			await this.#exitPlanMode({ silent: true, paused: false });
+
+			if (!options.preserveContext) {
+				await this.handleClearCommand();
+				// The new session has a fresh local:// root — persist the approved plan there
+				// so `local://<title>.md` resolves correctly in the execution session.
+				const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
+					getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+					getSessionId: () => this.sessionManager.getSessionId(),
+				});
+				await Bun.write(newLocalPath, planContent);
+			} else if (options.compactBeforeExecute) {
+				// Distill the plan-mode transcript before the execution turn is queued so
+				// the plan-approved synthetic prompt lands as a fresh cache anchor.
+				// Outcome is consumed after tool-restoration and plan-reference-path
+				// bookkeeping below; `markPlanReferenceSent` is intentionally deferred
+				// past the cancel guard — see the comment at the cancel branch.
+				// Cancellation skips the synthetic-prompt dispatch (operator's explicit
+				// abort is honored); failure proceeds best-effort — approval intent stands.
+				const compactionPrompt = prompt.render(planModeCompactInstructionsPrompt, {
+					planFilePath: options.finalPlanFilePath,
+				});
+				// Pin the plan reference path BEFORE compaction so any user messages
+				// queued during the compaction await (which `handleCompactCommand`
+				// flushes via `flushCompactionQueue` before returning) see the
+				// approved plan in `#buildPlanReferenceMessage`. Reassignment after
+				// the try/finally is idempotent and kept for the !compactBeforeExecute
+				// branch.
+				this.session.setPlanReferencePath(options.finalPlanFilePath);
+				compactOutcome = await this.handleCompactCommand(compactionPrompt);
+			}
+		} finally {
+			// Unconditional clear. Idempotent: a no-op when the flag was never set
+			// (i.e., the !compactBeforeExecute branch), and a no-op when the flag
+			// was already consumed by AgentSession.#handleAgentEvent's aborted
+			// message_end stamping. Guarantees the flag is dead at every exit.
+			this.session.clearPlanCompactAbortPending();
+		}
+
+		// Tool restoration runs on every path — the plan mode tools must be
+		// retired regardless of whether the synthetic prompt fires.
 		if (previousTools.length > 0) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		this.session.setPlanReferencePath(options.finalPlanFilePath);
+
+		if (compactOutcome === "cancelled") {
+			// Explicit abort: honor it. `executeCompaction` already surfaced
+			// `showError("Compaction cancelled")` to the operator; we add the
+			// deferred-dispatch warning and exit. `markPlanReferenceSent` is
+			// intentionally skipped here: `#planReferenceSent` stays false, so
+			// `AgentSession.#buildPlanReferenceMessage` will inject the plan
+			// reference on the operator's next `prompt()` call. If we marked it
+			// sent here, the executor's first turn would have no plan context.
+			this.showWarning(
+				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
+			);
+			return;
+		}
+
+		// markPlanReferenceSent fires only on the dispatch path so the synthetic
+		// plan-approved prompt is the source of the reference injection.
 		this.session.markPlanReferenceSent();
 		const planModePrompt = prompt.render(planModeApprovedPrompt, {
 			planContent,
@@ -1171,16 +1288,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async handleExitPlanModeTool(details: ExitPlanModeDetails): Promise<void> {
+	async handlePlanApproval(details: PlanApprovalDetails): Promise<void> {
 		if (!this.planModeEnabled) {
 			this.showWarning("Plan mode is not active.");
 			return;
 		}
 
-		// Abort the agent to prevent it from continuing (e.g., calling exit_plan_mode
-		// again) while the popup is showing. The event listener fires asynchronously
-		// (agent's #emit is fire-and-forget), so without this the model sees "Plan
-		// ready for approval." and immediately calls exit_plan_mode in a loop.
+		// Abort the agent to prevent it from continuing (e.g., re-submitting the
+		// plan) while the popup is showing. The event listener fires asynchronously
+		// (agent's #emit is fire-and-forget), so without this the model sees
+		// "Plan ready for approval." and immediately re-invokes `resolve` in a loop.
 		await this.session.abort();
 
 		const planFilePath = details.planFilePath || this.planModePlanFilePath || (await this.#getPlanFilePath());
@@ -1194,7 +1311,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#renderPlanPreview(planContent, { append: true });
 		const choice = await this.showHookSelector(
 			"Plan mode - next step",
-			["Approve and execute", "Approve and keep context", "Refine plan", "Stay in plan mode"],
+			[
+				"Approve and execute",
+				"Approve and compact context",
+				"Approve and keep context",
+				"Refine plan",
+				"Stay in plan mode",
+			],
 			{
 				initialIndex: 2,
 				helpText: this.#getPlanReviewHelpText(),
@@ -1202,7 +1325,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 		);
 
-		if (choice === "Approve and execute" || choice === "Approve and keep context") {
+		if (
+			choice === "Approve and execute" ||
+			choice === "Approve and compact context" ||
+			choice === "Approve and keep context"
+		) {
 			const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
 			try {
 				const latestPlanContent = await this.#readPlanFile(planFilePath);
@@ -1213,7 +1340,8 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.#approvePlan(latestPlanContent, {
 					planFilePath,
 					finalPlanFilePath,
-					preserveContext: choice === "Approve and keep context",
+					preserveContext: choice !== "Approve and execute",
+					compactBeforeExecute: choice === "Approve and compact context",
 				});
 			} catch (error) {
 				this.showError(
@@ -1380,6 +1508,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	// UI helpers
 	showStatus(message: string, options?: { dim?: boolean }): void {
 		this.#uiHelpers.showStatus(message, options);
+		this.#eventBus?.emit(PIPE_TUI_OUTPUT_CHANNEL, { level: "status", text: message } satisfies TuiOutputPayload);
 	}
 
 	showError(message: string): void {
@@ -1394,10 +1523,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.statusContainer.clear();
 		}
 		this.#uiHelpers.showError(message);
+		this.#eventBus?.emit(PIPE_TUI_OUTPUT_CHANNEL, { level: "error", text: message } satisfies TuiOutputPayload);
 	}
 
 	showWarning(message: string): void {
 		this.#uiHelpers.showWarning(message);
+		this.#eventBus?.emit(PIPE_TUI_OUTPUT_CHANNEL, { level: "warning", text: message } satisfies TuiOutputPayload);
 	}
 
 	#handleLspStartupEvent(event: LspStartupEvent): void {
@@ -1493,6 +1624,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.clearEditor();
 	}
 
+	scheduleInput(text: string): void {
+		this.#eventBus?.emit(SCHEDULE_SLASH_CHANNEL, text);
+	}
+
 	updatePendingMessagesDisplay(): void {
 		this.#uiHelpers.updatePendingMessagesDisplay();
 	}
@@ -1513,8 +1648,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#uiHelpers.isKnownSlashCommand(text);
 	}
 
-	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
-		this.#uiHelpers.addMessageToChat(message, options);
+	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[] {
+		return this.#uiHelpers.addMessageToChat(message, options);
 	}
 
 	renderSessionContext(
@@ -1738,7 +1873,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await controller.handle(text);
 	}
 
-	handleCompactCommand(customInstructions?: string): Promise<void> {
+	handleCompactCommand(customInstructions?: string): Promise<CompactionOutcome> {
 		return this.#commandController.handleCompactCommand(customInstructions);
 	}
 
@@ -1746,7 +1881,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleHandoffCommand(customInstructions);
 	}
 
-	executeCompaction(customInstructionsOrOptions?: string | CompactOptions, isAuto?: boolean): Promise<void> {
+	executeCompaction(
+		customInstructionsOrOptions?: string | CompactOptions,
+		isAuto?: boolean,
+	): Promise<CompactionOutcome> {
 		return this.#commandController.executeCompaction(customInstructionsOrOptions, isAuto);
 	}
 

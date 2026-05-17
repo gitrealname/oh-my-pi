@@ -1,19 +1,27 @@
 import { INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
-import { Loader, TERMINAL, Text } from "@oh-my-pi/pi-tui";
+import { type Component, Loader, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
-import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
+import {
+	ReadToolGroupComponent,
+	readArgsHaveTarget,
+	readArgsTargetInternalUrl,
+} from "../../modes/components/read-tool-group";
 import { TodoReminderComponent } from "../../modes/components/todo-reminder";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
+import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { calculatePromptTokens } from "../../session/compaction/compaction";
-import type { ExitPlanModeDetails } from "../../tools";
+import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
+import type { ResolveToolDetails } from "../../tools/resolve";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
+
+const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 
 type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
@@ -29,6 +37,7 @@ export class EventController {
 	#readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#lastAssistantComponent: AssistantMessageComponent | undefined = undefined;
 	#idleCompactionTimer?: NodeJS.Timeout;
+	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
 	#handlers: AgentSessionEventHandlers;
 
 	constructor(private ctx: InteractiveModeContext) {
@@ -54,11 +63,16 @@ export class EventController {
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
+			thinking_level_changed: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 
 	dispose(): void {
 		this.#cancelIdleCompaction();
+		for (const timer of this.#ircExpiryTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.#ircExpiryTimers.clear();
 	}
 
 	#resetReadGroup(): void {
@@ -167,6 +181,17 @@ export class EventController {
 			this.#renderedCustomMessages.add(signature);
 			this.#resetReadGroup();
 			this.ctx.addMessageToChat(event.message);
+			// Tag-keyed pending-bar refresh: when AgentSession.#handleAgentEvent
+			// spliced this dequeued custom message out of #steeringMessages /
+			// #followUpMessages (it ran before this emit), the array state is
+			// already correct — pendingMessagesContainer just needs to be
+			// re-rendered to match. Gated on tag presence so non-queued customs
+			// (ttsr-injection, irc:*, async-result, hookMessage) skip the
+			// rebuild; their dispatch path never registered a pending chip.
+			// Mirrors the user-role refresh at the bottom of this function.
+			if (event.message.role === "custom" && readPendingDisplayTag(event.message.details)) {
+				this.ctx.updatePendingMessagesDisplay();
+			}
 			this.ctx.ui.requestRender();
 		} else if (event.message.role === "user") {
 			const textContent = this.ctx.getUserMessageText(event.message);
@@ -222,8 +247,22 @@ export class EventController {
 		}
 		this.#renderedCustomMessages.add(signature);
 		this.#resetReadGroup();
-		this.ctx.addMessageToChat(event.message);
+		const components = this.ctx.addMessageToChat(event.message);
+		this.#scheduleIrcExpiry(signature, components);
 		this.ctx.ui.requestRender();
+	}
+
+	#scheduleIrcExpiry(signature: string, components: Component[]): void {
+		if (components.length === 0 || this.#ircExpiryTimers.has(signature)) return;
+		const timer = setTimeout(() => {
+			this.#ircExpiryTimers.delete(signature);
+			for (const component of components) {
+				this.ctx.chatContainer.removeChild(component);
+			}
+			this.ctx.ui.requestRender();
+		}, IRC_MESSAGE_VISIBLE_TTL_MS);
+		timer.unref?.();
+		this.#ircExpiryTimers.set(signature, timer);
 	}
 
 	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {
@@ -253,16 +292,25 @@ export class EventController {
 			for (const content of this.ctx.streamingMessage.content) {
 				if (content.type !== "toolCall") continue;
 				if (content.name === "read") {
-					this.#trackReadToolCall(content.id, content.arguments);
-					const component = this.ctx.pendingTools.get(content.id);
-					if (component) {
-						component.updateArgs(content.arguments, content.id);
-					} else {
-						const group = this.#getReadGroup();
-						group.updateArgs(content.arguments, content.id);
-						this.ctx.pendingTools.set(content.id, group);
+					if (!readArgsHaveTarget(content.arguments)) {
+						// Args still streaming — defer until path is parseable so we can route to the
+						// read group (regular files) vs ToolExecutionComponent (internal URLs).
+						// Creating either component now would lock the read into the wrong shape.
+						continue;
 					}
-					continue;
+					if (!readArgsTargetInternalUrl(content.arguments)) {
+						this.#trackReadToolCall(content.id, content.arguments);
+						const component = this.ctx.pendingTools.get(content.id);
+						if (component) {
+							component.updateArgs(content.arguments, content.id);
+						} else {
+							const group = this.#getReadGroup();
+							group.updateArgs(content.arguments, content.id);
+							this.ctx.pendingTools.set(content.id, group);
+						}
+						continue;
+					}
+					// Internal URL read falls through to ToolExecutionComponent below.
 				}
 
 				// Preserve the raw partial JSON for renderers that need to surface fields before the JSON object closes.
@@ -330,7 +378,15 @@ export class EventController {
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			this.ctx.streamingMessage = event.message;
 			let errorMessage: string | undefined;
-			if (this.ctx.streamingMessage.stopReason === "aborted" && !this.ctx.session.isTtsrAbortPending) {
+			const aborted = this.ctx.streamingMessage.stopReason === "aborted";
+			const silentlyAborted = aborted && isSilentAbort(this.ctx.streamingMessage.errorMessage);
+			const ttsrSilenced = aborted && this.ctx.session.isTtsrAbortPending;
+			if (aborted && !silentlyAborted && !ttsrSilenced) {
+				// Real user-cancel / network / provider abort: surface the standard
+				// operator-facing label. AgentSession.#handleAgentEvent already stamped
+				// SILENT_ABORT_MARKER for the plan-compact transition before this
+				// controller ran, so reaching this branch implies the abort was NOT a
+				// silent internal transition.
 				const retryAttempt = this.ctx.session.retryAttempt;
 				errorMessage =
 					retryAttempt > 0
@@ -338,7 +394,10 @@ export class EventController {
 						: "Operation aborted";
 				this.ctx.streamingMessage.errorMessage = errorMessage;
 			}
-			if (this.ctx.session.isTtsrAbortPending && this.ctx.streamingMessage.stopReason === "aborted") {
+			if (silentlyAborted || ttsrSilenced) {
+				// Silence the streaming render by downgrading stopReason to "stop" for
+				// display only — does NOT mutate the persisted message's stopReason
+				// (the marker on errorMessage drives replay-side suppression).
 				const msgWithoutAbort = { ...this.ctx.streamingMessage, stopReason: "stop" as const };
 				this.ctx.streamingComponent.updateContent(msgWithoutAbort);
 			} else {
@@ -363,7 +422,7 @@ export class EventController {
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {
 		this.#updateWorkingMessageFromIntent(event.intent);
 		if (!this.ctx.pendingTools.has(event.toolCallId)) {
-			if (event.toolName === "read") {
+			if (event.toolName === "read" && readArgsHaveTarget(event.args) && !readArgsTargetInternalUrl(event.args)) {
 				this.#trackReadToolCall(event.toolCallId, event.args);
 				const component = this.ctx.pendingTools.get(event.toolCallId);
 				if (component) {
@@ -488,10 +547,13 @@ export class EventController {
 				`Todo update failed${textContent ? `: ${textContent}` : ". Progress may be stale until todo_write succeeds."}`,
 			);
 		}
-		if (event.toolName === "exit_plan_mode" && !event.isError) {
-			const details = event.result.details as ExitPlanModeDetails | undefined;
-			if (details) {
-				await this.ctx.handleExitPlanModeTool(details);
+		if (event.toolName === "resolve" && !event.isError) {
+			const details = event.result.details as ResolveToolDetails | undefined;
+			if (details?.sourceToolName === "plan_approval" && details.action === "apply") {
+				const planDetails = details.sourceResultDetails as PlanApprovalDetails | undefined;
+				if (planDetails) {
+					await this.ctx.handlePlanApproval(planDetails);
+				}
 			}
 		}
 	}

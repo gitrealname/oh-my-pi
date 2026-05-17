@@ -26,9 +26,11 @@ import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md
 import { AgentRegistry } from "../registry/agent-registry";
 import { createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
-import { type ContextFileEntry, truncateTail } from "../tools";
+import { truncateTail } from "../session/streaming-output";
+import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
@@ -172,6 +174,12 @@ export interface ExecutorOptions {
 	settings?: Settings;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
+	/**
+	 * Parent session's ArtifactManager. Subagent adopts it so artifact IDs are
+	 * unique across the whole agent tree and all artifacts land in the parent's
+	 * artifacts directory (no per-subagent subdir).
+	 */
+	parentArtifactManager?: ArtifactManager;
 	parentHindsightSessionState?: HindsightSessionState;
 }
 
@@ -371,21 +379,29 @@ function firstNumberField(record: Record<string, unknown>, keys: string[]): numb
 }
 
 /**
- * Normalize usage objects from different event formats.
+ * Tokens for progress display: input + output + cacheWrite per turn.
+ *
+ * Deliberately excludes cacheRead. With prompt caching, cacheRead in each turn
+ * equals the full cached context (potentially hundreds of KB), so summing it
+ * across all turns produces a cumulative total that is N×context_size — far
+ * larger than the context window and misleading as a "work done" metric.
+ * cacheWrite is kept because each byte is written once, not repeated per turn.
+ * The cost segment handles billing; dedicated cache_read/cache_write segments
+ * handle cache-specific monitoring.
  */
 function getUsageTokens(usage: unknown): number {
 	if (!usage || typeof usage !== "object") return 0;
 	const record = usage as Record<string, unknown>;
 
-	const totalTokens = firstNumberField(record, ["totalTokens", "total_tokens"]);
-	if (totalTokens !== undefined && totalTokens > 0) return totalTokens;
-
 	const input = firstNumberField(record, ["input", "input_tokens", "inputTokens"]) ?? 0;
 	const output = firstNumberField(record, ["output", "output_tokens", "outputTokens"]) ?? 0;
-	const cacheRead = firstNumberField(record, ["cacheRead", "cache_read", "cacheReadTokens"]) ?? 0;
 	const cacheWrite = firstNumberField(record, ["cacheWrite", "cache_write", "cacheWriteTokens"]) ?? 0;
-
-	return input + output + cacheRead + cacheWrite;
+	const computed = input + output + cacheWrite;
+	if (computed > 0) return computed;
+	// Fallback for providers that only surface a pre-summed total without individual
+	// field breakdown. This total includes cacheRead, but returning it is still better
+	// than silently showing 0 for those providers.
+	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
 /**
@@ -489,6 +505,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		recentOutput: [],
 		toolCount: 0,
 		tokens: 0,
+		cost: 0,
 		durationMs: 0,
 		modelOverride,
 	};
@@ -563,6 +580,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const lspEnabled = enableLsp ?? true;
 	const ircEnabled = subagentSettings.get("irc.enabled") === true;
+	const contextFileForPrompt = ircEnabled ? undefined : options.contextFile;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
 	const outputChunks: string[] = [];
@@ -883,6 +901,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							accumulatedUsage.cost.cacheRead += getNumberField(costRecord, "cacheRead") ?? 0;
 							accumulatedUsage.cost.cacheWrite += getNumberField(costRecord, "cacheWrite") ?? 0;
 							accumulatedUsage.cost.total += getNumberField(costRecord, "total") ?? 0;
+							progress.cost = accumulatedUsage.cost.total;
 						}
 					}
 					// Accumulate tokens for progress display
@@ -938,10 +957,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 		try {
 			checkAbort();
-			const authStorage = options.authStorage ?? (await discoverAuthStorage());
-			checkAbort();
+			// Pin authStorage to modelRegistry.authStorage — mirrors the createAgentSession invariant.
 			const registryFromParent = options.modelRegistry !== undefined;
-			const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage);
+			const modelRegistry =
+				options.modelRegistry ?? new ModelRegistry(options.authStorage ?? (await discoverAuthStorage()));
+			const authStorage = modelRegistry.authStorage;
+			if (options.authStorage && options.authStorage !== authStorage) {
+				throw new Error(
+					"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
+				);
+			}
+			checkAbort();
 			if (!registryFromParent) {
 				await modelRegistry.refresh();
 			} else {
@@ -975,6 +1001,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const sessionManager = sessionFile
 				? await SessionManager.open(sessionFile)
 				: SessionManager.inMemory(worktree ?? cwd);
+			if (options.parentArtifactManager) {
+				sessionManager.adoptArtifactManager(options.parentArtifactManager);
+			}
 
 			const mcpProxyTools = options.mcpManager ? createMCPProxyTools(options.mcpManager) : [];
 			const enableMCP = !options.mcpManager;
@@ -1001,7 +1030,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						context: options.context?.trim() ?? "",
 						worktree: worktree ?? "",
 						outputSchema: normalizedOutputSchema,
-						contextFile: options.contextFile,
+						contextFile: contextFileForPrompt,
 						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
 						ircSelfId: ircEnabled ? id : "",
 					});

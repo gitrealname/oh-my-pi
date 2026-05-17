@@ -55,6 +55,10 @@ export interface EditToolPerFileResult {
 	 * Set when the underlying error carries a `displayMessage` (e.g. {@link HashlineMismatchError}). */
 	displayErrorText?: string;
 	meta?: OutputMeta;
+	/** Source-of-truth content before the edit; `undefined` for create operations. */
+	oldText?: string;
+	/** Source-of-truth content after the edit; `undefined` for delete operations. */
+	newText?: string;
 }
 
 export interface EditToolDetails {
@@ -72,6 +76,12 @@ export interface EditToolDetails {
 	meta?: OutputMeta;
 	/** Per-file results (multi-file edits) */
 	perFileResults?: EditToolPerFileResult[];
+	/** Absolute file path for single-file edit results. Required by ACP diff metadata consumers. */
+	path?: string;
+	/** Source-of-truth content before the edit; `undefined` for create operations. */
+	oldText?: string;
+	/** Source-of-truth content after the edit; `undefined` for delete operations. */
+	newText?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,6 +158,8 @@ export interface EditRenderContext {
 	editDiffPreview?: DiffResult | DiffError;
 	/** Multi-file streaming diff preview (edits spanning several files) */
 	perFileDiffPreview?: PerFileDiffPreview[];
+	/** Raw in-flight edit text shown while a computed diff preview is unavailable */
+	editStreamingFallback?: string;
 	/** Function to render diff text with syntax highlighting */
 	renderDiff?: (diffText: string, options?: { filePath?: string }) => string;
 }
@@ -272,7 +284,7 @@ function formatMultiFileStreamingDiff(previews: PerFileDiffPreview[], uiTheme: T
 	const parts: string[] = [];
 	for (const preview of previews) {
 		if (!preview.diff && !preview.error) continue;
-		const header = uiTheme.fg("dim", `\n\n\u2500\u2500 ${shortenPath(preview.path)} \u2500\u2500`);
+		const header = uiTheme.fg("dim", `\n\n── ${shortenPath(preview.path)} ──`);
 		if (preview.error) {
 			parts.push(`${header}\n${uiTheme.fg("error", replaceTabs(preview.error, preview.path))}`);
 			continue;
@@ -306,6 +318,9 @@ function getCallPreview(
 	if (args.newText || args.patch) {
 		return renderPlainTextPreview(args.newText ?? args.patch ?? "", uiTheme, rawPath);
 	}
+	if (renderContext?.editStreamingFallback) {
+		return renderContext.editStreamingFallback;
+	}
 	return "";
 }
 
@@ -325,7 +340,13 @@ function normalizeHashlineInputPreviewPath(rawPath: string): string {
 
 function parseHashlineInputPreviewHeader(line: string): string | null {
 	if (!line.startsWith(HL_INPUT_HEADER_PREFIX)) return null;
-	const body = line.slice(HL_INPUT_HEADER_PREFIX.length).trim();
+	// The real parser (`parseHashlineHeaderLine` in `hashline/input.ts`) strips
+	// every leading "@" before resolving the path so canonical "@@ PATH" headers
+	// (and stray "@ PATH" / "@@@ PATH" runs) all route to the same file. Mirror
+	// that here so the renderer doesn't surface a literal "@ " in the title.
+	let prefixEnd = 0;
+	while (prefixEnd < line.length && line[prefixEnd] === HL_INPUT_HEADER_PREFIX) prefixEnd++;
+	const body = line.slice(prefixEnd).trim();
 	const previewPath = normalizeHashlineInputPreviewPath(body);
 	return previewPath.length > 0 ? previewPath : null;
 }

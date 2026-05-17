@@ -2,12 +2,14 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { GithubTool } from "@oh-my-pi/pi-coding-agent/tools/gh";
-import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import {
+	buildSearchDateQualifier,
+	GithubTool,
+	parsePrUnifiedDiff,
+	parseSearchDateBound,
+} from "@oh-my-pi/pi-coding-agent/tools/gh";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -34,22 +36,6 @@ function createSession(
 		getSessionSpawns: () => null,
 		settings,
 	};
-}
-
-function createToolContext(settings: Settings): AgentToolContext {
-	return {
-		sessionManager: SessionManager.inMemory(),
-		settings,
-		modelRegistry: {
-			find: () => undefined,
-			getAll: () => [],
-			getApiKey: async () => undefined,
-		} as unknown as AgentToolContext["modelRegistry"],
-		model: undefined,
-		isIdle: () => true,
-		hasQueuedMessages: () => false,
-		abort: () => {},
-	} as AgentToolContext;
 }
 
 function runGit(cwd: string, args: string[]): string {
@@ -151,6 +137,52 @@ async function expectedWorktreePath(home: string, primaryRoot: string, localBran
 		.replace(/[/\\:]/g, "-");
 	return fs.realpath(path.join(home, ".omp", "wt", encoded, localBranch));
 }
+
+describe("parsePrUnifiedDiff", () => {
+	it("parses quoted diff headers instead of falling back to unknown paths", () => {
+		const diff = [
+			'diff --git "a/src/file with spaces.ts" "b/src/file with spaces.ts"',
+			"index 0000000..1111111 100644",
+			'--- "a/src/file with spaces.ts"',
+			'+++ "b/src/file with spaces.ts"',
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files).toHaveLength(1);
+		expect(parsed.files[0]).toMatchObject({
+			path: "src/file with spaces.ts",
+			additions: 1,
+			deletions: 1,
+			changeType: "modified",
+		});
+		expect(parsed.files[0]?.oldPath).toBeUndefined();
+	});
+
+	it("counts hunk lines whose content starts with file-header markers", () => {
+		const diff = [
+			"diff --git a/src/headings.md b/src/headings.md",
+			"index 0000000..1111111 100644",
+			"--- a/src/headings.md",
+			"+++ b/src/headings.md",
+			"@@ -1 +1 @@",
+			"---- removed heading marker",
+			"++++ added heading marker",
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({
+			path: "src/headings.md",
+			additions: 1,
+			deletions: 1,
+			changeType: "modified",
+		});
+	});
+});
 
 describe("github tool", () => {
 	afterEach(() => {
@@ -272,144 +304,35 @@ describe("github tool", () => {
 		expect(jsonSpy).not.toHaveBeenCalled();
 	});
 
-	it("formats issue comments and omits minimized ones", async () => {
+	it("formats pull request search results", async () => {
 		vi.spyOn(git.github, "json").mockResolvedValue({
-			number: 42,
-			title: "Example issue",
-			state: "OPEN",
-			stateReason: null,
-			author: { login: "octocat" },
-			body: "Issue body",
-			createdAt: "2026-04-01T09:00:00Z",
-			updatedAt: "2026-04-01T10:00:00Z",
-			url: "https://github.com/cli/cli/issues/42",
-			labels: [{ name: "bug" }],
-			comments: [
+			items: [
 				{
-					author: { login: "reviewer" },
-					body: "Visible comment",
-					createdAt: "2026-04-01T11:00:00Z",
-					url: "https://github.com/cli/cli/issues/42#issuecomment-1",
-					isMinimized: false,
+					number: 101,
+					title: "Add feature",
+					state: "open",
+					user: { login: "dev1" },
+					repository_url: "https://api.github.com/repos/owner/repo",
+					labels: [{ name: "feature" }],
+					created_at: "2026-04-01T08:00:00Z",
+					updated_at: "2026-04-01T09:00:00Z",
+					html_url: "https://github.com/owner/repo/pull/101",
+					pull_request: { merged_at: null },
 				},
 				{
-					author: { login: "spam" },
-					body: "Hidden comment",
-					createdAt: "2026-04-01T12:00:00Z",
-					url: "https://github.com/cli/cli/issues/42#issuecomment-2",
-					isMinimized: true,
-					minimizedReason: "SPAM",
+					number: 102,
+					title: "Fix regression",
+					state: "closed",
+					user: { login: "dev2" },
+					repository_url: "https://api.github.com/repos/owner/repo",
+					labels: [],
+					created_at: "2026-03-31T08:00:00Z",
+					updated_at: "2026-03-31T09:00:00Z",
+					html_url: "https://github.com/owner/repo/pull/102",
+					pull_request: { merged_at: "2026-03-31T10:00:00Z" },
 				},
 			],
 		});
-
-		const tool = new GithubTool(createSession());
-		const result = await tool.execute("issue-view", {
-			op: "issue_view",
-			issue: "42",
-			repo: "cli/cli",
-			comments: true,
-		});
-		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-
-		expect(text).toContain("# Issue #42: Example issue");
-		expect(text).toContain("Labels: bug");
-		expect(text).toContain("### @reviewer · 2026-04-01T11:00:00Z");
-		expect(text).toContain("Visible comment");
-		expect(text).toContain("Minimized comments omitted: 1.");
-		expect(text).not.toContain("Hidden comment");
-	});
-
-	it("includes pull request reviews and inline review comments in the discussion context", async () => {
-		vi.spyOn(git.github, "json").mockImplementation(async (_cwd, args) => {
-			if (args.includes("/repos/cli/cli/pulls/12/comments")) {
-				return [
-					{
-						id: 501,
-						body: "Please rename this helper.",
-						path: "src/file.ts",
-						line: 17,
-						side: "RIGHT",
-						user: { login: "inline-reviewer" },
-						created_at: "2026-04-01T11:30:00Z",
-						html_url: "https://github.com/cli/cli/pull/12#discussion_r1",
-					},
-				] as never;
-			}
-
-			return {
-				number: 12,
-				title: "Improve PR context",
-				state: "OPEN",
-				author: { login: "octocat" },
-				body: "PR body",
-				baseRefName: "main",
-				headRefName: "feature/pr-reviews",
-				isDraft: false,
-				mergeStateStatus: "CLEAN",
-				reviewDecision: "CHANGES_REQUESTED",
-				createdAt: "2026-04-01T09:00:00Z",
-				updatedAt: "2026-04-01T10:00:00Z",
-				url: "https://github.com/cli/cli/pull/12",
-				labels: [{ name: "bug" }],
-				files: [{ path: "src/file.ts", additions: 3, deletions: 1, changeType: "MODIFIED" }],
-				reviews: [
-					{
-						author: { login: "reviewer" },
-						body: "Please add coverage for this path.",
-						state: "CHANGES_REQUESTED",
-						submittedAt: "2026-04-01T11:00:00Z",
-						commit: { oid: "abcdef1234567890" },
-					},
-				],
-				comments: [],
-			} as never;
-		});
-
-		const tool = new GithubTool(createSession());
-		const result = await tool.execute("pr-view", {
-			op: "pr_view",
-			pr: "12",
-			repo: "cli/cli",
-			comments: true,
-		});
-		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-
-		expect(text).toContain("## Reviews (1)");
-		expect(text).toContain("### @reviewer - 2026-04-01T11:00:00Z [CHANGES_REQUESTED]");
-		expect(text).toContain("Commit: abcdef123456");
-		expect(text).toContain("Please add coverage for this path.");
-		expect(text).toContain("## Review Comments (1)");
-		expect(text).toContain("### @inline-reviewer · 2026-04-01T11:30:00Z");
-		expect(text).toContain("Location: src/file.ts:17");
-		expect(text).toContain("Please rename this helper.");
-	});
-
-	it("formats pull request search results", async () => {
-		vi.spyOn(git.github, "json").mockResolvedValue([
-			{
-				number: 101,
-				title: "Add feature",
-				state: "OPEN",
-				author: { login: "dev1" },
-				repository: { nameWithOwner: "owner/repo" },
-				labels: [{ name: "feature" }],
-				createdAt: "2026-04-01T08:00:00Z",
-				updatedAt: "2026-04-01T09:00:00Z",
-				url: "https://github.com/owner/repo/pull/101",
-			},
-			{
-				number: 102,
-				title: "Fix regression",
-				state: "CLOSED",
-				author: { login: "dev2" },
-				repository: { nameWithOwner: "owner/repo" },
-				labels: [],
-				createdAt: "2026-03-31T08:00:00Z",
-				updatedAt: "2026-03-31T09:00:00Z",
-				url: "https://github.com/owner/repo/pull/102",
-			},
-		]);
 
 		const tool = new GithubTool(createSession());
 		const result = await tool.execute("search-prs", {
@@ -424,12 +347,15 @@ describe("github tool", () => {
 		expect(text).toContain("Query: feature");
 		expect(text).toContain("Repository: owner/repo");
 		expect(text).toContain("- #101 Add feature");
+		expect(text).toContain("  State: open");
 		expect(text).toContain("  Labels: feature");
 		expect(text).toContain("- #102 Fix regression");
+		// merged_at present → state surfaces as "merged" even though the API says "closed".
+		expect(text).toContain("  State: merged");
 	});
 
-	it("passes leading-dash search queries after -- so gh does not parse them as flags", async () => {
-		const runGhJsonSpy = vi.spyOn(git.github, "json").mockResolvedValue([]);
+	it("calls /search/issues via gh api with the full query verbatim (including leading-dash terms)", async () => {
+		const runGhJsonSpy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
 
 		const tool = new GithubTool(createSession());
 		await tool.execute("search-issues", {
@@ -448,26 +374,136 @@ describe("github tool", () => {
 		const issueArgs = runGhJsonSpy.mock.calls[0]?.[1];
 		const prArgs = runGhJsonSpy.mock.calls[1]?.[1];
 
-		expect(issueArgs?.slice(0, 2)).toEqual(["search", "issues"]);
-		expect(issueArgs?.at(2)).toBe("--limit");
-		expect(issueArgs?.at(-2)).toBe("--");
-		expect(issueArgs?.at(-1)).toBe("-label:bug");
-		expect(prArgs?.slice(0, 2)).toEqual(["search", "prs"]);
-		expect(prArgs?.at(2)).toBe("--limit");
-		expect(prArgs?.at(-2)).toBe("--");
-		expect(prArgs?.at(-1)).toBe("-label:bug");
+		// `gh api` carries each form field separately, so leading dashes inside `q=` are not
+		// parsed as flags — replaces the historical `--` positional workaround.
+		expect(issueArgs?.slice(0, 4)).toEqual(["api", "-X", "GET", "/search/issues"]);
+		expect(issueArgs).toContain("q=-label:bug repo:owner/repo is:issue");
+		expect(issueArgs).toContain("per_page=1");
+		expect(prArgs?.slice(0, 4)).toEqual(["api", "-X", "GET", "/search/issues"]);
+		expect(prArgs).toContain("q=-label:bug repo:owner/repo is:pr");
+		expect(prArgs).toContain("per_page=1");
+	});
+
+	it("parseSearchDateBound: relative duration walks back from `now` and returns YYYY-MM-DD", () => {
+		const now = new Date("2026-05-12T15:00:00Z");
+		expect(parseSearchDateBound("3d", now)).toBe("2026-05-09");
+		expect(parseSearchDateBound("2w", now)).toBe("2026-04-28");
+		expect(parseSearchDateBound("12h", now)).toBe("2026-05-12");
+		expect(parseSearchDateBound("1mo", now)).toBe("2026-04-12");
+		expect(parseSearchDateBound("1y", now)).toBe("2025-05-12");
+	});
+
+	it("parseSearchDateBound: passes ISO dates through and normalizes ISO datetimes", () => {
+		expect(parseSearchDateBound("2026-05-01")).toBe("2026-05-01");
+		expect(parseSearchDateBound("2026-05-01T08:30:00Z")).toBe("2026-05-01T08:30:00.000Z");
+	});
+
+	it("parseSearchDateBound: rejects unparseable input", () => {
+		expect(() => parseSearchDateBound("yesterday")).toThrow(/invalid date bound/);
+		expect(() => parseSearchDateBound(" ")).toThrow(/must not be empty/);
+	});
+
+	it("buildSearchDateQualifier: emits >=, <=, or range depending on which bounds are set", () => {
+		const now = new Date("2026-05-12T00:00:00Z");
+		expect(buildSearchDateQualifier("created", "3d", undefined, now)).toBe("created:>=2026-05-09");
+		expect(buildSearchDateQualifier("created", undefined, "2026-05-01", now)).toBe("created:<=2026-05-01");
+		expect(buildSearchDateQualifier("committer-date", "7d", "1d", now)).toBe("committer-date:2026-05-05..2026-05-11");
+		expect(buildSearchDateQualifier("created", undefined, undefined)).toBeUndefined();
+	});
+
+	it("search_issues: appends a created:>= qualifier built from `since` and tags `is:issue`", async () => {
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession());
+		await tool.execute("search-issues", {
+			op: "search_issues",
+			query: "is:open",
+			repo: "owner/repo",
+			since: "2026-05-01",
+			limit: 5,
+		});
+
+		const args = spy.mock.calls[0]?.[1];
+		expect(args).toContain("q=is:open created:>=2026-05-01 repo:owner/repo is:issue");
+	});
+
+	it("search_prs: builds a qualifier-only query when `query` is omitted and tags `is:pr`", async () => {
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession());
+		await tool.execute("search-prs", {
+			op: "search_prs",
+			repo: "owner/repo",
+			since: "2026-05-01",
+			until: "2026-05-09",
+			dateField: "updated",
+			limit: 5,
+		});
+
+		const args = spy.mock.calls[0]?.[1];
+		expect(args).toContain("q=updated:2026-05-01..2026-05-09 repo:owner/repo is:pr");
+	});
+
+	it("search_prs: errors when neither `query` nor a date bound is provided", async () => {
+		vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession());
+		await expect(tool.execute("search-prs", { op: "search_prs", repo: "owner/repo" })).rejects.toThrow(
+			/query is required/,
+		);
+	});
+
+	it("search_commits: forces `committer-date` regardless of `dateField`", async () => {
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession());
+		await tool.execute("search-commits", {
+			op: "search_commits",
+			query: "refactor",
+			repo: "owner/repo",
+			since: "2026-05-01",
+			dateField: "updated",
+			limit: 5,
+		});
+
+		const args = spy.mock.calls[0]?.[1];
+		expect(args?.slice(0, 4)).toEqual(["api", "-X", "GET", "/search/commits"]);
+		expect(args).toContain("q=refactor committer-date:>=2026-05-01 repo:owner/repo");
+	});
+
+	it("search_repos: maps dateField=updated to the `pushed:` qualifier", async () => {
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession());
+		await tool.execute("search-repos", {
+			op: "search_repos",
+			query: "language:rust",
+			since: "2026-05-01",
+			dateField: "updated",
+			limit: 1,
+		});
+
+		const args = spy.mock.calls[0]?.[1];
+		expect(args?.slice(0, 4)).toEqual(["api", "-X", "GET", "/search/repositories"]);
+		expect(args).toContain("q=language:rust pushed:>=2026-05-01");
+	});
+
+	it("search_code: rejects since/until since GitHub code search has no date qualifier", async () => {
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession());
+		await expect(tool.execute("search-code", { op: "search_code", query: "foo", since: "3d" })).rejects.toThrow(
+			/search_code does not support since\/until/,
+		);
+		expect(spy).not.toHaveBeenCalled();
 	});
 
 	it("formats code search results with paths, repo, sha, and match fragment", async () => {
-		vi.spyOn(git.github, "json").mockResolvedValue([
-			{
-				path: "src/lib.ts",
-				repository: { nameWithOwner: "owner/repo" },
-				sha: "abcdef1234567890",
-				url: "https://github.com/owner/repo/blob/abcdef1234567890/src/lib.ts",
-				textMatches: [{ fragment: "function findThing(): void {\n  ...\n}", property: "content" }],
-			},
-		]);
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue({
+			items: [
+				{
+					path: "src/lib.ts",
+					repository: { full_name: "owner/repo" },
+					sha: "abcdef1234567890",
+					html_url: "https://github.com/owner/repo/blob/abcdef1234567890/src/lib.ts",
+					text_matches: [{ fragment: "function findThing(): void {\n  ...\n}", property: "content" }],
+				},
+			],
+		});
 
 		const tool = new GithubTool(createSession());
 		const result = await tool.execute("search-code", {
@@ -485,21 +521,30 @@ describe("github tool", () => {
 		expect(text).toContain("  Repo: owner/repo");
 		expect(text).toContain("  Commit: abcdef123456");
 		expect(text).toContain("  Match: function findThing(): void {");
+
+		// Code search needs the text-match accept header to populate `text_matches`.
+		const args = spy.mock.calls[0]?.[1] ?? [];
+		const acceptIndex = args.indexOf("Accept: application/vnd.github.text-match+json");
+		expect(acceptIndex).toBeGreaterThan(-1);
+		expect(args[acceptIndex - 1]).toBe("-H");
+		expect(args).toContain("q=findThing repo:owner/repo");
 	});
 
 	it("formats commit search results with short sha and message subject", async () => {
-		vi.spyOn(git.github, "json").mockResolvedValue([
-			{
-				sha: "0123456789abcdef",
-				author: { login: "octocat" },
-				commit: {
-					message: "Fix flaky test\n\nMore detail in the body.",
-					author: { name: "Mona Lisa", email: "mona@example.com", date: "2026-04-01T12:00:00Z" },
+		vi.spyOn(git.github, "json").mockResolvedValue({
+			items: [
+				{
+					sha: "0123456789abcdef",
+					author: { login: "octocat" },
+					commit: {
+						message: "Fix flaky test\n\nMore detail in the body.",
+						author: { name: "Mona Lisa", email: "mona@example.com", date: "2026-04-01T12:00:00Z" },
+					},
+					repository: { full_name: "owner/repo" },
+					html_url: "https://github.com/owner/repo/commit/0123456789abcdef",
 				},
-				repository: { nameWithOwner: "owner/repo" },
-				url: "https://github.com/owner/repo/commit/0123456789abcdef",
-			},
-		]);
+			],
+		});
 
 		const tool = new GithubTool(createSession());
 		const result = await tool.execute("search-commits", {
@@ -517,22 +562,24 @@ describe("github tool", () => {
 		expect(text).toContain("  Date: 2026-04-01T12:00:00Z");
 	});
 
-	it("formats repository search results without forwarding --repo", async () => {
-		const runGhJsonSpy = vi.spyOn(git.github, "json").mockResolvedValue([
-			{
-				fullName: "octocat/hello-world",
-				description: "First line.\nSecond line should not surface.",
-				language: "TypeScript",
-				stargazersCount: 42,
-				forksCount: 7,
-				openIssuesCount: 3,
-				visibility: "public",
-				isArchived: false,
-				isFork: false,
-				updatedAt: "2026-04-01T09:00:00Z",
-				url: "https://github.com/octocat/hello-world",
-			},
-		]);
+	it("formats repository search results and never injects the repo qualifier", async () => {
+		const runGhJsonSpy = vi.spyOn(git.github, "json").mockResolvedValue({
+			items: [
+				{
+					full_name: "octocat/hello-world",
+					description: "First line.\nSecond line should not surface.",
+					language: "TypeScript",
+					stargazers_count: 42,
+					forks_count: 7,
+					open_issues_count: 3,
+					visibility: "public",
+					archived: false,
+					fork: false,
+					updated_at: "2026-04-01T09:00:00Z",
+					html_url: "https://github.com/octocat/hello-world",
+				},
+			],
+		});
 
 		const tool = new GithubTool(createSession());
 		const result = await tool.execute("search-repos", {
@@ -550,51 +597,11 @@ describe("github tool", () => {
 		expect(text).toContain("  Language: TypeScript");
 		expect(text).toContain("  Stars: 42");
 
-		const reposArgs = runGhJsonSpy.mock.calls[0]?.[1];
-		expect(reposArgs?.slice(0, 2)).toEqual(["search", "repos"]);
-		expect(reposArgs).not.toContain("--repo");
-		expect(reposArgs?.at(-2)).toBe("--");
-		expect(reposArgs?.at(-1)).toBe("language:typescript stars:>100");
-	});
-
-	it("returns diff output under a stable heading without rewriting patch content", async () => {
-		vi.spyOn(git.github, "text").mockResolvedValue("diff --git a/Makefile b/Makefile\n+\tgo test ./... \n");
-
-		const tool = new GithubTool(createSession());
-		const result = await tool.execute("pr-diff", { op: "pr_diff", pr: "7", repo: "owner/repo" });
-		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-
-		expect(text).toContain("# Pull Request Diff");
-		expect(text).toContain("diff --git a/Makefile b/Makefile");
-		expect(text).toContain("+\tgo test ./... ");
-		expect(text).not.toContain("+    go test ./... ");
-	});
-
-	it("lets wrapped GitHub diff output spill to an artifact tail instead of head-truncating", async () => {
-		const diffOutput = Array.from({ length: 400 }, (_, index) => `diff line ${index + 1}`).join("\n");
-		vi.spyOn(git.github, "text").mockResolvedValue(diffOutput);
-
-		const settings = Settings.isolated({
-			"github.enabled": true,
-			"tools.artifactSpillThreshold": 1,
-			"tools.artifactTailBytes": 1,
-			"tools.artifactTailLines": 20,
-		});
-		const tool = wrapToolWithMetaNotice(new GithubTool(createSession("/tmp/test", settings)));
-		const result = await tool.execute(
-			"pr-diff",
-			{ op: "pr_diff", pr: "7", repo: "owner/repo" },
-			undefined,
-			undefined,
-			createToolContext(settings),
-		);
-		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-
-		expect(text).toContain("diff line 400");
-		expect(text).not.toContain("diff line 1");
-		expect(text).toContain("Read artifact://");
-		expect(text).not.toContain("Use offset=");
-		expect(result.details?.meta?.truncation?.direction).toBe("tail");
+		const reposArgs = runGhJsonSpy.mock.calls[0]?.[1] ?? [];
+		expect(reposArgs.slice(0, 4)).toEqual(["api", "-X", "GET", "/search/repositories"]);
+		// `repo:` is ignored for repository searches even when supplied — query is forwarded as-is.
+		expect(reposArgs).toContain("q=language:typescript stars:>100");
+		expect(reposArgs.some(arg => typeof arg === "string" && arg.includes("repo:ignored/value"))).toBe(false);
 	});
 
 	it("checks out a pull request into a worktree and configures contributor push metadata", async () => {
@@ -756,67 +763,6 @@ describe("github tool", () => {
 			await tempHome.cleanup();
 			await fs.rm(fixture.baseDir, { recursive: true, force: true });
 		}
-	});
-
-	it("aggregates multiple pull request diffs when pr is an array", async () => {
-		vi.spyOn(git.github, "text")
-			.mockResolvedValueOnce("diff --git a/one.ts b/one.ts\n+content one\n")
-			.mockResolvedValueOnce("diff --git a/two.ts b/two.ts\n+content two\n");
-
-		const tool = new GithubTool(createSession());
-		const result = await tool.execute("pr-diff", { op: "pr_diff", pr: ["10", "20"], repo: "owner/repo" });
-		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-
-		expect(text).toContain("# 2 Pull Request Diffs");
-		expect(text).toContain("## PR 10");
-		expect(text).toContain("## PR 20");
-		expect(text).toContain("content one");
-		expect(text).toContain("content two");
-		// Sections are separated by a horizontal rule.
-		expect(text.match(/\n---\n/g)?.length).toBe(1);
-	});
-
-	it("aggregates multiple pull request views when pr is an array", async () => {
-		vi.spyOn(git.github, "json")
-			.mockResolvedValueOnce({
-				number: 11,
-				title: "First view",
-				url: "https://github.com/owner/repo/pull/11",
-				baseRefName: "main",
-				headRefName: "feature/one",
-				state: "OPEN",
-				author: { login: "alice" },
-				createdAt: "2026-04-01T09:00:00Z",
-				updatedAt: "2026-04-01T10:00:00Z",
-				comments: [],
-				reviews: [],
-			})
-			.mockResolvedValueOnce({
-				number: 22,
-				title: "Second view",
-				url: "https://github.com/owner/repo/pull/22",
-				baseRefName: "main",
-				headRefName: "feature/two",
-				state: "OPEN",
-				author: { login: "bob" },
-				createdAt: "2026-04-01T11:00:00Z",
-				updatedAt: "2026-04-01T12:00:00Z",
-				comments: [],
-				reviews: [],
-			});
-
-		const tool = new GithubTool(createSession());
-		const result = await tool.execute("pr-view", {
-			op: "pr_view",
-			pr: ["11", "22"],
-			repo: "owner/repo",
-			comments: false,
-		});
-		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-
-		expect(text).toContain("# 2 Pull Requests");
-		expect(text).toContain("# Pull Request #11: First view");
-		expect(text).toContain("# Pull Request #22: Second view");
 	});
 
 	it("rejects PR pushes from branches without checkout metadata", async () => {

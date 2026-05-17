@@ -1,16 +1,13 @@
+import type { ExecStepResult, RpcExecStep } from "./rpc-inject";
+
 /**
- * Client-side inject extensions for RpcClient.
- *
- * Wraps an existing RpcClient instance and adds injectKey / injectText /
- * injectSlash methods using the minimal _sendCommand escape hatch.
- * Zero structural changes to rpc-client.ts beyond that one method.
+ * Client-side extensions for RpcClient — exec queue and event subscriptions.
  *
  * Usage:
  *   const base = new RpcClient(options);
  *   const client = new RpcInjectClient(base);
  *   await client.start();
- *   await client.prompt("...");
- *   await client.injectKey("Escape");
+ *   await client.enqueueExec([{ type: "prompt", text: "...", timeoutMs: 60_000 }]);
  */
 import type { RpcClient } from "./rpc-client";
 
@@ -44,37 +41,49 @@ export class RpcInjectClient {
 	get bash() { return this.#client.bash.bind(this.#client); }
 	get abortBash() { return this.#client.abortBash.bind(this.#client); }
 	get setCustomTools() { return this.#client.setCustomTools.bind(this.#client); }
+	/**
+	 * Subscribe to tui_output events emitted by a headed+pipe slave TUI
+	 * (showStatus / showError / showWarning forwarded through the RPC pipe).
+	 * Filters the generic onEvent stream — zero changes needed in upstream RpcClient
+	 * beyond adding "tui_output" to agentEventTypes.
+	 */
+	onTuiOutput(listener: (event: { level: "status" | "error" | "warning"; text: string }) => void): () => void {
+		return this.#client.onEvent((event) => {
+			const e = event as unknown as { type: string; level?: string; text?: string };
+			if (e.type === "tui_output" && e.level && e.text) {
+				listener({ level: e.level as "status" | "error" | "warning", text: e.text });
+			}
+		});
+	}
+
+	/**
+	 * Subscribe to exec_step_result frames from the slave.
+	 * The slave sends exactly ONE frame per enqueued step (including interrupt steps).
+	 * Returns an unsubscribe function.
+	 */
+	onExecStepResult(listener: (result: ExecStepResult) => void): () => void {
+		return this.#client.onEvent((event) => {
+			const e = event as unknown as { type: string };
+			if (e.type === "exec_step_result") {
+				listener(e as unknown as ExecStepResult);
+			}
+		});
+	}
 	// onExit/childPid live on RpcPipeClient (subclass); delegate when present
 	get onExit() {
 		const fn = (this.#client as unknown as { onExit?: (h: (c: number | null) => void) => void }).onExit;
 		return fn ? fn.bind(this.#client) : (_h: (c: number | null) => void) => {};
 	}
 
-	// ── Inject methods ──────────────────────────────────────────────────────
 
 	/**
-	 * Inject a keypress into the child session.
-	 * Headed mode: triggers the real InputController path (onEscape → abortTask etc.).
-	 * Headless mode: "Escape"/"\x1b" maps to session.abort(); others are no-ops.
+	 * Enqueue steps on the slave's execution queue.
+	 * Steps run sequentially; new steps are appended if the queue is busy.
+	 * When an `interrupt` step is included, the slave handles it inline:
+	 * aborts current, clears queue, enqueues only the steps after the interrupt.
 	 */
-	async injectKey(key: string): Promise<void> {
-		await this.#client._sendCommand({ type: "inject_key", key });
-	}
-
-	/**
-	 * Inject text into the child session.
-	 * Headed mode: types into the editor component.
-	 * Headless mode: delivers as a follow-up prompt.
-	 */
-	async injectText(text: string): Promise<void> {
-		await this.#client._sendCommand({ type: "inject_text", text });
-	}
-
-	/**
-	 * Schedule a slash command in the child session (e.g. "/mreview /path").
-	 * Routed via the session event bus in both headed and headless mode.
-	 */
-	async injectSlash(command: string): Promise<void> {
-		await this.#client._sendCommand({ type: "inject_slash", command });
+	async enqueueExec(steps: RpcExecStep[]): Promise<{ queued: number }> {
+		const resp = await this.#client._sendCommand({ type: "exec_enqueue", steps }) as { data?: { queued: number } };
+		return (resp as unknown as { data: { queued: number } }).data ?? { queued: steps.length };
 	}
 }

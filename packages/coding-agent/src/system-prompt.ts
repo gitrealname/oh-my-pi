@@ -12,7 +12,6 @@ import { Settings, type SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
-import nowPromptTemplate from "./prompts/system/now-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import { shortenPath } from "./tools/render-utils";
@@ -566,9 +565,11 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		description: tools?.get(name)?.description ?? "",
 	}));
 
-	// Filter skills to only include those with read tool.
+	// Filter skills for the rendered system prompt:
+	// - require the `read` tool so the model can actually fetch skill content;
+	// - drop skills with frontmatter `hide: true` (still loadable via skill:// and /skill:<name>).
 	const hasRead = tools?.has("read");
-	const filteredSkills = hasRead ? skills : [];
+	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true) : [];
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
@@ -609,10 +610,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const projectPrompt = resolvedCustomPrompt ? "" : prompt.render(projectPromptTemplate, data).trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
-	}
-	const nowPrompt = prompt.render(nowPromptTemplate, data).trim();
-	if (nowPrompt) {
-		systemPrompt.push(nowPrompt);
 	}
 
 	return { systemPrompt };

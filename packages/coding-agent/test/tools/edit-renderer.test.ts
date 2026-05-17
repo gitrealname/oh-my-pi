@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { editToolRenderer } from "@oh-my-pi/pi-coding-agent/edit/renderer";
+import { HL_EDIT_SEP } from "@oh-my-pi/pi-coding-agent/hashline/hash";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { TUI } from "@oh-my-pi/pi-tui";
 
 async function getUiTheme() {
 	await themeModule.initTheme(false, undefined, undefined, "dark", "light");
@@ -40,6 +44,32 @@ describe("editToolRenderer", () => {
 		expect(rendered).not.toContain("The first line of the patch must be");
 	});
 
+	it("shows hashline envelope input while preview diff is not computable yet", async () => {
+		await getUiTheme();
+		const uiStub = { requestRender() {} } as unknown as TUI;
+		const hashlineTool = { name: "edit", label: "Edit", mode: "hashline" } as unknown as AgentTool;
+		const component = new ToolExecutionComponent(
+			"edit",
+			{
+				input: [
+					"*** Begin Patch",
+					"@crates/pi-natives/src/shell.rs",
+					"+ EOF",
+					`${HL_EDIT_SEP}pub fn streaming_preview() {`,
+				].join("\n"),
+			},
+			{},
+			hashlineTool,
+			uiStub,
+		);
+
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+		expect(rendered).toContain("crates/pi-natives/src/shell.rs");
+		expect(rendered).toContain("+ EOF");
+		expect(rendered).toContain(`${HL_EDIT_SEP}pub fn streaming_preview() {`);
+		expect(rendered).not.toContain("*** Begin Patch");
+	});
+
 	it("recognizes compact and quoted hashline input headers", async () => {
 		const uiTheme = await getUiTheme();
 		const compactComponent = editToolRenderer.renderCall(
@@ -62,6 +92,35 @@ describe("editToolRenderer", () => {
 		const quotedRendered = Bun.stripANSI(quotedComponent.render(160).join("\n"));
 		expect(compactRendered).toContain("foo bar.ts");
 		expect(quotedRendered).toContain("baz qux.ts");
+	});
+
+	it("strips canonical `@@` and longer `@` runs from hashline input headers", async () => {
+		const uiTheme = await getUiTheme();
+
+		// Canonical `@@ PATH` form (two `@`s) — the parser strips both, the
+		// renderer used to keep one. Regression: title displayed `@ /path/...`.
+		const canonical = editToolRenderer.renderCall(
+			{
+				input: "@@ packages/coding-agent/src/slash-commands/builtin-registry.ts\n+ BOF\n~// preview",
+			},
+			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			uiTheme,
+		);
+
+		// Even longer runs should still produce the clean path.
+		const triple = editToolRenderer.renderCall(
+			{ input: "@@@ a/b/c.ts\n+ BOF\n~// preview" },
+			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			uiTheme,
+		);
+
+		const canonicalRendered = Bun.stripANSI(canonical.render(160).join("\n"));
+		const tripleRendered = Bun.stripANSI(triple.render(160).join("\n"));
+
+		expect(canonicalRendered).toContain("packages/coding-agent/src/slash-commands/builtin-registry.ts");
+		expect(canonicalRendered).not.toMatch(/@ packages\/coding-agent/);
+		expect(tripleRendered).toContain("a/b/c.ts");
+		expect(tripleRendered).not.toMatch(/@+ a\/b\/c\.ts/);
 	});
 
 	it("uses hashline input headers for completed single-file result path", async () => {

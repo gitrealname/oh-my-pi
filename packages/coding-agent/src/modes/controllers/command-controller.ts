@@ -14,7 +14,6 @@ import { formatDuration, Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { reset as resetCapabilities } from "../../capability";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
-import { getGatewayStatus } from "../../eval/py/gateway-coordinator";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
@@ -38,6 +37,7 @@ import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import { CompactionCancelledError, type CompactionOutcome } from "../../session/compaction";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -256,12 +256,21 @@ export class CommandController {
 	}
 
 	#copyLastMessage() {
-		const text = this.ctx.session.getLastAssistantText();
-		if (!text) {
-			this.ctx.showError("No agent messages to copy yet.");
+		const assistantText = this.ctx.session.getLastAssistantText();
+		if (assistantText) {
+			this.#doCopy(assistantText, "Copied last agent message to clipboard");
 			return;
 		}
-		this.#doCopy(text, "Copied last agent message to clipboard");
+
+		if (!this.ctx.session.hasCopyCandidateAssistantMessage()) {
+			const handoffText = this.ctx.session.getLastVisibleHandoffText();
+			if (handoffText) {
+				this.#doCopy(handoffText, "Copied handoff context to clipboard");
+				return;
+			}
+		}
+
+		this.ctx.showError("No agent messages to copy yet.");
 	}
 
 	#copyCode() {
@@ -400,28 +409,6 @@ export class CommandController {
 			if (normalizedPremiumRequests > 0) {
 				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
 			}
-		}
-
-		const gateway = await getGatewayStatus();
-		info += `\n${theme.bold("Python Gateway")}\n`;
-		if (gateway.active) {
-			info += `${theme.fg("dim", "Status:")} ${theme.fg("success", "Active (Global)")}\n`;
-			info += `${theme.fg("dim", "URL:")} ${gateway.url}\n`;
-			info += `${theme.fg("dim", "PID:")} ${gateway.pid}\n`;
-			if (gateway.pythonPath) {
-				info += `${theme.fg("dim", "Python:")} ${gateway.pythonPath}\n`;
-			}
-			if (gateway.venvPath) {
-				info += `${theme.fg("dim", "Venv:")} ${gateway.venvPath}\n`;
-			}
-			if (gateway.uptime !== null) {
-				const uptimeSec = Math.floor(gateway.uptime / 1000);
-				const mins = Math.floor(uptimeSec / 60);
-				const secs = uptimeSec % 60;
-				info += `${theme.fg("dim", "Uptime:")} ${mins}m ${secs}s\n`;
-			}
-		} else {
-			info += `${theme.fg("dim", "Status:")} ${theme.fg("dim", "Inactive")}\n`;
 		}
 
 		if (this.ctx.lspServers && this.ctx.lspServers.length > 0) {
@@ -1094,16 +1081,16 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 	}
 
-	async handleCompactCommand(customInstructions?: string): Promise<void> {
+	async handleCompactCommand(customInstructions?: string): Promise<CompactionOutcome> {
 		const entries = this.ctx.sessionManager.getEntries();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
 		if (messageCount < 2) {
 			this.ctx.showWarning("Nothing to compact (no messages yet)");
-			return;
+			return "ok";
 		}
 
-		await this.executeCompaction(customInstructions, false);
+		return this.executeCompaction(customInstructions, false);
 	}
 
 	async handleSkillCommand(skillPath: string, args: string): Promise<void> {
@@ -1121,7 +1108,10 @@ export class CommandController {
 		}
 	}
 
-	async executeCompaction(customInstructionsOrOptions?: string | CompactOptions, isAuto = false): Promise<void> {
+	async executeCompaction(
+		customInstructionsOrOptions?: string | CompactOptions,
+		isAuto = false,
+	): Promise<CompactionOutcome> {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
@@ -1145,6 +1135,7 @@ export class CommandController {
 		this.ctx.statusContainer.addChild(compactingLoader);
 		this.ctx.ui.requestRender();
 
+		let outcome: CompactionOutcome = "ok";
 		try {
 			const instructions = typeof customInstructionsOrOptions === "string" ? customInstructionsOrOptions : undefined;
 			const options =
@@ -1158,10 +1149,12 @@ export class CommandController {
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError")) {
+			if (error instanceof CompactionCancelledError) {
+				outcome = "cancelled";
 				this.ctx.showError("Compaction cancelled");
 			} else {
+				outcome = "failed";
+				const message = error instanceof Error ? error.message : String(error);
 				this.ctx.showError(`Compaction failed: ${message}`);
 			}
 		} finally {
@@ -1170,6 +1163,7 @@ export class CommandController {
 			this.ctx.editor.onEscape = originalOnEscape;
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: false });
+		return outcome;
 	}
 
 	async handleHandoffCommand(customInstructions?: string): Promise<void> {

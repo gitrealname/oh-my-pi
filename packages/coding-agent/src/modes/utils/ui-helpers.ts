@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message } from "@oh-my-pi/pi-ai";
-import { Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
+import { type Component, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { BashExecutionComponent } from "../../modes/components/bash-execution";
@@ -9,13 +9,22 @@ import { CompactionSummaryMessageComponent } from "../../modes/components/compac
 import { CustomMessageComponent } from "../../modes/components/custom-message";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
 import { EvalExecutionComponent } from "../../modes/components/eval-execution";
-import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
+import {
+	ReadToolGroupComponent,
+	readArgsHaveTarget,
+	readArgsTargetInternalUrl,
+} from "../../modes/components/read-tool-group";
 import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { UserMessageComponent } from "../../modes/components/user-message";
 import { theme } from "../../modes/theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext } from "../../modes/types";
-import { type CustomMessage, SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
+import {
+	type CustomMessage,
+	isSilentAbort,
+	SKILL_PROMPT_MESSAGE_TYPE,
+	type SkillPromptDetails,
+} from "../../session/messages";
 import type { SessionContext } from "../../session/session-manager";
 import { formatBytes, formatDuration } from "../../tools/render-utils";
 
@@ -70,7 +79,7 @@ export class UiHelpers {
 		this.ctx.ui.requestRender();
 	}
 
-	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[] {
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ctx.ui, message.excludeFromContext);
@@ -147,26 +156,30 @@ export class UiHelpers {
 						if (message.customType === "irc:incoming") {
 							const peer = details?.from ?? "?";
 							body = details?.message ?? "";
-							arrow = `\u21e6 ${peer}`;
+							arrow = `⇦ ${peer}`;
 						} else if (message.customType === "irc:autoreply") {
 							const peer = details?.to ?? "?";
 							body = details?.reply ?? "";
-							arrow = `\u21e8 ${peer} (auto)`;
+							arrow = `⇨ ${peer}`;
 						} else {
 							const from = details?.from ?? "?";
 							const to = details?.to ?? "?";
 							body = details?.body ?? "";
-							const suffix = details?.kind === "reply" ? " (auto)" : "";
-							arrow = `${from} \u21e8 ${to}${suffix}`;
+							arrow = `${from} ⇨ ${to}`;
 						}
+						const components: Component[] = [];
 						const header = `${theme.fg("accent", `[IRC] ${arrow}`)}`;
-						this.ctx.chatContainer.addChild(new Text(header, 1, 0));
+						const headerComponent = new Text(header, 1, 0);
+						this.ctx.chatContainer.addChild(headerComponent);
+						components.push(headerComponent);
 						if (body) {
 							for (const line of body.split("\n")) {
-								this.ctx.chatContainer.addChild(new Text(theme.fg("muted", `  ${line}`), 0, 0));
+								const lineComponent = new Text(theme.fg("muted", `  ${line}`), 0, 0);
+								this.ctx.chatContainer.addChild(lineComponent);
+								components.push(lineComponent);
 							}
 						}
-						break;
+						return components;
 					}
 					const renderer = this.ctx.session.extensionRunner?.getMessageRenderer(message.customType);
 					// Both HookMessage and CustomMessage have the same structure, cast for compatibility
@@ -237,9 +250,10 @@ export class UiHelpers {
 				break;
 			}
 			default: {
-				const _exhaustive: never = message;
+				message satisfies never;
 			}
 		}
+		return [];
 	}
 
 	/**
@@ -279,7 +293,9 @@ export class UiHelpers {
 					assistantComponent.setUsageInfo(message.usage);
 				}
 				readGroup = null;
-				const hasErrorStop = message.stopReason === "aborted" || message.stopReason === "error";
+				const isAbortedSilently = message.stopReason === "aborted" && isSilentAbort(message.errorMessage);
+				const hasErrorStop =
+					!isAbortedSilently && (message.stopReason === "aborted" || message.stopReason === "error");
 				const errorMessage = hasErrorStop
 					? message.stopReason === "aborted"
 						? (() => {
@@ -297,7 +313,11 @@ export class UiHelpers {
 						continue;
 					}
 
-					if (content.name === "read") {
+					if (
+						content.name === "read" &&
+						readArgsHaveTarget(content.arguments) &&
+						!readArgsTargetInternalUrl(content.arguments)
+					) {
 						if (hasErrorStop && errorMessage) {
 							if (!readGroup) {
 								readGroup = new ReadToolGroupComponent({
@@ -359,7 +379,11 @@ export class UiHelpers {
 					}
 				}
 			} else if (message.role === "toolResult") {
-				if (message.toolName === "read") {
+				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
+				const isReadGroupResult =
+					message.toolName === "read" &&
+					(!pendingReadComponent || pendingReadComponent instanceof ReadToolGroupComponent);
+				if (isReadGroupResult) {
 					const assistantComponent = readToolCallAssistantComponents.get(message.toolCallId);
 					const images: ImageContent[] = message.content.filter(
 						(content): content is ImageContent => content.type === "image",

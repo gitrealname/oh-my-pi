@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outputPath = path.join(packageDir, "dist", "omp");
+const binariesPath = path.join(packageDir, "binaries", "omp-aws-corp.exe");
 
 function shouldAdhocSignDarwinBinary(): boolean {
 	return process.platform === "darwin";
@@ -35,21 +36,41 @@ async function main(): Promise<void> {
 					"bun",
 					"build",
 					"--compile",
-					"--define", 'process.env.PI_COMPILED="true"',
-					"--define", `process.env.BUILD_TIME="${buildTime}"`,
-					"--external", "mupdf",
-					"--root", "../..",
+					"--no-compile-autoload-bunfig",
+					"--no-compile-autoload-dotenv",
+					"--no-compile-autoload-tsconfig",
+					"--no-compile-autoload-package-json",
+					"--keep-names",
+					"--define",
+					'process.env.PI_COMPILED="true"',
+					"--define",
+					`process.env.BUILD_TIME="${buildTime}"`,
+					"--external",
+					"mupdf",
+					"--root",
+					"../..",
 					"./src/cli.ts",
-					// Worker entrypoints: Bun --compile must list workers explicitly so
-					// they are embedded in the binary at the path the spawn sites expect.
+					// Worker entrypoints. Bun's `--compile` discovers the literal in
+					// `new Worker("…", …)` at each spawn site, but only actually
+					// emits the worker into the bunfs root when it is listed here as
+					// an explicit additional entry. Paths are relative to this
+					// script's cwd (packages/coding-agent) and the `--root` above
+					// (../..) makes them appear inside the binary at
+					// `/$bunfs/root/packages/<pkg>/src/<worker>.js`, which is
+					// exactly what the literals at the spawn sites resolve to.
 					"../stats/src/sync-worker.ts",
 					"./src/tools/browser/tab-worker-entry.ts",
 					"./src/eval/js/worker-entry.ts",
-					"--outfile", "dist/omp",
+					"--outfile",
+					"dist/omp",
 				],
 				buildEnv,
 			);
 
+			// Copy to binaries/ so deploy.cmd (which reads from there) stays in sync.
+			if (process.platform === "win32") {
+				await Bun.write(binariesPath, Bun.file(outputPath + ".exe"));
+			}
 			// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 			if (shouldAdhocSignDarwinBinary()) {
 				await runCommand(["codesign", "--force", "--sign", "-", outputPath]);

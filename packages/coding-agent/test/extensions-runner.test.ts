@@ -8,9 +8,9 @@ import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
-	__test_setExtensionHandlerTimeoutMs,
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
+	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -34,7 +34,7 @@ describe("ExtensionRunner", () => {
 	});
 
 	afterEach(() => {
-		__test_setExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 		authStorage.close();
 		tempDir.removeSync();
 	});
@@ -644,7 +644,7 @@ describe("ExtensionRunner", () => {
 			runner.onError(err => {
 				errors.push(err);
 			});
-			__test_setExtensionHandlerTimeoutMs(50);
+			testSetExtensionHandlerTimeoutMs(50);
 
 			const startedAt = performance.now();
 			await runner.emit({ type: "session_start" });
@@ -766,6 +766,186 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.hasHandlers("tool_call")).toBe(true);
 			expect(runner.hasHandlers("agent_end")).toBe(false);
+		});
+	});
+
+	describe("credential_disabled", () => {
+		it("delivers credential_disabled events to subscribed extensions with the typed payload", async () => {
+			const eventsPath = path.join(tempDir.path(), "credential-disabled-events.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("credential_disabled", async (event) => {
+						fs.appendFileSync(
+							${JSON.stringify(eventsPath)},
+							JSON.stringify({
+								type: event.type,
+								provider: event.provider,
+								disabledCause: event.disabledCause,
+							}) + "\\n",
+						);
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "credential-disabled.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await runner.emit({ type: "credential_disabled", provider: "anthropic", disabledCause: "invalid_grant" });
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([
+				{ type: "credential_disabled", provider: "anthropic", disabledCause: "invalid_grant" },
+			]);
+		});
+
+		it("isolates subscriber failures so other handlers still receive the event", async () => {
+			const eventsPath = path.join(tempDir.path(), "credential-disabled-isolated.jsonl");
+			const ext1Code = `
+				export default function(pi) {
+					pi.on("credential_disabled", async () => {
+						throw new Error("subscriber exploded");
+					});
+				}
+			`;
+			const ext2Code = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("credential_disabled", async (event) => {
+						fs.appendFileSync(
+							${JSON.stringify(eventsPath)},
+							JSON.stringify({ provider: event.provider }) + "\\n",
+						);
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "ext1-credential-disabled-throws.ts"), ext1Code);
+			fs.writeFileSync(path.join(extensionsDir, "ext2-credential-disabled-records.ts"), ext2Code);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(err => {
+				errors.push(err);
+			});
+
+			await runner.emit({ type: "credential_disabled", provider: "anthropic", disabledCause: "invalid_grant" });
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([{ provider: "anthropic" }]);
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.event).toBe("credential_disabled");
+			expect(errors[0]?.error).toContain("subscriber exploded");
+		});
+
+		it("is a no-op when no extension subscribes", async () => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			expect(runner.hasHandlers("credential_disabled")).toBe(false);
+			await expect(
+				runner.emit({ type: "credential_disabled", provider: "anthropic", disabledCause: "invalid_grant" }),
+			).resolves.toBeUndefined();
+		});
+
+		it("caps the pre-initialize buffer and drops oldest events under pressure", async () => {
+			const eventsPath = path.join(tempDir.path(), "credential-disabled-cap.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("credential_disabled", async (event) => {
+						fs.appendFileSync(
+							${JSON.stringify(eventsPath)},
+							JSON.stringify({ provider: event.provider }) + "\\n",
+						);
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "credential-disabled-cap.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			// Push 33 events while uninitialized — the 1st should be dropped.
+			for (let i = 0; i < 33; i++) {
+				await runner.emitCredentialDisabled({ provider: `provider-${i}`, disabledCause: "invalid_grant" });
+			}
+
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => sessionManager.getSessionName(),
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			// Drain microtasks so the fire-and-forget emit() calls inside initialize() complete.
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toHaveLength(32);
+			// Drop-oldest policy: provider-0 was evicted, provider-1 survived as the head.
+			expect(events[0]?.provider).toBe("provider-1");
 		});
 	});
 });

@@ -2,9 +2,258 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Removed the dedicated `exit_plan_mode` tool and its prompt, requiring plan-mode completion to use the existing `resolve` tool path instead
+
+### Added
+
+- Added optional `extra` metadata object to the `resolve` tool so callers can pass context-specific payloads, including plan approval titles
+- Added `hide: true` frontmatter option for skill `SKILL.md` files. Hidden skills are still loaded and remain reachable via `skill://<name>` URLs and (when enabled) `/skill:<name>` slash commands, but are omitted from the rendered system prompt's `<skills>` listing so the model won't auto-discover them. Use for skills the user opts into explicitly rather than ones the model should pick up from descriptions.
+- Added middle elision for streaming tool outputs (bash, ssh, python, js eval) and post-execution tool result spill. When `tools.artifactHeadBytes` is set (default 20 KB), large outputs now keep both the first N KB and the last N KB with an inline `[… N lines elided (M KB) …]` marker between them, instead of dropping everything before the trailing tail. Setting `tools.artifactHeadBytes = 0` reverts to the previous tail-only behavior. The full output is still mirrored to the session artifact (`artifact://<id>`) regardless of elision mode. Exposes `truncateMiddle` and `formatMiddleElisionMarker` from `@oh-my-pi/pi-coding-agent/session/streaming-output`, extends `OutputSinkOptions` with `headBytes`, and adds `direction: "middle"` plus `headRange` / `tailRange` / `elidedLines` / `elidedBytes` to `TruncationMeta`.
+- Added per-line column cap shared across streaming tool outputs (`bash`, `ssh`, `python`, `js eval`) and the `read` tool. Lines wider than `tools.outputMaxColumns` bytes (default **768**) are ellipsis-truncated at write time and remaining bytes up to the next `\n` are dropped — bounded memory even on multi-MB single-line outputs (e.g. `cat /dev/urandom`). The cap lives on `OutputSink` as the new `maxColumns` option, persists state across chunk boundaries so split-mid-line writes still respect the budget, and exposes `columnDroppedBytes` / `columnTruncatedLines` on `OutputSummary`. Middle-elision byte math subtracts column drops so the "elided from middle" count stays honest. `read` reuses the same setting but trims its already-collected lines via `truncateLine`. Skipped when the read selector is `:raw`. The artifact file (`artifact://<id>`) keeps the full uncapped stream. Set `tools.outputMaxColumns = 0` to disable.
+- Added Bun HTTP/2 fetch opt-in. Dev scripts (`bun run dev`, `bun run stats`) now pass `bun --experimental-http2-fetch` so every `fetch()` advertises `h2` in the TLS ALPN list and falls back to HTTP/1.1 when the server doesn't select it. Multiplexing collapses parallel requests to the same origin onto one TLS connection. For the installed `omp` binary, export `BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT=1` in your shell to enable the same behavior (the flag has to be set before Bun starts; `process.env` from inside JS is too late). Requires Bun **1.3.14**.
+- Added per-subagent cost display (`$X.XX` in the task progress tree and the session-observer stats line). Cost is accumulated incrementally from `message_end` events and shown only when non-zero, using the `statusLineCost` theme color. Providers that do not report per-turn cost data (e.g. subscription/OAuth usage) continue to show nothing.
+
+### Changed
+
+- Changed plan-mode completion to use `resolve { action: "apply", reason, extra: { title } }` to request plan approval rather than calling `exit_plan_mode`
+- Changed resolve pending-action previews to trim and truncate long `reason` text for cleaner status-line rendering
+- Raised the image downscaling default JPEG quality from 75 to 80 in `resizeImage` output generation
+- Changed image resize metadata notes from coordinate-scale hints to a simple `Image resized from <original> to <displayed>` message and hide the note when the resized dimensions are unchanged
+- Removed `utils/image-convert.ts` and its `convertToPng` helper; callers now inline `new Bun.Image(bytes).png().toBase64()` from [`Bun.Image`](https://bun.com/docs/runtime/image) (Bun 1.3.14+).
+- Changed image decode/resize/encode in `utils/image-resize.ts` from the native `PhotonImage` binding to [`Bun.Image`](https://bun.com/docs/runtime/image). Same PNG/JPEG/WebP quality+dimension ladder, but pipelines run off-thread on Bun's statically-linked codecs with no native-addon round-trip. Bumped the minimum Bun runtime requirement to **1.3.14**.
+- Changed `search` pagination in multi-file scopes so `skip` now skips entire files and pages results in groups of up to 20 files, with output guiding the next `skip` value via `Showing files X-Y of N`
+- Changed multi-file search result selection to cap each file at 20 matches and round-robin across files, so one noisy file no longer suppresses visibility of hits in other files and truncation now reports per-file limits
+- Changed search truncation metadata/renderer output from match/result-based limits to file-based limits (`fileLimitReached`, `perFileLimitReached`) and updated truncation labels accordingly
+- Lowered `read.defaultLimit` default from `500` to `300` lines, and split the per-range context padding into asymmetric `RANGE_LEADING_CONTEXT_LINES = 1` / `RANGE_TRAILING_CONTEXT_LINES = 3` (was symmetric `RANGE_CONTEXT_LINES = 3`). Replay analysis over post-summarizer sessions (`scripts/session-stats/optimize_read_config.py`) showed that bare-path reads are over-provisioned at the median (file p50 = 220 lines) and that most follow-up reads are disjoint hops rather than adjacent extensions — so a smaller default plus narrower leading context reclaims tokens without measurably changing first-cover rate. Trailing context stays at 3 lines to keep anchor-stale recovery on narrow reads. Explicit `read.defaultLimit` overrides in settings are honoured unchanged.
+
 ### Fixed
 
+- Fixed `--help` startup to avoid a config/model-registry load cycle so the root CLI help command now exits successfully in a clean environment
+- Queued `/skill:<name> [args]` invocations now show as compact `Steer: /skill:<name> [args]` / `Follow-up: /skill:<name> [args]` chips in the pending-messages bar and disappear when the agent consumes the queued message (parity with plain-text steer/follow-up). Previously the queued skill was invisible while queued and rendered as a full skill block at consumption with no chip ever appearing.
+- Plan-mode "Approve and compact context" no longer surfaces a red "Operation aborted" line on the plan-mode assistant message; the silent transition into compaction now renders cleanly on both live and replay paths. Real user-cancel aborts on unrelated turns and the existing "Compaction cancelled" path are unchanged.
+- Auto-recover conflict-resolution `write`/`read` paths that the agent malformed as `<file>:conflict://<N>` (or `<file>:conflict://*`) by mixing the `:conflicts` read selector with the `conflict://` scheme. The stripped `<file>:` prefix is stored on `ParsedConflictUri.recoveredPrefix` and, for writes, surfaces as a trailing note in the result text so the agent learns the correct shape. Clean `conflict://…` URIs are unchanged.
+- Fixed hashline edit renderer leaving a stray `@` in the displayed file path when the agent emitted a canonical `@@ PATH` header (or any `@`-run longer than one). Titles like `Edit: @ packages/foo.ts` now render as `Edit: packages/foo.ts`, matching the actual parser in `hashline/input.ts` which already strips every leading `@` before resolving the path. Purely cosmetic — the edit itself was always routed to the correct file.
+- Fixed model contextWindow and maxTokens defaulting to `UNK_CONTEXT_WINDOW` (222222) / `UNK_MAX_TOKENS` (8888) when cached or freshly-discovered provider models replace bundled models through `ModelRegistry.#mergeResolvedModels`. The merge now preserves the bundled model's values when the replacement only has sentinel fallbacks.
+- Fixed headless `browser.open` tab startup on slow Chromium target enumeration by making worker-side stealth user-agent target setup selective, bounded, and best-effort for non-active targets. Worker startup errors are now surfaced directly instead of degrading into the generic tab worker initialization timeout.
+- Fixed token display for sessions and subagents inflating far beyond the context window. `token_total` status-line segment and the subagent overlay token counter now show `input + output + cacheWrite` instead of `input + output + cacheRead + cacheWrite`. With prompt caching, `cacheRead` per turn equals the full cached context — summing it across all turns produces a cumulative total that is N×context_size (e.g. a 5-turn session with a 1 M-token context reported ~5 M tokens). Cache activity is still visible via the dedicated `cache_read`/`cache_write` status-line segments; billing cost is unaffected.
+- Fixed ACP clients missing `config_option_update` notifications when the thinking level changed via any path other than the client's own `session/set_session_config_option` call (slash commands, model auto-adjust, extension UI). `AgentSession` now emits a `thinking_level_changed` event from `setThinkingLevel`, and `AcpAgent` subscribes to each managed session for the session's lifetime and pushes a fresh `config_option_update` whenever the effective level changes — independent of any active prompt turn. The subscription is installed inside `#scheduleBootstrapUpdates`'s 50 ms timer so it shares the same race guard that prevents Zed's `Received session notification for unknown session` drop when notifications fire before `session/new` (or fork) returns; the pre-bootstrap thinking level is reported in the response's `configOptions`. The `session/set_session_config_option` handler keeps its own push only when the subscription has not yet been installed, so client-driven thinking changes still notify pre-bootstrap, post-bootstrap they flow through the subscription exactly once. Subscriptions are released in `#disposeSessionRecord`.
+- Fixed MCP OAuth refresh failing with `HTTP 401 invalid_client` for servers that require Dynamic Client Registration (RFC 7591) and have no `oauth.clientId` configured (e.g. `mcp.linear.app`). `MCPOAuthFlow` registered a fresh public PKCE client on each authorize and discarded the issued `client_id` once the flow object went out of scope; refresh then called the provider's `/token` endpoint without a `client_id`. The flow now exposes `resolvedClientId` / `registeredClientSecret` getters, `MCPCommandController#handleOAuthFlow` returns them alongside `credentialId`, and both the initial-connect and `/mcp reauth` paths persist them into `auth.{clientId,clientSecret}` (used at refresh) and `oauth.{clientId,clientSecret}` (used by subsequent `/mcp reauth` to skip re-registration). The `MCPAddWizard` `onOAuth` callback type is now `Promise<MCPAddWizardOAuthResult>` and `#launchOAuthFlow` folds the registered credentials into wizard state. Servers with a statically-configured `oauth.clientId` (Notion, Slack, Datadog) are unaffected — `#tryRegisterClient` short-circuits and the write-back is a no-op. ([#1061](https://github.com/can1357/oh-my-pi/pull/1061) by [@ldx](https://github.com/ldx)).
+
+## [15.0.0] - 2026-05-13
+### Breaking Changes
+
+- Removed `op: issue_view` and `op: pr_view` from the `github` tool. Read single issues/PRs via the `read` tool against `issue://<N>` / `pr://<N>` (or the long form `issue://<owner>/<repo>/<N>` / `pr://<owner>/<repo>/<N>`); append `?comments=0` to drop the comments section. The `issue` and `comments` parameters were removed from the tool schema since no remaining op consumes them. Mutating ops (`pr_create`, `pr_checkout`, `pr_push`), `repo_view`, `search_*`, and `run_watch` are unchanged.
+- Removed `op: pr_diff` (along with the `nameOnly` and `exclude` schema fields) from the `github` tool. Read PR diffs through the new `pr://` URL family: `pr://<N>/diff` for the changed-file listing, `pr://<N>/diff/<i>` for a single file slice (1-indexed), and `pr://<N>/diff/all` for the verbatim unified diff. Long-form `pr://<owner>/<repo>/<N>/diff[/…]` works the same way. All three variants share one `gh pr diff` invocation through a new `pr-diff` cache row, so the listing and per-file slices reconstruct from cached bytes without re-shelling. Diff content is served as `text/plain` so the `read` tool's line selectors (e.g. `pr://<N>/diff/all:200-400`) page the cached output without falsely advertising hashline anchors.
+- Renamed ACP custom extension methods from `omp/*` to `_omp/*` to comply with the ACP spec's `_`-prefix requirement for non-spec methods; existing callers must update method names
+
+### Added
+
+- Added markdown rendering for `read` results when content type is `text/markdown`, so GitHub internal-URL outputs are shown as formatted markdown instead of plain code blocks
+- Added `pr://<N>/diff`, `pr://<N>/diff/<i>`, and `pr://<N>/diff/all` internal-URL shapes covering changed-file listings, per-file slices, and the full unified diff. They share one `pr-diff` SQLite cache row with the same TTL knobs as `pr://<N>` views (`github.cache.softTtlSec` / `github.cache.hardTtlSec` / `github.cache.enabled`). Single PR views now advertise the diff entry point via a `Diff: pr://<owner>/<repo>/<N>/diff` note. Cache schema bumped to `user_version = 3`; older rows are dropped on first open to add credential-scoped keys and relax the `kind` CHECK constraint.
+- Added `issue://` / `pr://` internal-URL schemes that share a SQLite-backed cache with the rest of the `github` tool. Single-item reads (`issue://<N>`, `issue://<owner>/<repo>/<N>`) return rendered markdown and within `github.cache.softTtlSec` (default 5 minutes) skip the `gh` round-trip entirely; within `github.cache.hardTtlSec` (default 7 days) the cached row is returned and a background refresh is scheduled. Root and repo-scoped reads (`issue://`, `pr://owner/repo`) issue a live `gh issue list` / `gh pr list` for browsing, supporting `?state=open|closed|all` for issues, `?state=open|closed|merged|all` for PRs, and `?limit=`, `?author=`, `?label=` query params. Rendered output lands in `~/.omp/cache/github-cache.db` (override via `OMP_GITHUB_CACHE_DB`); disable the cache entirely with `github.cache.enabled = false`. Cwd→default-repo lookups (`gh repo view`) are memoized per-process.
+- Added new `Approve and compact context` choice to the ExitPlanMode approval selector. Sits between `Approve and execute` (purge session) and `Approve and keep context` (full transcript) — runs `/compact` on the plan-mode transcript with a planning-specific summarization hint, then dispatches the plan-approved execution turn so it lands on a fresh cache anchor with the summarized rationale carried over. Cancelling the compaction (Esc or any other abort source) defers the execution dispatch and surfaces a warning so the operator can resubmit manually; non-abort failures proceed best-effort.
+- Added `CompactionCancelledError` typed sentinel and `CompactionOutcome` (`"ok" | "cancelled" | "failed"`) return type to `@oh-my-pi/pi-coding-agent/session/compaction`. `CommandController.executeCompaction` and `handleCompactCommand` now return the outcome instead of `void` so callers can discriminate user-driven aborts from generic failures without inspecting error messages.
+- Added a `credential_disabled` extension event so extensions can subscribe via `pi.on("credential_disabled", handler)` and react when `AuthStorage` automatically soft-disables a credential (e.g. OAuth `invalid_grant`). Replaces the current `agent_end` errorMessage regex pattern downstream extensions have to match against. Handler payload is `{ type, provider, disabledCause }`. `createAgentSession()` subscribes the per-session extension runner to the shared `AuthStorage` via `authStorage.onCredentialDisabled(...)` at the very top of session creation — before any startup model probes run — so events fire on every disable regardless of whether the embedder also has a constructor `onCredentialDisabled` handler attached. The SDK forwards through `ExtensionRunner.emitCredentialDisabled(event)`, which buffers events until `runner.initialize(...)` runs in the mode controller and then flushes them through `emit()` so extension handlers see populated UI/runtime context (rather than the constructor's no-op default with `hasUI=false`, an unset model, and no-op runtime actions). On `session.dispose()` the subscription is unsubscribed; the embedder's constructor-attached listener keeps firing through its own permanent subscription. The outer `createAgentSession()` catch also releases the subscription if startup throws before the dispose-wrap is wired, so repeated retries don't accumulate dead listeners.
+- Added `omp acp` subcommand for launching as an ACP (Agent Client Protocol) server over stdio
+- Added explicit `type` discriminators to ACP `initialize` auth methods, including a `terminal` setup method gated on `clientCapabilities.auth.terminal`
+- Added ACP equivalents for the remaining TUI slash commands (`/jobs`, `/changelog`, `/dump`, `/copy`, `/hotkeys`, `/extensions`, `/agents`, `/model`, `/plan`, `/loop`, `/btw`, `/login`, `/logout`, `/resume`, `/tree`, `/branch`, `/new`, `/drop`, `/handoff`, `/fork`, `/session delete`, `/export`, `/share`, `/todo`, `/memory`, `/move`, `/mcp`, `/ssh`, `/marketplace`, `/plugins`) so ACP clients reach feature parity with the TUI for non-interactive flows
+- Added ACP `plan` mode: when `plan.enabled` setting is on, ACP `session/new`/`load`/`resume`/`fork` advertise a `plan` mode alongside `default`; `session/set_mode` toggles plan-mode state so the next agent turn injects the plan-mode system prompt
+- Added ACP `ClientBridge` abstraction (`packages/coding-agent/src/session/client-bridge.ts`) that routes tool I/O through the connected client when capabilities are advertised at `initialize`; populated from `AgentSideConnection` in ACP mode
+- Added ACP `terminal/*` routing for `bash`: when the client advertises `terminal: true`, the tool creates a client-side terminal, embeds its `terminalId` on the live tool card, polls output, and releases the handle on exit or abort
+- Added ACP `fs/read_text_file` and `fs/write_text_file` routing for the `read` and `write` tools: when the client advertises `fs.readTextFile` / `fs.writeTextFile`, plain-text reads/writes go through the editor (surfacing unsaved buffer content and letting the editor track agent writes); falls back to disk only for reads, throws on bridge write failures
+- Added ACP `session/request_permission` gate around `bash`, `edit`, `write`, and `ast_edit` when an ACP client is connected; remembers `allow_always` / `reject_always` decisions per tool for the session lifetime
+- Added `diff` `ToolCallContent` emission for edit tool results: per-file `oldText`/`newText` is threaded through `EditToolPerFileResult` / `EditToolDetails` so ACP clients can render inline diffs
+- Added richer ACP `StopReason` mapping (`max_tokens`, `refusal`, `cancelled`) derived from the last assistant message's internal stop reason; previously only `end_turn`/`cancelled` were emitted
+- Added `_meta.messageCount` and `_meta.size` on `session/list` `SessionInfo` entries
+- Added ACP `tool_call_update` `locations` refresh from in-flight tool args and final result details so clients can "follow along" multi-file edits in real time
+
+### Changed
+
+- Changed issue and pull-request list entries to link to repository-qualified URLs (for example `issue://owner/repo/<N>`) so list items open correctly outside the default repo
+- Aligned prompt instruction language by defining `NEVER` and `AVOID` as strict aliases for `MUST NOT` and `SHOULD NOT` in the system prompt, and standardized agent, tool, and system prompt templates to use those terms consistently
+- Changed `--mode acp` to apply the same stdout-quiet overrides as `--mode rpc` so no banner or status text leaks into the JSON-RPC channel
+- Changed ACP startup to no longer require a configured model so registry validators and clients can complete `initialize` and `authenticate` before any model is selected
+### Fixed
+
+- Deferred flushing of buffered `credential_disabled` events during extension runner initialization to a microtask so handler failures are now routed through `onError()` registrations made immediately after `initialize()`, preserving extension error reporting
+- Fixed `eval` tool dynamic `await import("./relative.ts")` calls failing with `Cannot find module ... from .../eval/js/shared/runtime.ts`. The static-import rewriter only handled `ImportDeclaration` nodes, so dynamic-import call expressions resolved their specifier against the worker module's URL instead of the session cwd. The rewriter now walks the full AST and additionally swaps `import` callees in `CallExpression` nodes for `__omp_import__`, which forwards the optional options bag verbatim to native `import()` so `{ with: { type: "json" } }` round-trips. Renamed `rewriteStaticImports` → `rewriteImports`.
+- Fixed `pr://<owner>/<repo>/diff` URLs for repositories named `diff` to continue resolving to PR list lookups instead of being parsed as short-form diff links
+- Fixed `issue://<N>/diff` short form previously misparsing as a repo named `<N>/diff` and surfacing a confusing GraphQL "Could not resolve to a Repository" error. The numeric-host disambiguation that already routed `pr://<N>/diff` through the diff path now applies to both schemes, so `issue://<N>/diff[/…]` falls through to the existing "Issue views do not have a diff; use pr://<owner>/<repo>/<n>/diff for pull requests." rejection — matching the long-form `issue://<owner>/<repo>/<N>/diff` behavior. `<scheme>://<owner>/diff` listings for a repo literally named `diff` are unchanged.
+- Fixed PR unified diff parsing so changed-file headers with quoted paths (such as paths containing spaces) are now detected correctly and hunk content lines beginning with `---`/`+++` are counted in additions/deletions
+- Fixed GitHub view caching to account for active credential identity and avoid serving cached issue/PR data across different account/token contexts
+- Fixed `read` call tracking so calls without an explicit path or URL target no longer appear as regular file reads in the execution tracker
+- Fixed `createAgentSession()` subscribing the `credential_disabled` bridge to a freshly discovered `AuthStorage` orphan when an embedder supplied only `options.modelRegistry` (no `options.authStorage`). Refresh failures emitted by `modelRegistry.getApiKey()` flow through `modelRegistry.authStorage`, so a divergent local instance silently swallowed every disable event and also leaked into the `mcpManager` and session result. The SDK now reconciles `authStorage` to `modelRegistry.authStorage` up front and rejects mismatched `options.authStorage`/`options.modelRegistry.authStorage` pairs at session construction.
+- Fixed `runSubagent` (subagent task executor) carrying the same latent `AuthStorage`/`ModelRegistry` divergence as `createAgentSession()`: when only `options.modelRegistry` was supplied, the executor previously fell through to a fresh `discoverAuthStorage()` and handed that orphan into `createAgentSession()` alongside a registry whose `.authStorage` was a different instance. The executor now reconciles to `modelRegistry.authStorage` before any further work and rejects mismatched `options.authStorage`/`options.modelRegistry.authStorage` pairs the same way the SDK does, so subagents can no longer silently observe a different storage view than their parent.
+- Fixed `github` tool's `search_issues`/`search_prs`/`search_code`/`search_commits`/`search_repos` ops always returning 0 results when the query contained more than one qualifier (e.g. `is:merged is:pr`, `is:open author:foo`). `gh search …` since the `advanced_search=true` rollout in gh 2.92 silently wraps multi-token positional queries in parentheses and quotes everything after the first qualifier as that qualifier's value (`is:"merged is:pr"`), which GitHub then matches as a literal state filter that no PR can satisfy. The tool now calls `gh api -X GET /search/<endpoint> -f q=… -F per_page=…` directly so the qualifiers reach GitHub's search API verbatim. `is:issue`/`is:pr` and `repo:<owner>/<repo>` are appended internally to preserve the previous CLI-flag behavior; the user-facing query string in the formatted output is unchanged. `state` for merged PRs is derived from `pull_request.merged_at` so the rendered `State:` line stays `merged`/`closed`/`open` as before.
+- Fixed `read` tool renderer rendering failed reads with a success check (`✓`) and styling the error message as file content while the surrounding box was red. The renderer now branches on `isError` for both file and URL paths: header shows `✘ Read <path>` with a proper error icon and the underlying message is rendered as an error line. `renderReadUrlResult` got the same treatment so failed URL reads also get the cross icon instead of falling through to the `"No response data"` Text fallback. Mirrors the `bash`/`find` renderer error pattern.
+- Fixed ACP mode to advertise and handle non-TUI builtin slash commands and `/skill:<name>` commands
+- Fixed ACP `session/resume` and `session/close` to dispatch correctly under SDK 0.21 by renaming `unstable_resumeSession` / `unstable_closeSession` to the stable `resumeSession` / `closeSession` method names the SDK now routes to
+- Fixed ACP `tool_call` / `tool_call_update` `locations` to always emit absolute paths (resolved against the session cwd) so editor clients can reliably open or focus the referenced file
+- Fixed ACP edit `diff` metadata for moves to point at the destination path rather than the now-deleted source so post-edit "open file" actions land on the new file
+- Fixed ACP `session/request_permission` `locations` to be absolute and to honor the `requestPermission` capability bit instead of only checking for the method, matching the read/write/bash capability gating
+- Fixed ACP `authenticate` to reject `methodId` values that were not advertised by `initialize` so malformed clients fail fast instead of being treated as authenticated
+- Fixed ACP mode changes made via `session/set_session_config_option` (`MODE_CONFIG_ID`) to also emit a `current_mode_update` notification, matching `session/set_mode` so clients tracking `modes.currentModeId` stay in sync
+- Fixed `/model` ACP builtin to emit a `config_option_update` after switching models so clients show the new model in config selectors immediately
+- Fixed `/mcp list` (ACP) to redact query strings and userinfo from server URLs before emitting them, so API keys embedded in URLs (e.g. `?exaApiKey=…`) are not leaked to clients
+- Fixed `/mcp test|resources|prompts` (ACP) to wire the auth storage before `prepareConfig` so OAuth-backed MCP servers can refresh tokens and inject `Authorization` headers
+- Fixed `/mcp list`, `/mcp test`, `/mcp resources`, `/mcp prompts`, `/mcp enable`, and `/mcp disable` (ACP) to preserve project-over-user precedence when the same server name is defined in both scopes, matching the runtime capability merge so toggling the duplicated name flips the effective entry
+- Fixed `/ssh add --port` parsing to reject non-integer values (e.g. `22oops`) instead of silently coercing them via `Number.parseInt`
+- Fixed `/ssh list` to deduplicate hosts shared between project and user scopes, listing project entries first to match capability-loader precedence
+- Fixed `/export` (ACP) to reject clipboard aliases (`--copy`, `clipboard`, `copy`) instead of using them as the output filename
+- Fixed ACP builtin commands (`/compact`, `/force`, `/move`, `/browser`) to surface underlying failures via `output()` instead of swallowing them
+- Fixed `/session save|delete` (ACP) to route through the active `SessionManager` so the persist writer is consulted and stale storage references are removed
+- Fixed `/reload-plugins`, `/marketplace install|uninstall|upgrade`, and `/plugins enable|disable` (ACP) to refresh slash command registries and emit `available_commands_update` after plugin state changes
+- Fixed ACP `usage()` text emission to be awaited so help and error output is not dropped or reordered when commands return immediately
+- Fixed ACP `bash` tool to release the client terminal handle on `terminal/output` or `waitForExit` failures, and to race output polling against abort so a stuck RPC cannot delay cancellation
+- Fixed ACP `resource` content blocks with `image/*` MIME types to be routed into the LLM `images` array instead of being dropped as opaque blobs
+- Fixed `pr://` and `issue://` URLs accepting empty, `.`, or `..` path segments. `pr://owner//77`, `pr://owner/repo/77/diff//2`, and `pr://owner/../77/diff` previously slipped past the `.filter(Boolean)` split and were forwarded to `gh`; now they throw `Invalid <scheme>:// URL: empty or unsafe path segment` before any subprocess work.
+- Fixed `read` of `issue://` / `pr://` URLs ignoring the read tool's `AbortSignal`. Aborting a long `pr://<N>/diff/all` or stale issue fetch now propagates into the resolver and short-circuits at the handler entry; previously the `gh` round-trip and cache write ran to completion.
+- Fixed `read <path>:raw` (and the `raw: true` arg) still rendering markdown internal-URL content through the formatted markdown renderer. The TUI now respects the raw selector and falls back to the code-cell renderer so verbatim bytes are shown when requested.
+- Fixed `eval` tool JS cells crashing with a `structuredClone` error when an awaited final expression returned a non-cloneable value (module namespace, function, symbol, etc.). `displayValue` now falls back to a text representation and logs at debug instead of throwing.
+- Fixed `eval` tool JS rewriter missing the final expression when followed by trailing empty statements (e.g. `await Promise.resolve(1);;`). `returnFinalExpression` now scans backward past `EmptyStatement` nodes before deciding there is no final expression.
+- Fixed `github` view cache evicting valid rows on open whenever a longer-than-default `github.cache.hardTtlSec` was configured. `openDb()` no longer sweeps with the 7-day default before settings load; the per-lookup `sweepIfDue()` enforces the configured retention exclusively.
+- Fixed extension `ctx.shutdown()` being a no-op in the primary interactive path. The handler in `initHooksAndCustomTools` now sets `shutdownRequested` (mirroring the backgrounded-reinit path), and the main REPL loop drains the flag at the post-stream idle boundary so queued steering messages still flush before teardown.
+- Fixed plan-mode "Approve and compact context" dispatching queued user input against the stale plan-mode reference path. `setPlanReferencePath(finalPlanFilePath)` now runs before `handleCompactCommand` flushes the compaction queue, so any message typed during compaction is delivered with the approved plan context attached.
+- Fixed `.omp/commands/fix-issues.md` and `.omp/commands/review-prs.md` still instructing agents to call the removed `github issue_view` / `pr_view` / `pr_diff` ops; they now reference `read issue://<N>` and `read pr://<N>[/diff[/all|<i>]]`.
+- Fixed `ExtensionRunner.initialize()` flushing buffered `credential_disabled` events before mode controllers had a chance to register their `onError` listener. Mode controllers call `runner.initialize(...)` immediately followed by `runner.onError(...)` synchronously; the flush now runs in a microtask after splicing the buffer, so a synchronously throwing `credential_disabled` handler is routed through the registered error listener instead of being silently dropped.
+
+### Security
+
+- Secured the GitHub cache store with strict file permissions (`0600` files) and private permissions for newly created cache directories (`0700`) to reduce local cache exposure
+
+## [14.9.9] - 2026-05-12
+
+### Added
+
+- Added new `task.isolation.mode` values `auto`, `apfs`, `btrfs`, `zfs`, `reflink`, `overlayfs`, `projfs`, `block-clone`, and `rcopy` for native PAL-backed task isolation backends
+- Added automatic PAL-backed isolation backend selection so `task.isolation.mode` uses the host's best-available backend
+- Added input-token and output-token totals to `omp stats --summary`.
+
+### Changed
+
+- Changed `task.isolation.enabled=true` migration to map to `task.isolation.mode = "auto"` instead of legacy `worktree` isolation
+- Updated isolation configuration UI labels and descriptions to expose new back-end names (`overlayfs`, `projfs`, etc.) and removed references to deprecated values in guidance text
+
+### Fixed
+
+- Fixed worktree delta capture to include previously untracked file state by baselining untracked patches for both snapshots
+- Fixed task isolation startup to try alternate PAL backends when the preferred one is unavailable, allowing successful fallback instead of immediate failure
+- Mapped legacy `task.isolation.mode` values `worktree`, `fuse-overlay`, and `fuse-projfs` to their new equivalents during settings migration to preserve behavior with older configs
+
+## [14.9.8] - 2026-05-12
+
+### Breaking Changes
+
+- Changed the `eval` tool input format to a single-line `*** Cell <lang>:"<title>" [t:<duration>] [rst]` header per cell, replacing the `*** Begin <LANG>` / `*** End <LANG>` envelope and the standalone `*** Title:` / `*** Timeout:` / `*** Reset` directives. The lark grammar enforces a fixed attribute order; the runtime parser remains lenient (alias keys, bare positional tokens, single-quoted titles).
+
+### Added
+
+- Added `:conflicts` read selector (`read <path>:conflicts`) to return a one-line index of all unresolved merge conflicts with stable `#N` IDs for quick inspection
+- Added bulk conflict resolution with `write({ path: "conflict://*", content })` to resolve all currently registered conflicts across files in one call, expanding `@ours`/`@theirs`/`@base`/`@both` per conflict and returning per-file counts
+- Added `read` support for `conflict://<N>` and `read conflict://<N>/<scope>` to inspect unresolved conflict regions captured by a prior read, including `ours`, `theirs`, and `base` side views with original file line alignment
+- Added shorthand content tokens `@ours`, `@theirs`, `@both`, and `@base` to conflict-resolution writes using `path: "conflict://<N>"` so replacement content can be composed from recorded conflict sections
+- Added conflict count metadata to read results so conflict files now show a warning badge (`⚠ N`) in the read tool UI
+- Added support for explicit boolean `rst` values (`rst:true`, `rst:false`, `rst:1`, `rst:0`, `rst:yes`, `rst:no`, `rst:on`, `rst:off`) in `*** Cell` headers
+- Added detection of unresolved git merge conflicts in `read` output: each marker block is registered with a session-stable id and surfaced in a footer with `ours`/`theirs` previews. Resolve a block by calling `write({ path: "conflict://<id>", content })` — the tool splices the recorded marker region (markers and all sides) with the supplied content and routes through the normal writethrough (LSP format/diagnostics, fs-cache invalidation).
+
+### Changed
+
+- Changed `read` conflict warning footers to show `X of Y` unresolved conflicts when a range only captures part of a file and provide a `read <path>:conflicts` hint for the full list
+- Changed conflict scanning in conflict read paths to inspect the whole file (with a 10 MB cap) so totals better reflect hidden conflicts and truncated scans are called out
+- Changed conflict marker scanning during `read` to only register fully formed, column-0 merge-marker blocks, so indented or malformed marker-like lines are no longer treated as conflicts
+- Changed `write` conflict resolution to validate `conflict://` IDs and report clear errors for malformed or unknown conflict URIs
+- Changed the HTML transcript renderer to parse the new `*** Cell` headers while keeping the older `*** Begin <LANG>` and `===== ... =====` formats renderable for historical sessions.
+- Changed the `eval` tool parser so a stray non-marker line between cells no longer crashes with `null is not an object (evaluating 'BEGIN_RE.exec(lines[i])[1]')`; stray content is consumed without aborting parsing.
+- Changed `*** End` to be an optional, undocumented per-cell terminator (kept in the lark to satisfy GPT-trained models' natural terminator habit during constrained sampling).
+
+### Fixed
+
+- Fixed single-conflict `write` retries to re-locate the recorded conflict block by exact marker content so shifted line numbers from out-of-band edits no longer prevent resolution
+- Fixed `read conflict://*` handling by rejecting wildcard reads with a clear write-only guidance error
+- Fixed conflict resolution to verify the live file still contains recorded `<<<<<<<` and `>>>>>>>` markers before splicing, preventing stale conflict IDs from silently corrupting out-of-band-edited files
+- Fixed `@base` token handling so two-way conflicts without a base section now return a clear error
+- Improved `*** Cell` header parsing to reject invalid `rst` values with a clear `invalid rst value` error
+
+## [14.9.7] - 2026-05-12
+
+### Breaking Changes
+
+- Changed the `timeoutMs` execution option to no longer be enforced during worker-based JS runs, so callers must rely on external cancellation signals for time limits
+- Replaced the Jupyter kernel gateway + WebSocket protocol behind the Python `eval` backend with a subprocess-backed runner that speaks NDJSON over stdin/stdout; removed the `jupyter_kernel_gateway`/`ipykernel` pip dependencies, the `python.sharedGateway` setting, the `omp jupyter` CLI command, and the `PI_PYTHON_GATEWAY_URL` / `PI_PYTHON_GATEWAY_TOKEN` environment variables
+
+### Added
+
+- Added Python `tool.<name>(args)` support to `executePython` sessions so evaluated Python code can invoke session tools through the prelude `tool` proxy
+- Added per-execution Python tool bridge session registration and loopback endpoint wiring so Python tool calls resolve to host tools and return tool results
+- Added status-event forwarding for Python tool bridge calls so `tool` invocations can emit execution status updates
+- Added browser-tab JavaScript execution through the shared runtime so tab runs now expose the standard helper globals (`read`, `write`, `sort`, `uniq`, `counter`, `diff`, `tree`, `env`, `output`, `display`, and `tool`)
+- Added static ESM `import` support to browser-tab JavaScript by rewriting top-level imports and resolving them against the tab session context
+- Added substring fallback matching to `HistoryStorage.search` so infix and short-token queries that FTS5 prefix matching misses are still returned
+- Added a live single-line sync progress display to the stats command showing current/total sessions while syncing
+- Added automatic inline JS evaluation fallback when worker creation failed so script execution still works in environments without worker support
+
+### Changed
+
+- Changed `setup python` to only verify a reachable Python 3 interpreter instead of installing Jupyter dependencies
+- Changed `info` output to remove the obsolete Python Gateway status block now that shared gateway management is no longer available
+- Changed JavaScript execution in `executeJs` to expose the worker\u2019s real `process` object instead of a restricted, frozen subset
+- Changed JavaScript evaluation to run per session in a worker-backed runner with explicit initialization and teardown handling
+- Changed the Python backend to launch one `python -u runner.py` subprocess per kernel; cancellation now sends `SIGINT` which raises a real `KeyboardInterrupt` in user code, and the same subprocess is reused across cells in session mode
+- Changed Python magic handling so `%pip`, `%cd`, `%env`, `%pwd`, `%ls`, `%time`, `%timeit`, `%who`, `%reset`, `%load`, `%run`, `%%bash`, `%%capture`, `%%timeit`, `%%writefile`, and `!shell` work without depending on IPython
+
+### Fixed
+
+- Fixed Python output rendering so `text/markdown` takes precedence over `text/plain` and status bundles are emitted as status updates rather than plain text
+- Fixed query tokenization in `HistoryStorage.search` so punctuation-delimited terms like `git-commit` are aligned with indexing and matched correctly
+- Fixed history search result merging to de-duplicate matches and return full-text matches before substring-only matches while still respecting the requested limit
+- Fixed JS run cancellation so aborting a run now also cancels in-flight tool calls and terminates the active worker session
+- Fixed top-level `const`, `let`, and `class` declarations in evaluated JavaScript to persist across subsequent runs by rewriting top-level declarations
+
+## [14.9.5] - 2026-05-12
+### Breaking Changes
+
+- Removed the `jobs://` internal URL protocol; inspect background jobs via the `job` tool's `list: true` operation instead
+
+### Added
+
+- Added `since` and `until` date-range filters to `search_issues`, `search_prs`, `search_commits`, and `search_repos`, accepting relative durations (`m`/`h`/`d`/`w`/`mo`/`y`), ISO dates, and ISO datetimes
+- Added `dateField` support for date filtering (`created` or `updated`) so search results can be constrained by creation, update, pushed (for repos), or committer date (for commits)
+- Added owner-based scoping to async job registration and queries so background jobs can be registered with an `ownerId` and filtered per agent in `getRunningJobs`, `getRecentJobs`, `getAllJobs`, and `cancelAll`
+- Added agent ownership metadata to async jobs started by `task` and `bash` tools so their lifecycle and cancellation is attributed to the creating agent
+- Added `list: true` operation to the `job` tool, returning an immediate snapshot of every job spawned by the calling agent without waiting (replaces the deleted `jobs://` URL)
+- Added per-agent visibility scoping to the `job` tool so `list`, `poll`, and `cancel` only see and act on jobs owned by the calling agent; cross-agent operations now return `not_found`
+
+### Changed
+
+- Changed `search_issues`, `search_prs`, `search_commits`, and `search_repos` to allow date-only queries where `query` is omitted if `since`/`until` is provided
+- Changed `search_code` to return a validation error when `since`/`until` is supplied because GitHub code search does not support date qualifiers
+- Changed async job manager ownership so subagents inherit the parent session’s global `AsyncJobManager` instead of creating and owning separate instances
+- Changed session lifecycle cleanup so the global async-job manager is disposed only by the owning top-level session
+- Changed subagent session switches and handoff paths to stop global async-job cancellation and cancel only jobs owned by that session
+- Changed `agent://` and `artifact://` URL resolution to search artifact outputs across all active sessions instead of only the current session, allowing parent and subagent sessions to read each other’s generated outputs by ID
+- Changed `memory://` URL resolution to walk all active sessions’ memory roots and return the first matching file, so worktree-based subagents can access their own memory views as well as shared roots
+- Changed internal URL routing to use a shared process-global `InternalUrlRouter` and protocol handlers, so built-in tools resolve `agent://`, `artifact://`, `memory://`, `skill://`, `rule://`, `mcp://`, and `local://` URLs without requiring session-specific router wiring
+- Changed `mcp://` handler to use the globally registered MCP manager so MCP resource links work for agents sharing session context
+
+### Changed
+
+- Changed the `ask.timeout` default from `30` (seconds) to `0` (wait indefinitely). Auto-selecting the recommended option after a fixed delay was surprising users mid-deliberation; the timer is now strictly opt-in. The legacy auto-select behavior is preserved when `ask.timeout` is set to a non-zero value, and the `ask` tool's prompt has been updated so the model expects unlimited reply time by default.
+
+### Fixed
+
+- Added `ModelRegistry.hasConfiguredAuth(model)` to mirror the upstream `@mariozechner/pi-coding-agent` API surface; external plugins and downstream wrappers that pre-flight auth before launching a subagent no longer crash with `this._modelRegistry.hasConfiguredAuth is not a function` on the direct agent-launch path. ([#993](https://github.com/can1357/oh-my-pi/issues/993))
+- Fixed an ESM circular-import TDZ that crashed test suites when modules from the `task/` and `tools/` graphs were evaluated together (e.g. `executor-warnings.test.ts` + `task-simple-mode.test.ts`) by deferring `BUILTIN_TOOLS.task`'s `TaskTool.create` dereference to factory-call time and sourcing `truncateTail` from `session/streaming-output` instead of the `tools/` barrel
+- Treat keyless-by-design providers (llama.cpp, ollama, lm-studio) as authenticated in subagent model resolution; fixes silent fallback to parent remote model when a local model is configured. ([#1008](https://github.com/can1357/oh-my-pi/issues/1008))
+- Fixed subagent disposal and session transitions that previously canceled all running async jobs, preventing inadvertent termination of a parent agent’s background work
+- Fixed multi-entry edits silently rendering a fake success when every entry failed (e.g. all hit the auto-generated guard), by surfacing `isError: true` from the single-path edit orchestrator so the renderer takes the error branch instead of falling through to the streaming-preview fallback that displays the *proposed* diff
+- Fixed the auto-generated streaming guard being gated behind `edit.streamingAbort` (default false), so it now pre-empts streaming edit tool calls targeting auto-generated files regardless of that setting
 - Fixed subagents launched in the same parallel batch not seeing each other in their initial `# IRC Peers` system-prompt block by pre-registering the agent in the global `AgentRegistry` before `rebuildSystemPrompt` runs and attaching the live session afterwards
+- Fixed plugin manifest extensions whose entry points at a directory (e.g. `pi-goal`'s `"pi": { "extensions": [".pi/extensions/pi-goal"] }`) failing to load with `Failed to load extension: Directories cannot be read like files`. The plugin path resolver now resolves directory entries to their `index.{ts,js,mjs,cjs}` file, matching the behavior of native auto-discovery via `resolveExtensionEntries`.
+- Fixed the SSH tool on native Windows by avoiding OpenSSH ControlMaster multiplexing, which Win32-OpenSSH does not support and reports as `getsockname failed` ([#154](https://github.com/can1357/oh-my-pi/issues/154)).
+- Fixed `/export` and `/tree` not showing developer-role messages (including the plan content injected after `/plan` approval) so the HTML export and TUI session tree now render developer messages dimmed with their actual content instead of hiding them entirely ([#753](https://github.com/can1357/oh-my-pi/issues/753))
+- Fixed `Timed out initializing browser tab worker` on prebuilt binaries by rewriting `spawnTabWorker` to import the worker entry with `with { type: "file" }` so Bun's `--compile` bundler statically discovers and embeds `tab-worker-entry.ts` in the single-file binary ([#1011](https://github.com/can1357/oh-my-pi/issues/1011))
 
 ## [14.9.3] - 2026-05-10
 ### Breaking Changes

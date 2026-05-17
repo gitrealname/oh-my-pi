@@ -22,7 +22,7 @@ import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../we
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
-import { formatExpandHint, getDomain } from "./render-utils";
+import { formatExpandHint, getDomain, replaceTabs } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -1352,7 +1352,7 @@ export function renderReadUrlCall(
 ): Component {
 	const url = args.path ?? args.url ?? "";
 	const domain = getDomain(url);
-	const path = truncate(url.replace(/^https?:\/\/[^/]+/, ""), 50, "\u2026");
+	const path = truncate(url.replace(/^https?:\/\/[^/]+/, ""), 50, "…");
 	const description = `${domain}${path ? ` ${path}` : ""}`.trim();
 	const meta: string[] = [];
 	if (args.raw) meta.push("raw");
@@ -1362,14 +1362,25 @@ export function renderReadUrlCall(
 
 /** Render URL read result with tree-based layout */
 export function renderReadUrlResult(
-	result: { content: Array<{ type: string; text?: string }>; details?: ReadUrlToolDetails },
+	result: { content: Array<{ type: string; text?: string }>; details?: ReadUrlToolDetails; isError?: boolean },
 	options: RenderResultOptions,
 	uiTheme: Theme = theme,
 ): Component {
 	const details = result.details;
 
-	if (!details) {
-		return new Text(uiTheme.fg("error", "No response data"), 0, 0);
+	if (result.isError || !details) {
+		const rawErrorText = result.content?.find(c => c.type === "text")?.text ?? "";
+		const errorText = (rawErrorText || "No response data").replace(/^Error:\s*/, "");
+		const urlText = details?.finalUrl ?? details?.url ?? "";
+		const description = urlText ? `${getDomain(urlText)}${urlText.replace(/^https?:\/\/[^/]+/, "")}` : undefined;
+		const header = renderStatusLine({ icon: "error", title: "Read", description }, uiTheme);
+		const errorLines = errorText.split("\n").map(line => uiTheme.fg("error", replaceTabs(line)));
+		const outputBlock = new CachedOutputBlock();
+		return {
+			render: (width: number) =>
+				outputBlock.render({ header, state: "error", sections: [{ lines: errorLines }], width }, uiTheme),
+			invalidate: () => outputBlock.invalidate(),
+		};
 	}
 
 	const domain = getDomain(details.finalUrl);

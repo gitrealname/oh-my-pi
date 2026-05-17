@@ -18,6 +18,7 @@ import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { Container, Markdown, type MarkdownTheme, matchesKey } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
+import { isSilentAbort } from "../../session/messages";
 import type { SessionMessageEntry } from "../../session/session-manager";
 import { parseSessionEntries } from "../../session/session-manager";
 import { PREVIEW_LIMITS, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
@@ -192,7 +193,7 @@ export class SessionObserverOverlayComponent extends Container {
 		const statsLine = this.#buildStatsLine(session);
 		if (statsLine) this.#viewerFooterLines.push(statsLine);
 		this.#viewerFooterLines.push(
-			theme.fg("dim", "j/k:scroll  Enter:expand  [/]/\u2190\u2192:cycle agents  Esc/Ctrl+S:close  g/G:top/bottom"),
+			theme.fg("dim", "j/k:scroll  Enter:expand  [/]/←→:cycle agents  Esc/Ctrl+S:close  g/G:top/bottom"),
 		);
 
 		// Auto-scroll to bottom if we were at bottom
@@ -267,7 +268,10 @@ export class SessionObserverOverlayComponent extends Container {
 		if (progress.toolCount > 0) stats.push(`${formatNumber(progress.toolCount)} tools`);
 		if (progress.tokens > 0) stats.push(`${formatNumber(progress.tokens)} tokens`);
 		if (progress.durationMs > 0) stats.push(formatDuration(progress.durationMs));
-		return stats.length > 0 ? theme.fg("dim", stats.join(theme.sep.dot)) : "";
+		const parts: string[] = [];
+		if (stats.length > 0) parts.push(theme.fg("dim", stats.join(theme.sep.dot)));
+		if (progress.cost > 0) parts.push(theme.fg("statusLineCost", `$${progress.cost.toFixed(2)}`));
+		return parts.join(theme.sep.dot);
 	}
 
 	#buildTranscriptLines(messageEntries: SessionMessageEntry[], lines: string[]): void {
@@ -285,7 +289,7 @@ export class SessionObserverOverlayComponent extends Container {
 
 			if (msg.role === "assistant") {
 				// Handle error messages with empty content
-				if (msg.content.length === 0 && msg.errorMessage) {
+				if (msg.content.length === 0 && msg.errorMessage && !isSilentAbort(msg.errorMessage)) {
 					const startLine = lines.length;
 					const isSelected = entryIndex === this.#selectedEntryIndex;
 					const cursor = isSelected ? theme.fg("accent", "▶") : " ";
@@ -452,7 +456,7 @@ export class SessionObserverOverlayComponent extends Container {
 
 		// Tool call header
 		const intentStr = call.intent ? theme.fg("dim", ` ${sanitizeLine(call.intent, TRUNCATE_LENGTHS.SHORT)}`) : "";
-		lines.push(`${cursor} ${theme.fg("accent", "\u25B8")} ${theme.bold(theme.fg("muted", call.name))}${intentStr}`);
+		lines.push(`${cursor} ${theme.fg("accent", "▸")} ${theme.bold(theme.fg("muted", call.name))}${intentStr}`);
 
 		// Key arguments
 		const argSummary = this.#formatToolArgs(call.name, call.arguments);

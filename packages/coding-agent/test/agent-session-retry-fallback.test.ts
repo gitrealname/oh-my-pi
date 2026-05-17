@@ -36,15 +36,6 @@ function createAssistantMessage(
 	};
 }
 
-async function _waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("Timed out waiting for condition");
-}
-
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -346,14 +337,14 @@ describe("AgentSession retry fallback", () => {
 		expect(lastAssistant.content).toContainEqual({ type: "text", text: "Recovered after OpenAI timeout" });
 	});
 
-	it("auto-retries Bun socket closure errors", async () => {
+	it("auto-retries OpenAI processing-request transient errors", async () => {
 		const model = getBundledModel("openai", "gpt-4o-mini");
 		if (!model) {
 			throw new Error("Expected bundled OpenAI test model to exist");
 		}
 
-		const socketError =
-			"The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()";
+		const processingError =
+			"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 4a4c6b73-a07c-4de0-aaaf-82560f9f626a in your message.";
 		const requestedModels: string[] = [];
 		let attemptCount = 0;
 
@@ -373,7 +364,7 @@ describe("AgentSession retry fallback", () => {
 					if (attemptCount === 1) {
 						const message = createAssistantMessage(requestedModel, {
 							stopReason: "error",
-							errorMessage: socketError,
+							errorMessage: processingError,
 						});
 						stream.push({ type: "start", partial: message });
 						stream.push({ type: "error", reason: "error", error: message });
@@ -381,7 +372,7 @@ describe("AgentSession retry fallback", () => {
 					}
 					if (attemptCount === 2) {
 						const message = createAssistantMessage(requestedModel, {
-							text: "Recovered after socket closure",
+							text: "Recovered after OpenAI processing error",
 							stopReason: "stop",
 						});
 						stream.push({
@@ -391,7 +382,7 @@ describe("AgentSession retry fallback", () => {
 						stream.push({ type: "done", reason: "stop", message });
 						return;
 					}
-					throw new Error(`Unexpected retry attempt in socket closure test: ${attemptCount}`);
+					throw new Error(`Unexpected retry attempt in processing-error test: ${attemptCount}`);
 				});
 				return stream;
 			},
@@ -412,7 +403,7 @@ describe("AgentSession retry fallback", () => {
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
 
-		await session.prompt("Retry Bun socket closure");
+		await session.prompt("Retry OpenAI processing-request error");
 		await session.waitForIdle();
 
 		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
@@ -420,13 +411,16 @@ describe("AgentSession retry fallback", () => {
 		expect(retryStartEvents[0]).toMatchObject({
 			attempt: 1,
 			maxAttempts: 1,
-			errorMessage: socketError,
+			errorMessage: processingError,
 		});
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
 		const lastAssistant = getLastAssistantMessage(session);
 		expect(lastAssistant.stopReason).toBe("stop");
-		expect(lastAssistant.content).toContainEqual({ type: "text", text: "Recovered after socket closure" });
+		expect(lastAssistant.content).toContainEqual({
+			type: "text",
+			text: "Recovered after OpenAI processing error",
+		});
 	});
 
 	it("auto-retries Anthropic stream-envelope failures before message_start", async () => {
