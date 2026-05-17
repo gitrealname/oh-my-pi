@@ -2,10 +2,12 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { projfsOverlayStart, projfsOverlayStop } from "@oh-my-pi/pi-natives";
-import { $which, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
+import * as natives from "@oh-my-pi/pi-natives";
+import { getWorktreeDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import * as git from "../utils/git";
+
+const { IsoBackendKind } = natives;
+type IsoBackendKind = natives.IsoBackendKind;
 
 /** Baseline state for a single git repository. */
 export interface RepoBaseline {
@@ -14,6 +16,7 @@ export interface RepoBaseline {
 	staged: string;
 	unstaged: string;
 	untracked: string[];
+	untrackedPatch: string;
 }
 
 /** Baseline state for the project, including any nested git repos. */
@@ -36,26 +39,10 @@ export async function getRepoRoot(cwd: string): Promise<string> {
 	return repoRoot;
 }
 
-const PROJFS_UNAVAILABLE_PREFIX = "PROJFS_UNAVAILABLE:";
 const GIT_NO_INDEX_NULL_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
-
-export function isProjfsUnavailableError(err: unknown): boolean {
-	return err instanceof Error && err.message.includes(PROJFS_UNAVAILABLE_PREFIX);
-}
 
 export function getGitNoIndexNullPath(): string {
 	return GIT_NO_INDEX_NULL_PATH;
-}
-
-export async function ensureWorktree(baseCwd: string, id: string): Promise<string> {
-	const repoRoot = await getRepoRoot(baseCwd);
-	const encodedProject = getEncodedProjectName(repoRoot);
-	const worktreeDir = getWorktreeDir(encodedProject, id);
-	await fs.mkdir(path.dirname(worktreeDir), { recursive: true });
-	await git.worktree.tryRemove(repoRoot, worktreeDir);
-	await fs.rm(worktreeDir, { recursive: true, force: true });
-	await git.worktree.add(repoRoot, worktreeDir, "HEAD", { detach: true });
-	return worktreeDir;
 }
 
 /** Find nested git repositories (non-submodule) under the given root. */
@@ -96,12 +83,49 @@ async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
 	return result;
 }
 
+async function captureUntrackedPatch(repoRoot: string, untracked: readonly string[]): Promise<string> {
+	if (untracked.length === 0) return "";
+	const nullPath = getGitNoIndexNullPath();
+	const untrackedDiffs = await Promise.all(
+		untracked.map(entry =>
+			git.diff(repoRoot, {
+				allowFailure: true,
+				binary: true,
+				noIndex: { left: nullPath, right: entry },
+			}),
+		),
+	);
+	return untrackedDiffs.filter(diff => diff.trim()).join("\n");
+}
+
 async function captureRepoBaseline(repoRoot: string): Promise<RepoBaseline> {
 	const headCommit = (await git.head.sha(repoRoot)) ?? "";
 	const staged = await git.diff(repoRoot, { binary: true, cached: true });
 	const unstaged = await git.diff(repoRoot, { binary: true });
 	const untracked = await git.ls.untracked(repoRoot);
-	return { repoRoot, headCommit, staged, unstaged, untracked };
+	const untrackedPatch = await captureUntrackedPatch(repoRoot, untracked);
+	return { repoRoot, headCommit, staged, unstaged, untracked, untrackedPatch };
+}
+
+async function writeSyntheticTree(repoDir: string, baseTreeish: string, patches: readonly string[]): Promise<string> {
+	const tempIndex = path.join(os.tmpdir(), `omp-task-index-${Snowflake.next()}`);
+	try {
+		await git.readTree(repoDir, baseTreeish, {
+			env: { GIT_INDEX_FILE: tempIndex },
+		});
+		for (const patch of patches) {
+			if (!patch.trim()) continue;
+			await git.patch.applyText(repoDir, patch, {
+				cached: true,
+				env: { GIT_INDEX_FILE: tempIndex },
+			});
+		}
+		return await git.writeTree(repoDir, {
+			env: { GIT_INDEX_FILE: tempIndex },
+		});
+	} finally {
+		await fs.rm(tempIndex, { force: true });
+	}
 }
 
 export async function captureBaseline(repoRoot: string): Promise<WorktreeBaseline> {
@@ -115,138 +139,24 @@ export async function captureBaseline(repoRoot: string): Promise<WorktreeBaselin
 	return { root, nested };
 }
 
-async function applyRepoBaseline(worktreeDir: string, rb: RepoBaseline, sourceRoot: string): Promise<void> {
-	await git.patch.applyText(worktreeDir, rb.staged, { cached: true });
-	await git.patch.applyText(worktreeDir, rb.staged);
-	await git.patch.applyText(worktreeDir, rb.unstaged);
-
-	for (const entry of rb.untracked) {
-		const source = path.join(sourceRoot, entry);
-		const destination = path.join(worktreeDir, entry);
-		try {
-			await fs.mkdir(path.dirname(destination), { recursive: true });
-			await fs.cp(source, destination, { recursive: true });
-		} catch (err) {
-			if (isEnoent(err)) continue;
-			throw err;
-		}
-	}
-}
-
-export async function applyBaseline(worktreeDir: string, baseline: WorktreeBaseline): Promise<void> {
-	await applyRepoBaseline(worktreeDir, baseline.root, baseline.root.repoRoot);
-
-	// Restore nested repos into the worktree
-	for (const entry of baseline.nested) {
-		const nestedDir = path.join(worktreeDir, entry.relativePath);
-		// Copy the nested repo wholesale (it's not managed by root git)
-		const sourceDir = path.join(baseline.root.repoRoot, entry.relativePath);
-		try {
-			await fs.cp(sourceDir, nestedDir, { recursive: true });
-		} catch (err) {
-			if (isEnoent(err)) continue;
-			throw err;
-		}
-		// Apply any uncommitted changes from the nested baseline
-		await applyRepoBaseline(nestedDir, entry.baseline, entry.baseline.repoRoot);
-		// Commit baseline state so captureRepoDeltaPatch can cleanly subtract it.
-		// Without this, `git add -A && git commit` by the task would include
-		// baseline untracked files in the diff-tree output.
-		if ((await git.status(nestedDir)).trim().length > 0) {
-			await git.stage.files(nestedDir);
-			await git.commit(nestedDir, "omp-baseline", { allowEmpty: true });
-			// Update baseline to reflect the committed state — prevents double-apply
-			// in captureRepoDeltaPatch's temp-index path
-			entry.baseline.headCommit = (await git.head.sha(nestedDir)) ?? "";
-			entry.baseline.staged = "";
-			entry.baseline.unstaged = "";
-			entry.baseline.untracked = [];
-		}
-	}
-}
-
 async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise<string> {
-	// Check if HEAD advanced (task committed changes)
 	const currentHead = (await git.head.sha(repoDir)) ?? "";
-	const headAdvanced = currentHead && currentHead !== rb.headCommit;
+	const currentStaged = await git.diff(repoDir, { binary: true, cached: true });
+	const currentUnstaged = await git.diff(repoDir, { binary: true });
+	const currentUntracked = await git.ls.untracked(repoDir);
+	const currentUntrackedPatch = await captureUntrackedPatch(repoDir, currentUntracked);
 
-	if (headAdvanced) {
-		// HEAD moved: use diff-tree to capture committed changes, plus any uncommitted on top
-		const parts: string[] = [];
+	const baselineTree = await writeSyntheticTree(repoDir, rb.headCommit, [rb.staged, rb.unstaged, rb.untrackedPatch]);
+	const currentTree = await writeSyntheticTree(repoDir, currentHead, [
+		currentStaged,
+		currentUnstaged,
+		currentUntrackedPatch,
+	]);
 
-		// Committed changes since baseline
-		const committedDiff = await git.diff.tree(repoDir, rb.headCommit, currentHead, {
-			allowFailure: true,
-			binary: true,
-		});
-		if (committedDiff.trim()) parts.push(committedDiff);
-
-		// Uncommitted changes on top of the new HEAD
-		const staged = await git.diff(repoDir, { binary: true, cached: true });
-		const unstaged = await git.diff(repoDir, { binary: true });
-		if (staged.trim()) parts.push(staged);
-		if (unstaged.trim()) parts.push(unstaged);
-
-		// New untracked files (relative to both baseline and current tracking)
-		const currentUntracked = await git.ls.untracked(repoDir);
-		const baselineUntracked = new Set(rb.untracked);
-		const newUntracked = currentUntracked.filter(entry => !baselineUntracked.has(entry));
-		if (newUntracked.length > 0) {
-			const nullPath = getGitNoIndexNullPath();
-			const untrackedDiffs = await Promise.all(
-				newUntracked.map(entry =>
-					git.diff(repoDir, {
-						allowFailure: true,
-						binary: true,
-						noIndex: { left: nullPath, right: entry },
-					}),
-				),
-			);
-			parts.push(...untrackedDiffs.filter(d => d.trim()));
-		}
-
-		return parts.join("\n");
-	}
-
-	// HEAD unchanged: use temp index approach (subtracts baseline from delta)
-	const tempIndex = path.join(os.tmpdir(), `omp-task-index-${Snowflake.next()}`);
-	try {
-		await git.readTree(repoDir, rb.headCommit, {
-			env: { GIT_INDEX_FILE: tempIndex },
-		});
-		await git.patch.applyText(repoDir, rb.staged, {
-			cached: true,
-			env: { GIT_INDEX_FILE: tempIndex },
-		});
-		await git.patch.applyText(repoDir, rb.unstaged, {
-			cached: true,
-			env: { GIT_INDEX_FILE: tempIndex },
-		});
-		const diff = await git.diff(repoDir, {
-			binary: true,
-			env: { GIT_INDEX_FILE: tempIndex },
-		});
-
-		const currentUntracked = await git.ls.untracked(repoDir);
-		const baselineUntracked = new Set(rb.untracked);
-		const newUntracked = currentUntracked.filter(entry => !baselineUntracked.has(entry));
-
-		if (newUntracked.length === 0) return diff;
-
-		const nullPath = getGitNoIndexNullPath();
-		const untrackedDiffs = await Promise.all(
-			newUntracked.map(entry =>
-				git.diff(repoDir, {
-					allowFailure: true,
-					binary: true,
-					noIndex: { left: nullPath, right: entry },
-				}),
-			),
-		);
-		return `${diff}${diff && !diff.endsWith("\n") ? "\n" : ""}${untrackedDiffs.join("\n")}`;
-	} finally {
-		await fs.rm(tempIndex, { force: true });
-	}
+	return git.diff.tree(repoDir, baselineTree, currentTree, {
+		allowFailure: true,
+		binary: true,
+	});
 }
 
 export interface NestedRepoPatch {
@@ -318,119 +228,140 @@ export async function applyNestedPatches(
 	}
 }
 
-export async function cleanupWorktree(dir: string): Promise<void> {
-	try {
-		const repository = await git.repo.resolve(dir);
-		const commonDir = repository?.commonDir ?? "";
-		if (commonDir && path.basename(commonDir) === ".git") {
-			const repoRoot = path.dirname(commonDir);
-			await git.worktree.tryRemove(repoRoot, dir);
-		}
-	} finally {
-		await fs.rm(dir, { recursive: true, force: true });
+// ═══════════════════════════════════════════════════════════════════════════
+// Unified isolation lifecycle — picks the best backend via the PAL and
+// returns the merged-view path together with the resolved kind.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * User-facing isolation mode names exposed by the `task.isolation.mode`
+ * setting. Mapped to a backend-kind hint via {@link parseIsolationMode};
+ * the PAL's `iso_resolve` then falls back through the kind order
+ * whenever the hint isn't available on the current host.
+ */
+export type TaskIsolationMode =
+	| "none"
+	| "auto"
+	| "apfs"
+	| "btrfs"
+	| "zfs"
+	| "reflink"
+	| "overlayfs"
+	| "projfs"
+	| "block-clone"
+	| "rcopy"
+	// Legacy values, accepted for back-compat with pre-PAL settings files.
+	| "worktree"
+	| "fuse-overlay"
+	| "fuse-projfs";
+
+/**
+ * Translate a {@link TaskIsolationMode} string to an [`IsoBackendKind`]
+ * the PAL can act on. `"none"` returns `null` (caller skips isolation
+ * entirely); `"auto"` returns `undefined` (no hint — let the resolver
+ * pick). Anything else returns the matching kind.
+ */
+export function parseIsolationMode(mode: TaskIsolationMode): IsoBackendKind | undefined {
+	switch (mode) {
+		case "none":
+		case "auto":
+			return undefined;
+		case "apfs":
+			return IsoBackendKind.Apfs;
+		case "btrfs":
+			return IsoBackendKind.Btrfs;
+		case "zfs":
+			return IsoBackendKind.Zfs;
+		case "reflink":
+			return IsoBackendKind.LinuxReflink;
+		case "overlayfs":
+		case "fuse-overlay":
+			return IsoBackendKind.Overlayfs;
+		case "projfs":
+		case "fuse-projfs":
+			return IsoBackendKind.Projfs;
+		case "block-clone":
+			return IsoBackendKind.WindowsBlockClone;
+		case "rcopy":
+		case "worktree":
+			return IsoBackendKind.Rcopy;
 	}
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Fuse-overlay isolation (Unix)
-// ═══════════════════════════════════════════════════════════════════════════
+export interface IsolationHandle {
+	/** Merged view materialised by the backend; pass this to the task. */
+	mergedDir: string;
+	/** Backend the PAL actually used. */
+	backend: IsoBackendKind;
+	/** True when the resolver downgraded from `preferred` to `backend`. */
+	fellBack: boolean;
+	/** Optional reason associated with `fellBack`. */
+	fallbackReason: string | null;
+}
 
-export async function ensureFuseOverlay(baseCwd: string, id: string): Promise<string> {
-	if (process.platform === "win32") {
-		throw new Error('fuse-overlay isolation is unsupported on Windows. Use task.isolation.mode = "fuse-projfs".');
-	}
+/**
+ * Materialise `merged` for a single task. `preferred` is a hint — when
+ * its prerequisites are missing the PAL silently falls back, and the
+ * caller learns about that through `IsolationHandle.fellBack` +
+ * `fallbackReason`.
+ */
 
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+export async function ensureIsolation(
+	baseCwd: string,
+	id: string,
+	preferred?: IsoBackendKind,
+): Promise<IsolationHandle> {
 	const repoRoot = await getRepoRoot(baseCwd);
 	const encodedProject = getEncodedProjectName(repoRoot);
 	const baseDir = getWorktreeDir(encodedProject, id);
-	const upperDir = path.join(baseDir, "upper");
-	const workDir = path.join(baseDir, "work");
 	const mergedDir = path.join(baseDir, "merged");
 
-	// Clean up any stale mount at this path (linux only)
-	const fusermount = $which("fusermount3") ?? $which("fusermount");
-	if (fusermount) {
-		await $`${fusermount} -u ${mergedDir}`.quiet().nothrow();
-	}
+	const resolution = natives.isoResolve(preferred ?? null);
+	const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
+	let fallbackReason = resolution.reason ?? null;
 
-	await fs.rm(baseDir, { recursive: true, force: true });
-	await fs.mkdir(upperDir, { recursive: true });
-	await fs.mkdir(workDir, { recursive: true });
-	await fs.mkdir(mergedDir, { recursive: true });
-
-	const binary = $which("fuse-overlayfs");
-	if (!binary) {
+	for (const candidate of candidates) {
 		await fs.rm(baseDir, { recursive: true, force: true });
-		throw new Error(
-			"fuse-overlayfs not found. Install it (e.g. `apt install fuse-overlayfs` or `pacman -S fuse-overlayfs`) to use fuse-overlay isolation.",
-		);
-	}
-
-	const result = await $`${binary} -o lowerdir=${repoRoot},upperdir=${upperDir},workdir=${workDir} ${mergedDir}`
-		.quiet()
-		.nothrow();
-	if (result.exitCode !== 0) {
-		const stderr = result.stderr.toString().trim();
-		await fs.rm(baseDir, { recursive: true, force: true });
-		throw new Error(`fuse-overlayfs mount failed (exit ${result.exitCode}): ${stderr}`);
-	}
-
-	return mergedDir;
-}
-
-export async function cleanupFuseOverlay(mergedDir: string): Promise<void> {
-	try {
-		const fusermount = $which("fusermount3") ?? $which("fusermount");
-		if (fusermount) {
-			await $`${fusermount} -u ${mergedDir}`.quiet().nothrow();
-		}
-	} finally {
-		// baseDir is the parent of the merged directory
-		const baseDir = path.dirname(mergedDir);
-		await fs.rm(baseDir, { recursive: true, force: true });
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ProjFS isolation (Windows)
-// ═══════════════════════════════════════════════════════════════════════════
-
-export async function ensureProjfsOverlay(baseCwd: string, id: string): Promise<string> {
-	if (process.platform !== "win32") {
-		throw new Error("fuse-projfs isolation is only available on Windows.");
-	}
-
-	const repoRoot = await getRepoRoot(baseCwd);
-	const encodedProject = getEncodedProjectName(repoRoot);
-	const baseDir = getWorktreeDir(encodedProject, id);
-	const mergedDir = path.join(baseDir, "merged");
-
-	await fs.rm(baseDir, { recursive: true, force: true });
-	await fs.mkdir(mergedDir, { recursive: true });
-	try {
-		projfsOverlayStart(repoRoot, mergedDir);
-		return mergedDir;
-	} catch (err) {
-		await fs.rm(baseDir, { recursive: true, force: true });
-		throw err;
-	}
-}
-
-export async function cleanupProjfsOverlay(mergedDir: string): Promise<void> {
-	try {
-		if (process.platform === "win32") {
-			try {
-				projfsOverlayStop(mergedDir);
-			} catch (err) {
-				logger.warn("ProjFS overlay stop failed during cleanup", {
-					mergedDir,
-					error: err instanceof Error ? err.message : String(err),
-				});
+		try {
+			await natives.isoStart(candidate, repoRoot, mergedDir);
+			return {
+				mergedDir,
+				backend: candidate,
+				fellBack: candidate !== resolution.kind || resolution.fellBack,
+				fallbackReason,
+			};
+		} catch (err) {
+			await fs.rm(baseDir, { recursive: true, force: true });
+			const message = errorMessage(err);
+			if (!natives.isoIsUnavailableError(message)) {
+				throw err;
 			}
+			fallbackReason ??= message;
+		}
+	}
+
+	throw new Error(fallbackReason ?? "No isolation backend is available.");
+}
+
+/** Tear down a handle returned by {@link ensureIsolation}. */
+export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+	try {
+		try {
+			await natives.isoStop(handle.backend, handle.mergedDir);
+		} catch (err) {
+			logger.warn("isolation backend stop failed during cleanup", {
+				backend: handle.backend,
+				mergedDir: handle.mergedDir,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 	} finally {
 		// baseDir is the parent of the merged directory
-		const baseDir = path.dirname(mergedDir);
+		const baseDir = path.dirname(handle.mergedDir);
 		await fs.rm(baseDir, { recursive: true, force: true });
 	}
 }

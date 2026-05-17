@@ -28,22 +28,30 @@
 
 `input` syntax accepted at runtime:
 
-- Cell header: `*** Begin <LANG>`; parser accepts `PY`, `PYTHON`, `IPY`, `IPYTHON`, `JS`, `JAVASCRIPT`, `TS`, `TYPESCRIPT` case-insensitively.
-- Optional attributes immediately after the header, first occurrence wins:
-  - `*** Title: ...`
-  - `*** Timeout: <n>[ms|s|m]` (default 30s)
-  - `*** Reset`
-- Cell body: every following line until `*** End ...`, the next `*** Begin ...`, or `*** Abort`.
+- Cell header: `*** Cell <attrs...>`. Attributes are space-separated tokens with quoted titles (`"..."` or `'...'`).
+- Canonical tokens (advertised in the prompt):
+  - `<lang>:"<title>"` — language + title shorthand. `lang` is `py` or `js` (lenient: also `ts`, plus the long-form aliases `python`, `javascript`, `typescript`, `ipy`, `ipython`).
+  - `t:<n>[ms|s|m]` — per-cell timeout (default 30s).
+  - `rst` — wipe this cell's language kernel before running.
+- Lenient additional tokens (accepted by the parser, not advertised):
+  - bare language token (`py`, `js`)
+  - `id:"..."` / `title:"..."` / `name:"..."` / `cell:"..."` / `file:"..."` / `label:"..."` — title aliases
+  - `timeout:` / `duration:` / `time:` — `t:` aliases
+  - `reset` — `rst` alias
+  - `rst:true|false|1|0|yes|no|on|off` — explicit boolean form
+  - a bare positional duration token (`30s`, `2m`, `500ms`)
+  - any unclassified bare token folds into a positional title fragment
+- Cell body: every following line until the next `*** Cell ...`, the optional `*** End`, or `*** Abort`. `*** End` is a quirk fix for GPT-trained models that emit terminators and is not documented in the prompt.
 
 Leniencies in `packages/coding-agent/src/eval/parse.ts`:
 
 - Markers accept two or more leading `*` and flexible whitespace.
-- `*** End` does not need to repeat the language token.
-- Missing end markers between adjacent cells are tolerated; the next `*** Begin` closes the prior cell.
+- `*** End` is optional everywhere; the parser silently consumes trailing tokens (e.g. `*** End py`).
+- Missing terminators between adjacent cells are tolerated; the next `*** Cell` closes the prior cell, and stray non-marker lines between cells fold into the prior cell's body without crashing.
 - Bare code or a single markdown fence such as ```` ```py ```` is treated as one implicit cell.
-- If `*** Abort` appears, the in-progress cell is dropped and the result carries an abort warning.
+- If `*** Abort` appears, the in-progress cell is dropped and the result carries an abort warning. To preserve a completed cell before `*** Abort`, emit `*** End` first.
 
-The tool also exposes a custom Lark grammar from `packages/coding-agent/src/eval/eval.lark` for constrained sampling. That grammar is stricter than the runtime parser: it only advertises `PY` / `JS` / `TS` headers and an `*** End Cell` closer.
+The tool also exposes a custom Lark grammar from `packages/coding-agent/src/eval/eval.lark` for constrained sampling. That grammar is stricter than the runtime parser: it requires the canonical `*** Cell <lang>:"title"` header form with a fixed attribute order, advertises only `py` / `js`, and pins the trailing `*** End` so GPT-trained models' natural terminator habit aligns with the constrained output.
 
 ## Outputs
 
@@ -107,7 +115,7 @@ Side-channel artifacts:
 
 ### Parsing modes
 
-- Explicit multi-cell format with `*** Begin ...` / `*** End ...`
+- Explicit multi-cell format with `*** Cell ...` headers
 - Implicit single-cell fallback for bare code or a single fenced block
 - Abort-recovery parse path when `*** Abort` is present
 
@@ -124,12 +132,12 @@ Side-channel artifacts:
 Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packages/coding-agent/src/eval/js/prelude.txt`.
 
 - Persistent `vm.Context` instances keyed by `js:${sessionId}` in `vmContexts`
-- `*** Reset` calls `resetVmContext(sessionKey)` before the cell executes
+- `rst` calls `resetVmContext(sessionKey)` before the cell executes
 - Top-level `await` and bare `return` are supported by wrapping code in an async IIFE when `wrapCode()` sees `await` or `return`
-- Top-level static `import ... from ...` is rewritten to `await import(...)` by `rewriteStaticImports()`
+- Top-level static `import ... from ...` and dynamic `import(...)` calls are routed through `rewriteImports()`, which sends them via `__omp_import__` so the specifier resolves against the session cwd
 - The prelude installs globals:
   - `display`, `print`
-  - `read`, `write`, `append`, `sort`, `uniq`, `counter`, `diff`, `tree`, `run`, `env`, `output`
+  - `read`, `write`, `append`, `sort`, `uniq`, `counter`, `diff`, `tree`, `env`, `output`
   - `tool.<name>(args)` proxy for arbitrary session tool calls
 - JS helpers are async because they cross the VM/tool boundary
 - `display(value)` behavior:
@@ -145,7 +153,7 @@ Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding
 
 - Default mode is retained `session` kernels keyed by `python:${sessionId}`
 - Optional `python.kernelMode = "per-call"` creates a fresh kernel for each cell and shuts it down afterward
-- `*** Reset` disposes the retained kernel for that session before the cell runs; later Python cells in the same tool call reuse the fresh kernel
+- `rst` disposes the retained kernel for that session before the cell runs; later Python cells in the same tool call reuse the fresh kernel
 - Startup path:
   - availability check
   - create/connect kernel
@@ -177,14 +185,11 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
   - JS/Python prelude helpers can read, write, append, diff, and traverse files under the session cwd or absolute paths.
   - Output may spill to an artifact file via `OutputSink`.
 - Network
-  - Python backend talks to a Jupyter kernel gateway over HTTP and WebSocket.
-  - External gateway mode uses `PI_PYTHON_GATEWAY_URL` and optional `PI_PYTHON_GATEWAY_TOKEN`.
+  - Python backend speaks NDJSON to a local `python3` subprocess over stdin/stdout (no network).
   - JS runtime exposes `fetch` and `tool.<name>()`; those tools may perform additional network I/O.
 - Subprocesses / native bindings
   - Python availability check runs `<python> -c ...`.
-  - Python backend may start or connect to a kernel gateway; details are in `docs/python-repl.md`.
-  - JS `run()` helper spawns `bash -lc <command>` via `Bun.spawn`.
-  - Python `run()` helper spawns `bash` or `sh` via `subprocess.Popen`.
+  - Python backend spawns one `python -u runner.py` subprocess per kernel; cancellation sends `SIGINT`. Details in `docs/python-repl.md`.
 - Session state
   - `session.assertEvalExecutionAllowed?.()` can block execution.
   - `session.trackEvalExecution?.(...)` can register cancellable eval work.

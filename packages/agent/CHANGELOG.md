@@ -1,6 +1,15 @@
 # Changelog
 
 ## [Unreleased]
+### Breaking Changes
+
+- Raised the minimum required Bun version from >=1.3.7 to >=1.3.14
+
+## [14.9.5] - 2026-05-12
+
+### Added
+
+- Added an `isError?: boolean` field on `AgentToolResult` so tools can flag a non-throwing failure (e.g. an aggregator that catches per-entry errors). `coerceToolResult` preserves the flag and the agent loop surfaces it as a tool error on the wire.
 
 ## [14.9.3] - 2026-05-10
 ### Added

@@ -6,12 +6,13 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { glob, type SummaryResult, summarizeCode } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { getRemoteDir, prompt, readImageMetadata, untilAborted } from "@oh-my-pi/pi-utils";
+import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
 import { getFileReadCache } from "../edit/file-read-cache";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
+import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
@@ -24,14 +25,26 @@ import {
 	type TruncationResult,
 	truncateHead,
 	truncateHeadBytes,
+	truncateLine,
 } from "../session/streaming-output";
-import { renderCodeCell, renderStatusLine } from "../tui";
+import { renderCodeCell, renderMarkdownCell, renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { ImageInputTooLargeError, loadImageInput, MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
 import { convertFileWithMarkit } from "../utils/markit";
 import { buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
 import { type ArchiveReader, openArchive, parseArchivePathCandidates } from "./archive-reader";
+import {
+	type ConflictEntry,
+	type ConflictScope,
+	formatConflictSummary,
+	formatConflictWarning,
+	getConflictHistory,
+	parseConflictUri,
+	renderConflictRegion,
+	scanConflictLines,
+	scanFileForConflicts,
+} from "./conflict-detect";
 import {
 	executeReadUrl,
 	isReadableUrlPath,
@@ -42,9 +55,14 @@ import {
 	renderReadUrlResult,
 } from "./fetch";
 import { applyListLimit } from "./list-limit";
-import { formatFullOutputReference, formatStyledTruncationWarning, type OutputMeta } from "./output-meta";
+import {
+	formatFullOutputReference,
+	formatStyledTruncationWarning,
+	type OutputMeta,
+	resolveOutputMaxColumns,
+} from "./output-meta";
 import { expandPath, formatPathRelativeToCwd, resolveReadPath, splitPathAndSel } from "./path-utils";
-import { formatBytes, shortenPath, wrapBrackets } from "./render-utils";
+import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
 import {
 	executeReadQuery,
 	getRowByKey,
@@ -69,6 +87,12 @@ const CONVERTIBLE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx"
 
 const MAX_SUMMARY_BYTES = 2 * 1024 * 1024;
 const MAX_SUMMARY_LINES = 20_000;
+/**
+ * Per-line column cap for file reads. Lines wider than the value of
+ * `tools.outputMaxColumns` are ellipsis-truncated at display time; the file
+ * on disk is unchanged. Shared with the streaming sink path so one setting
+ * covers `bash`/`ssh`/`python`/`js eval` and `read` uniformly.
+ */
 const PROSE_SUMMARY_EXTENSIONS = new Set([".md", ".txt"]);
 // Remote mount path prefix (sshfs mounts) - skip fuzzy matching to avoid hangs
 const REMOTE_MOUNT_PREFIX = getRemoteDir() + path.sep;
@@ -151,18 +175,25 @@ function countTextLines(text: string): number {
 const READ_CHUNK_SIZE = 8 * 1024;
 
 /**
- * Number of unanchored context lines to include before/after a user-requested
- * range. Anchor-stale failures are heavily concentrated on edits whose anchors
- * land just outside the most recent read window — a few lines of pre-anchored
- * context covers off-by-one anchor selection without much cost.
+ * Context lines added around an explicit range read. Anchor-stale failures
+ * cluster on edits whose anchors land just outside the most recent read
+ * window, but the data (`scripts/session-stats/analyze_selector_reads.py`)
+ * shows most follow-up reads are disjoint hops, not adjacent extensions —
+ * so symmetric padding rarely pays for itself.
+ *
+ * Leading=1 catches accidental single-line reads where the anchor is the
+ * line immediately above the requested start. Trailing=3 buffers the
+ * common case where the agent asks for a narrow range and then needs the
+ * next few lines to disambiguate an anchor.
  */
-const RANGE_CONTEXT_LINES = 3;
+const RANGE_LEADING_CONTEXT_LINES = 1;
+const RANGE_TRAILING_CONTEXT_LINES = 3;
 
 /**
- * Expand a [start, end) range with ±RANGE_CONTEXT_LINES context lines on the
+ * Expand a [start, end) range with leading/trailing context lines on the
  * sides where the user actually constrained the range. A start of 0 (no
- * explicit offset) does not get leading context — that's already an open-ended
- * read from the top.
+ * explicit offset) does not get leading context — that's already an
+ * open-ended read from the top.
  */
 function expandRangeWithContext(
 	requestedStart: number,
@@ -172,8 +203,8 @@ function expandRangeWithContext(
 	expandEnd: boolean,
 ): { startLine: number; endLine: number } {
 	return {
-		startLine: expandStart ? Math.max(0, requestedStart - RANGE_CONTEXT_LINES) : requestedStart,
-		endLine: expandEnd ? Math.min(totalLines, requestedEnd + RANGE_CONTEXT_LINES) : requestedEnd,
+		startLine: expandStart ? Math.max(0, requestedStart - RANGE_LEADING_CONTEXT_LINES) : requestedStart,
+		endLine: expandEnd ? Math.min(totalLines, requestedEnd + RANGE_TRAILING_CONTEXT_LINES) : requestedEnd,
 	};
 }
 
@@ -454,6 +485,8 @@ export interface ReadToolDetails {
 	 * so the TUI can render the file content with its own gutter without re-parsing the formatted text. */
 	displayContent?: { text: string; startLine: number };
 	summary?: { lines: number; elidedSpans: number };
+	/** Number of unresolved git conflicts surfaced by this read (TUI uses for inline `⚠ N` badge). */
+	conflictCount?: number;
 }
 
 type ReadParams = ReadToolInput;
@@ -462,6 +495,7 @@ type ReadParams = ReadToolInput;
 type ParsedSelector =
 	| { kind: "none" }
 	| { kind: "raw" }
+	| { kind: "conflicts" }
 	| { kind: "lines"; startLine: number; endLine: number | undefined; raw?: boolean };
 
 const LINE_RANGE_RE = /^L?(\d+)(?:([-+])L?(\d+))?$/i;
@@ -520,6 +554,7 @@ function parseSel(sel: string | undefined): ParsedSelector {
 	}
 
 	if (sel.toLowerCase() === "raw") return { kind: "raw" };
+	if (sel.toLowerCase() === "conflicts") return { kind: "conflicts" };
 	const range = parseLineRangeChunk(sel);
 	if (range) {
 		return { kind: "lines", startLine: range.startLine, endLine: range.endLine };
@@ -1029,12 +1064,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 	}
 
+	#routeReadThroughBridge(
+		absolutePath: string,
+		options?: { line?: number; limit?: number },
+	): Promise<string> | undefined {
+		const bridge = this.session.getClientBridge?.();
+		if (!bridge?.capabilities.readTextFile || !bridge.readTextFile) return undefined;
+		return bridge.readTextFile({ path: absolutePath, ...options });
+	}
+
 	async #trySummarize(absolutePath: string, fileSize: number, signal?: AbortSignal): Promise<SummaryResult | null> {
 		if (fileSize > MAX_SUMMARY_BYTES) return null;
 
 		try {
 			throwIfAborted(signal);
-			const code = await Bun.file(absolutePath).text();
+			const bridgePromise = this.#routeReadThroughBridge(absolutePath);
+			const code =
+				bridgePromise !== undefined
+					? await bridgePromise.catch(() => Bun.file(absolutePath).text())
+					: await Bun.file(absolutePath).text();
 			throwIfAborted(signal);
 			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
 
@@ -1152,6 +1200,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (readPath.startsWith("file://")) {
 			readPath = expandPath(readPath);
 		}
+
+		const conflictUri = parseConflictUri(readPath);
+		if (conflictUri) {
+			if (conflictUri.id === "*") {
+				throw new ToolError(
+					"Reading `conflict://*` is not supported — wildcards are write-only. Use the `<path>:conflicts` read selector for the full list of conflicts in a file, or read `conflict://<N>` to inspect a single block.",
+				);
+			}
+			return this.#readConflictRegion(conflictUri.id, conflictUri.scope);
+		}
 		const displayMode = resolveFileDisplayMode(this.session);
 
 		const parsedUrlTarget = parseReadUrlTarget(readPath);
@@ -1181,11 +1239,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		// Handle internal URLs (agent://, artifact://, memory://, skill://, rule://, local://, mcp://)
 		const internalTarget = splitPathAndSel(readPath);
-		const internalRouter = this.session.internalRouter;
-		if (internalRouter?.canHandle(internalTarget.path)) {
+		const internalRouter = InternalUrlRouter.instance();
+		if (internalRouter.canHandle(internalTarget.path)) {
 			const parsed = parseSel(internalTarget.sel);
 			const { offset, limit } = selToOffsetLimit(parsed);
-			return this.#handleInternalUrl(internalTarget.path, offset, limit, { raw: isRawSelector(parsed) });
+			return this.#handleInternalUrl(internalTarget.path, offset, limit, { raw: isRawSelector(parsed) }, signal);
 		}
 
 		const archivePath = await this.#resolveArchiveReadPath(readPath, signal);
@@ -1256,16 +1314,19 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			return dirResult;
 		}
 
+		if (parsed.kind === "conflicts") {
+			return this.#readFileConflicts(absolutePath, suffixResolution, signal);
+		}
+
 		const imageMetadata = await readImageMetadata(absolutePath);
 		const mimeType = imageMetadata?.mimeType;
 		const ext = path.extname(absolutePath).toLowerCase();
-		const _hasEditTool = this.session.hasEditTool ?? true;
-		const _language = getLanguageFromPath(absolutePath);
 		const shouldConvertWithMarkit = CONVERTIBLE_EXTENSIONS.has(ext);
 		// Read the file based on type
 		let content: Array<TextContent | ImageContent> | undefined;
 		let details: ReadToolDetails = {};
 		let sourcePath: string | undefined;
+		let columnTruncated = 0;
 		let truncationInfo:
 			| { result: TruncationResult; options: { direction: "head"; startLine?: number; totalFileLines?: number } }
 			| undefined;
@@ -1383,13 +1444,36 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (!content) {
 				// Raw text or line-range mode
 				const { offset, limit } = selToOffsetLimit(parsed);
+				// Try ACP bridge first — editor's in-memory buffer is source of truth.
+				// Request full text so local range rendering keeps normal context and line numbers.
+				const bridgePromise = this.#routeReadThroughBridge(absolutePath);
+				if (bridgePromise !== undefined) {
+					try {
+						const bridgeText = await bridgePromise;
+						const bridgeResult = this.#buildInMemoryTextResult(bridgeText, offset, limit, {
+							details: { resolvedPath: absolutePath, suffixResolution },
+							sourcePath: absolutePath,
+							entityLabel: "file",
+							raw: isRawSelector(parsed),
+						});
+						if (suffixResolution) {
+							const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
+							const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
+							if (firstText) firstText.text = `${notice}\n${firstText.text}`;
+						}
+						return bridgeResult;
+					} catch (error) {
+						logger.warn("ACP fs readTextFile failed; falling back to disk", { path: absolutePath, error });
+					}
+				}
+
 				// User-requested 0-indexed range start. Lines BEFORE this become
 				// leading context (added below if offset is explicit).
 				const requestedStart = offset ? Math.max(0, offset - 1) : 0;
 				const expandStart = offset !== undefined && offset > 1;
 				const expandEnd = limit !== undefined;
-				const leadingContext = expandStart ? Math.min(requestedStart, RANGE_CONTEXT_LINES) : 0;
-				const trailingContext = expandEnd ? RANGE_CONTEXT_LINES : 0;
+				const leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
+				const trailingContext = expandEnd ? RANGE_TRAILING_CONTEXT_LINES : 0;
 				const startLine = requestedStart - leadingContext;
 				const startLineDisplay = startLine + 1;
 
@@ -1432,6 +1516,22 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						.done();
 				}
 
+				// Per-line column cap. Skipped in raw mode so `:raw` always returns
+				// verbatim bytes for paste-back-into-tool workflows. Total byte/line
+				// counts in `truncation` keep reflecting the source, not the trimmed
+				// view — column truncation surfaces separately via `.limits()`.
+				const rawSelector = isRawSelector(parsed);
+				const maxColumns = resolveOutputMaxColumns(this.session.settings);
+				if (!rawSelector && maxColumns > 0) {
+					for (let i = 0; i < collectedLines.length; i++) {
+						const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
+						if (wasTruncated) {
+							collectedLines[i] = text;
+							columnTruncated = maxColumns;
+						}
+					}
+				}
+
 				const selectedContent = collectedLines.join("\n");
 				const userLimitedLines = collectedLines.length;
 
@@ -1456,9 +1556,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					getFileReadCache(this.session).recordContiguous(absolutePath, startLineDisplay, collectedLines);
 				}
 
-				const isRawMode = isRawSelector(parsed);
-				const shouldAddHashLines = !isRawMode && displayMode.hashLines;
-				const shouldAddLineNumbers = isRawMode ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
+				const shouldAddHashLines = !rawSelector && displayMode.hashLines;
+				const shouldAddLineNumbers = rawSelector ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
 				let capturedDisplayContent: { text: string; startLine: number } | undefined;
 				const formatText = (text: string, startNum: number): string => {
 					capturedDisplayContent = { text, startLine: startNum };
@@ -1516,6 +1615,38 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					details.displayContent = capturedDisplayContent;
 				}
 
+				if (!firstLineExceedsLimit && collectedLines.length > 0) {
+					const blocks = scanConflictLines(collectedLines, startLineDisplay);
+					if (blocks.length > 0) {
+						const history = getConflictHistory(this.session);
+						const displayPathForWarning = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+						const entries = blocks.map(block =>
+							history.register({
+								absolutePath,
+								displayPath: displayPathForWarning,
+								...block,
+							}),
+						);
+						// Cheap full-file scan only when the window already showed
+						// at least one conflict — otherwise pay nothing on clean files.
+						let totalInFile = entries.length;
+						let scanTruncated = false;
+						try {
+							const fileScan = await scanFileForConflicts(absolutePath);
+							totalInFile = Math.max(entries.length, fileScan.blocks.length);
+							scanTruncated = fileScan.scanTruncated;
+						} catch {
+							// Best-effort enrichment; fall back to window-only count.
+						}
+						outputText += formatConflictWarning(entries, {
+							totalInFile,
+							displayPath: displayPathForWarning,
+							scanTruncated,
+						});
+						details.conflictCount = entries.length;
+					}
+				}
+
 				content = [{ type: "text", text: outputText }];
 			}
 		}
@@ -1538,7 +1669,75 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (truncationInfo) {
 			resultBuilder.truncation(truncationInfo.result, truncationInfo.options);
 		}
+		if (columnTruncated > 0) {
+			resultBuilder.limits({ columnMax: columnTruncated });
+		}
 		return resultBuilder.done();
+	}
+
+	/**
+	 * Render a `conflict://<N>` (or `conflict://<N>/<scope>`) region as
+	 * regular file content. The lines are emitted with their original
+	 * file line numbers so hashline anchors line up with the source
+	 * file, and no truncation footer is appended.
+	 */
+	async #readConflictRegion(id: number, scope: ConflictScope | undefined): Promise<AgentToolResult<ReadToolDetails>> {
+		const entry: ConflictEntry | undefined = getConflictHistory(this.session).get(id);
+		if (!entry) {
+			throw new ToolError(
+				`Conflict #${id} not found. Conflict ids are registered when \`read\` surfaces a marker block; re-read the file to get a current id.`,
+			);
+		}
+
+		const region = renderConflictRegion(entry, scope);
+		const displayMode = resolveFileDisplayMode(this.session);
+		const shouldAddHashLines = displayMode.hashLines;
+		const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
+
+		const rawText = region.lines.join("\n");
+		const formattedText = formatTextWithMode(rawText, region.startLine, shouldAddHashLines, shouldAddLineNumbers);
+
+		const details: ReadToolDetails = {
+			resolvedPath: entry.absolutePath,
+			displayContent: { text: rawText, startLine: region.startLine },
+		};
+		return toolResult<ReadToolDetails>(details).text(formattedText).sourcePath(entry.absolutePath).done();
+	}
+
+	/**
+	 * Implement the `<path>:conflicts` read selector: scan the whole file once, register
+	 * every block in the session's conflict history, and return a compact
+	 * `#N L_a-L_b` index instead of file content. Designed for heavily
+	 * conflicted files where dumping every body would be wasteful.
+	 */
+	async #readFileConflicts(
+		absolutePath: string,
+		suffixResolution: { from: string; to: string } | undefined,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<ReadToolDetails>> {
+		throwIfAborted(signal);
+		const scan = await scanFileForConflicts(absolutePath);
+		const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+		const history = getConflictHistory(this.session);
+		const entries = scan.blocks.map(block =>
+			history.register({
+				absolutePath,
+				displayPath,
+				...block,
+			}),
+		);
+
+		const summary =
+			entries.length === 0
+				? `No unresolved git merge conflicts in ${displayPath}.`
+				: formatConflictSummary(entries, { displayPath, scanTruncated: scan.scanTruncated });
+
+		const details: ReadToolDetails = {
+			resolvedPath: absolutePath,
+			suffixResolution,
+			conflictCount: entries.length,
+		};
+		return toolResult<ReadToolDetails>(details).text(summary).sourcePath(absolutePath).done();
 	}
 
 	/**
@@ -1550,8 +1749,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		offset?: number,
 		limit?: number,
 		options?: { raw?: boolean },
+		signal?: AbortSignal,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		const internalRouter = this.session.internalRouter!;
+		const internalRouter = InternalUrlRouter.instance();
 
 		// Check if URL has query extraction (agent:// only).
 		// Use parseInternalUrl which handles colons in host (namespaced skills).
@@ -1576,8 +1776,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 
 		// Resolve the internal URL
-		const resource = await internalRouter.resolve(url);
-		const details: ReadToolDetails = { resolvedPath: resource.sourcePath };
+		const resource = await internalRouter.resolve(url, {
+			cwd: this.session.cwd,
+			settings: this.session.settings,
+			signal,
+		});
+		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
 
 		// If extraction was used, return directly (no pagination)
 		if (hasExtraction) {
@@ -1676,20 +1880,44 @@ export const readToolRenderer = {
 	},
 
 	renderResult(
-		result: { content: Array<{ type: string; text?: string }>; details?: ReadToolDetails },
-		_options: RenderResultOptions,
+		result: { content: Array<{ type: string; text?: string }>; details?: ReadToolDetails; isError?: boolean },
+		options: RenderResultOptions,
 		uiTheme: Theme,
 		args?: ReadRenderArgs,
 	): Component {
 		const urlDetails = result.details as ReadUrlToolDetails | undefined;
 		if (urlDetails?.kind === "url" || isReadableUrlPath(args?.file_path || args?.path || "")) {
 			return renderReadUrlResult(
-				result as { content: Array<{ type: string; text?: string }>; details?: ReadUrlToolDetails },
-				_options,
+				result as {
+					content: Array<{ type: string; text?: string }>;
+					details?: ReadUrlToolDetails;
+					isError?: boolean;
+				},
+				options,
 				uiTheme,
 			);
 		}
 
+		if (result.isError) {
+			const rawErrorText = result.content?.find(c => c.type === "text")?.text ?? "";
+			const errorText = (rawErrorText || "Unknown error").replace(/^Error:\s*/, "");
+			const rawPath = args?.file_path || args?.path || "";
+			const filePath = shortenPath(rawPath);
+			let title = filePath ? `Read ${filePath}` : "Read";
+			if (args?.offset !== undefined || args?.limit !== undefined) {
+				const startLine = args.offset ?? 1;
+				const endLine = args.limit !== undefined ? startLine + args.limit - 1 : "";
+				title += `:${startLine}${endLine ? `-${endLine}` : ""}`;
+			}
+			const header = renderStatusLine({ icon: "error", title }, uiTheme);
+			const errorLines = errorText.split("\n").map(line => uiTheme.fg("error", replaceTabs(line)));
+			const outputBlock = new CachedOutputBlock();
+			return {
+				render: (width: number) =>
+					outputBlock.render({ header, state: "error", sections: [{ lines: errorLines }], width }, uiTheme),
+				invalidate: () => outputBlock.invalidate(),
+			};
+		}
 		const details = result.details;
 		const rawText = result.content?.find(c => c.type === "text")?.text ?? "";
 		// Prefer structured `displayContent` from details when available so the TUI
@@ -1698,7 +1926,7 @@ export const readToolRenderer = {
 		const imageContent = result.content?.find(c => c.type === "image");
 		const rawPath = args?.file_path || args?.path || "";
 		const filePath = shortenPath(rawPath);
-		const lang = getLanguageFromPath(rawPath);
+		const lang = getLanguageFromPath(splitPathAndSel(rawPath).path);
 
 		const warningLines: string[] = [];
 		const truncation = details?.meta?.truncation;
@@ -1762,28 +1990,50 @@ export const readToolRenderer = {
 		if (details?.summary) {
 			title += ` (summary: ${details.summary.elidedSpans} elided span${details.summary.elidedSpans === 1 ? "" : "s"})`;
 		}
+		if (details?.conflictCount && details.conflictCount > 0) {
+			const n = details.conflictCount;
+			title += ` ${uiTheme.fg("warning", `(⚠ ${n} conflict${n === 1 ? "" : "s"})`)}`;
+		}
+		const rawRequested = args?.raw === true || isRawSelector(parseSel(splitPathAndSel(rawPath).sel));
+		const isMarkdown = details?.contentType === "text/markdown" && !rawRequested;
 		let cachedWidth: number | undefined;
+		let cachedExpanded: boolean | undefined;
 		let cachedLines: string[] | undefined;
 		return {
 			render: (width: number) => {
-				if (cachedLines && cachedWidth === width) return cachedLines;
-				cachedLines = renderCodeCell(
-					{
-						code: contentText,
-						language: lang,
-						title,
-						status: "complete",
-						output: warningLines.length > 0 ? warningLines.join("\n") : undefined,
-						expanded: true,
-						width,
-					},
-					uiTheme,
-				);
+				const expanded = options.expanded;
+				if (cachedLines && cachedWidth === width && cachedExpanded === expanded) return cachedLines;
+				cachedLines = isMarkdown
+					? renderMarkdownCell(
+							{
+								content: contentText,
+								title,
+								status: "complete",
+								output: warningLines.length > 0 ? warningLines.join("\n") : undefined,
+								expanded,
+								width,
+							},
+							uiTheme,
+						)
+					: renderCodeCell(
+							{
+								code: contentText,
+								language: lang,
+								title,
+								status: "complete",
+								output: warningLines.length > 0 ? warningLines.join("\n") : undefined,
+								expanded,
+								width,
+							},
+							uiTheme,
+						);
 				cachedWidth = width;
+				cachedExpanded = expanded;
 				return cachedLines;
 			},
 			invalidate: () => {
 				cachedWidth = undefined;
+				cachedExpanded = undefined;
 				cachedLines = undefined;
 			},
 		};

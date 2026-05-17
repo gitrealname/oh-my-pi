@@ -20,7 +20,9 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { TSchema } from "@sinclair/typebox";
 import type { ToolSession } from "..";
+import { AsyncJobManager } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
@@ -34,7 +36,6 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
-import { resolveIsolationBackendForTaskExecution } from "./isolation-backend";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
@@ -48,20 +49,17 @@ import {
 	type TaskToolDetails,
 } from "./types";
 import {
-	applyBaseline,
 	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
-	cleanupFuseOverlay,
-	cleanupProjfsOverlay,
+	cleanupIsolation,
 	cleanupTaskBranches,
-	cleanupWorktree,
 	commitToBranch,
-	ensureFuseOverlay,
-	ensureProjfsOverlay,
-	ensureWorktree,
+	ensureIsolation,
 	getRepoRoot,
+	type IsolationHandle,
 	mergeTaskBranches,
+	parseIsolationMode,
 	type WorktreeBaseline,
 } from "./worktree";
 
@@ -141,6 +139,7 @@ function renderDescription(
 	asyncEnabled: boolean,
 	disabledAgents: string[],
 	simpleMode: TaskSimpleMode,
+	ircEnabled: boolean,
 ): string {
 	const filteredAgents = disabledAgents.length > 0 ? agents.filter(a => !disabledAgents.includes(a.name)) : agents;
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
@@ -151,6 +150,7 @@ function renderDescription(
 		asyncEnabled,
 		contextEnabled,
 		customSchemaEnabled,
+		ircEnabled,
 		defaultMode: simpleMode === "default",
 		schemaFreeMode: simpleMode === "schema-free",
 		independentMode: simpleMode === "independent",
@@ -229,6 +229,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 			this.session.settings.get("async.enabled"),
 			disabledAgents,
 			this.#getTaskSimpleMode(),
+			this.session.settings.get("irc.enabled") === true,
 		);
 	}
 	private constructor(
@@ -270,7 +271,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 			return this.#executeSync(_toolCallId, params, signal, onUpdate);
 		}
 
-		const manager = this.session.asyncJobManager;
+		const manager = AsyncJobManager.instance();
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "Async execution is enabled but no async job manager is available." }],
@@ -305,6 +306,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				recentOutput: [],
 				toolCount: 0,
 				tokens: 0,
+				cost: 0,
 				durationMs: 0,
 			});
 		}
@@ -389,6 +391,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 										: "failed";
 								progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
 								progress.tokens = singleResult?.tokens ?? 0;
+								progress.cost = singleResult?.usage?.cost.total ?? 0;
 								progress.extractedToolData = singleResult?.extractedToolData;
 							}
 							completedJobs += 1;
@@ -444,6 +447,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 					},
 					{
 						id: label,
+						ownerId: this.session.getAgentId?.() ?? undefined,
 						onProgress: (text, details) => {
 							const progressDetails =
 								(details as TaskToolDetails | undefined) ??
@@ -481,11 +485,27 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				? ` Failed to schedule ${failedSchedules.length} task${failedSchedules.length === 1 ? "" : "s"}.`
 				: "";
 
+		const ircEnabled = this.session.settings.get("irc.enabled") === true;
+		const taskIdByItemId = new Map<string, string>();
+		for (let i = 0; i < taskItems.length; i++) {
+			taskIdByItemId.set(taskItems[i].id, uniqueIds[i]);
+		}
+		const startedListing = startedJobs
+			.map(({ taskId }) => {
+				const id = taskIdByItemId.get(taskId) ?? taskId;
+				const desc = progressByTaskId.get(taskId)?.description;
+				return desc ? `- \`${id}\` — ${desc}` : `- \`${id}\``;
+			})
+			.join("\n");
+		const coordinationHint = ircEnabled
+			? ` DM these ids via \`irc\` to coordinate while they run; reach for \`job\` only to inspect (\`list\`), wait (\`poll\`), or cancel a stuck task.`
+			: ` Use \`job\` to inspect (\`list\`), wait (\`poll\`), or cancel a stuck task by id.`;
+
 		return {
 			content: [
 				{
 					type: "text",
-					text: `Started ${startedJobs.length} background task job${startedJobs.length === 1 ? "" : "s"} using ${params.agent}.${scheduleFailureSummary} Results will be delivered when complete.`,
+					text: `Started ${startedJobs.length} background task job${startedJobs.length === 1 ? "" : "s"} using ${params.agent}.${scheduleFailureSummary} Results will be delivered when complete.\n${startedListing}\n${coordinationHint}`,
 				},
 			],
 			details: {
@@ -524,7 +544,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				content: [
 					{
 						type: "text",
-						text: "Task isolation is disabled. Remove the isolated argument or set task.isolation.mode to 'worktree', 'fuse-overlay', or 'fuse-projfs'.",
+						text: "Task isolation is disabled.",
 					},
 				],
 				details: {
@@ -694,28 +714,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 			}
 		}
 
-		let effectiveIsolationMode = isolationMode;
-		let isolationBackendWarning = "";
-		try {
-			const resolvedIsolation = await resolveIsolationBackendForTaskExecution(isolationMode, isIsolated, repoRoot);
-			effectiveIsolationMode = resolvedIsolation.effectiveIsolationMode;
-			isolationBackendWarning = resolvedIsolation.warning;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return {
-				content: [
-					{
-						type: "text",
-						text: message,
-					},
-				],
-				details: {
-					projectAgentsDir,
-					results: [],
-					totalDurationMs: Date.now() - startTime,
-				},
-			};
-		}
+		const preferredIsolationBackend = parseIsolationMode(isolationMode);
 
 		// Derive artifacts directory
 		const sessionFile = this.session.getSessionFile();
@@ -728,6 +727,10 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
+
+		// Subagents adopt the parent's ArtifactManager so artifact IDs are unique
+		// across the whole tree and outputs land flat in the parent's dir.
+		const parentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
 
 		// Initialize progress tracking
 		const progressMap = new Map<number, AgentProgress>();
@@ -785,9 +788,11 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				};
 			}
 
-			// Write parent conversation context for subagents
+			// Write parent conversation context for subagents. When IRC is available,
+			// subagents should ask live peers instead of reading a stale markdown dump.
 			await fs.mkdir(effectiveArtifactsDir, { recursive: true });
-			const compactContext = this.session.getCompactContext?.();
+			const shouldWriteConversationContext = this.session.settings.get("irc.enabled") !== true;
+			const compactContext = shouldWriteConversationContext ? this.session.getCompactContext?.() : undefined;
 			let contextFilePath: string | undefined;
 			if (compactContext) {
 				contextFilePath = path.join(effectiveArtifactsDir, "context.md");
@@ -828,6 +833,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 					recentOutput: [],
 					toolCount: 0,
 					tokens: 0,
+					cost: 0,
 					durationMs: 0,
 					modelOverride,
 					description: taskItem.description,
@@ -867,32 +873,27 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						authStorage: this.session.authStorage,
 						modelRegistry: this.session.modelRegistry,
 						settings: this.session.settings,
-						mcpManager: this.session.mcpManager,
+						mcpManager: MCPManager.instance(),
 						contextFiles,
 						skills: availableSkills,
 						workspaceTree: this.session.workspaceTree,
 						promptTemplates,
 						localProtocolOptions,
+						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 					});
 				}
 
 				const taskStart = Date.now();
-				let isolationDir: string | undefined;
+				let isolationHandle: IsolationHandle | undefined;
 				try {
 					if (!repoRoot || !baseline) {
 						throw new Error("Isolated task execution not initialized.");
 					}
 					const taskBaseline = structuredClone(baseline);
 
-					if (effectiveIsolationMode === "fuse-overlay") {
-						isolationDir = await ensureFuseOverlay(repoRoot, task.id);
-					} else if (effectiveIsolationMode === "fuse-projfs") {
-						isolationDir = await ensureProjfsOverlay(repoRoot, task.id);
-					} else {
-						isolationDir = await ensureWorktree(repoRoot, task.id);
-						await applyBaseline(isolationDir, taskBaseline);
-					}
+					isolationHandle = await ensureIsolation(repoRoot, task.id, preferredIsolationBackend);
+					const isolationDir = isolationHandle.mergedDir;
 
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
@@ -925,12 +926,13 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						authStorage: this.session.authStorage,
 						modelRegistry: this.session.modelRegistry,
 						settings: this.session.settings,
-						mcpManager: this.session.mcpManager,
+						mcpManager: MCPManager.instance(),
 						contextFiles,
 						skills: availableSkills,
 						workspaceTree: this.session.workspaceTree,
 						promptTemplates,
 						localProtocolOptions,
+						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 					});
 					if (mergeMode === "branch" && result.exitCode === 0) {
@@ -1003,14 +1005,8 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						error: message,
 					};
 				} finally {
-					if (isolationDir) {
-						if (effectiveIsolationMode === "fuse-overlay") {
-							await cleanupFuseOverlay(isolationDir);
-						} else if (effectiveIsolationMode === "fuse-projfs") {
-							await cleanupProjfsOverlay(isolationDir);
-						} else {
-							await cleanupWorktree(isolationDir);
-						}
+					if (isolationHandle) {
+						await cleanupIsolation(isolationHandle);
 					}
 				}
 			};
@@ -1253,7 +1249,6 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 			});
 
 			const outputIds = results.filter(r => !r.aborted || r.output.trim()).map(r => `agent://${r.id}`);
-			const backendSummaryPrefix = isolationBackendWarning ? `\n\n${isolationBackendWarning}` : "";
 			const summary = prompt.render(taskSummaryTemplate, {
 				successCount,
 				totalCount: results.length,
@@ -1263,7 +1258,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 				summaries,
 				outputIds,
 				agentName,
-				mergeSummary: `${backendSummaryPrefix}${mergeSummary}`,
+				mergeSummary,
 			});
 
 			// Cleanup temp directory if used

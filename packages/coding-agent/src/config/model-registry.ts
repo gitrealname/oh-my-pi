@@ -18,6 +18,8 @@ import {
 	registerCustomApi,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
+	UNK_CONTEXT_WINDOW,
+	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@oh-my-pi/pi-ai";
 
@@ -29,10 +31,10 @@ import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/utils/oauth/types";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
-import { type ConfigError, ConfigFile } from "../config";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
+import { type ConfigError, ConfigFile } from "./config-file";
 import {
 	buildCanonicalModelIndex,
 	type CanonicalModelIndex,
@@ -1055,7 +1057,16 @@ export class ModelRegistry {
 			const key = `${replacementModel.provider}\u0000${replacementModel.id}`;
 			const existingIndex = indexByKey.get(key);
 			if (existingIndex !== undefined) {
-				merged[existingIndex] = replacementModel;
+				const existing = merged[existingIndex];
+				merged[existingIndex] = {
+					...replacementModel,
+					contextWindow:
+						replacementModel.contextWindow === UNK_CONTEXT_WINDOW
+							? existing.contextWindow
+							: replacementModel.contextWindow,
+					maxTokens:
+						replacementModel.maxTokens === UNK_MAX_TOKENS ? existing.maxTokens : replacementModel.maxTokens,
+				};
 			} else {
 				merged.push(replacementModel);
 				indexByKey.set(key, merged.length - 1);
@@ -2073,6 +2084,19 @@ export class ModelRegistry {
 	 */
 	getAvailable(): Model<Api>[] {
 		return this.#models.filter(model => this.#isModelAvailable(model));
+	}
+
+	/**
+	 * Check whether auth is configured for a model's provider.
+	 *
+	 * Mirrors the upstream `@mariozechner/pi-coding-agent` API surface so that
+	 * external plugins/extensions and downstream wrappers (e.g. subagent launch
+	 * paths that pre-flight auth before model resolution) can probe a model
+	 * without resolving an API key. Returns true for keyless providers as well
+	 * as providers with stored credentials. See issue #993.
+	 */
+	hasConfiguredAuth(model: Model<Api>): boolean {
+		return this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider);
 	}
 
 	getDiscoverableProviders(): string[] {

@@ -7,6 +7,14 @@ import { logger } from "@oh-my-pi/pi-utils";
  */
 export const SCHEDULE_SLASH_CHANNEL = "tui:schedule-slash";
 
+/**
+ * Channel for TUI output (showStatus / showError / showWarning) to flow back
+ * through the RPC pipe to the parent mtuicontrol session.
+ * Payload: TuiOutputPayload
+ * Only emitted when the child is running with --rpc-pipe (headed+pipe mode).
+ */
+export const PIPE_TUI_OUTPUT_CHANNEL = "tui:pipe-output";
+export type TuiOutputPayload = { level: "status" | "error" | "warning"; text: string };
 
 export class EventBus {
 	readonly #listeners = new Map<string, Set<(data: unknown) => void>>();

@@ -1,24 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { _resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend";
 
 describe("resolveMemoryBackend", () => {
 	beforeEach(() => {
-		_resetSettingsForTest();
+		resetSettingsForTest();
 	});
 
 	afterEach(() => {
-		_resetSettingsForTest();
-	});
-
-	it("returns the off backend when memory.backend is off", () => {
-		const settings = Settings.isolated({ "memory.backend": "off" });
-		expect(resolveMemoryBackend(settings).id).toBe("off");
-	});
-
-	it("returns the local backend when memory.backend is local", () => {
-		const settings = Settings.isolated({ "memory.backend": "local", "memories.enabled": false });
-		expect(resolveMemoryBackend(settings).id).toBe("local");
+		resetSettingsForTest();
 	});
 
 	it("returns the hindsight backend when memory.backend is hindsight, regardless of legacy memories.enabled", () => {

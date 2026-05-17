@@ -84,7 +84,86 @@ describe("executeJs", () => {
 		expect(resetResult.output.trim()).toBe("undefined");
 	});
 
-	it("exposes a read-only safe process subset", async () => {
+	it("persists bindings when auto-displaying the final expression", async () => {
+		const first = await executeJs("const inspected = 40; inspected + 2;", { sessionId, session, sessionFile });
+		expect(first.exitCode).toBe(0);
+		expect(first.output.trim()).toBe("42");
+
+		const persisted = await executeJs("return inspected + 1;", { sessionId, session, sessionFile });
+		expect(persisted.exitCode).toBe(0);
+		expect(persisted.output.trim()).toBe("41");
+	});
+
+	it("does not expose the final expression marker as a global property", async () => {
+		const result = await executeJs("const localOnly = 7; localOnly;", { sessionId, session, sessionFile });
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("7");
+
+		const marker = await executeJs("return Object.hasOwn(globalThis, '__omp_final_expr__');", {
+			sessionId,
+			session,
+			sessionFile,
+		});
+		expect(marker.exitCode).toBe(0);
+		expect(marker.output.trim()).toBe("false");
+
+		const persisted = await executeJs("return localOnly;", { sessionId, session, sessionFile });
+		expect(persisted.exitCode).toBe(0);
+		expect(persisted.output.trim()).toBe("7");
+	});
+
+	it("ignores user-assigned final expression markers without a rewritten final expression", async () => {
+		const result = await executeJs("globalThis.__omp_final_expr__ = 'manual'; return 'actual';", {
+			sessionId,
+			session,
+			sessionFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("actual");
+	});
+
+	it("captures promise-valued final expression before promise callbacks can mutate the marker", async () => {
+		const result = await executeJs(
+			"const pending = Promise.resolve(1).then(value => { globalThis.__omp_final_expr__ = 999; return value; }); pending;",
+			{ sessionId, session, sessionFile },
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("1");
+	});
+
+	it("awaits rewritten thenable final expressions once", async () => {
+		const result = await executeJs(
+			[
+				"globalThis.thenCalls = 0;",
+				"const thenable = {",
+				"  then(resolve) {",
+				"    globalThis.thenCalls++;",
+				"    resolve('done');",
+				"  },",
+				"};",
+				"thenable;",
+			].join("\n"),
+			{ sessionId, session, sessionFile },
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("done");
+
+		const calls = await executeJs("return globalThis.thenCalls;", { sessionId, session, sessionFile });
+		expect(calls.exitCode).toBe(0);
+		expect(calls.output.trim()).toBe("1");
+	});
+
+	it("does not auto-display side-effect import rewrites", async () => {
+		const result = await executeJs('import "node:path";', { sessionId, session, sessionFile });
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("");
+		expect(result.displayOutputs).toEqual([]);
+	});
+
+	it("exposes the worker's real process object", async () => {
 		const result = await executeJs(
 			[
 				"return {",
@@ -92,8 +171,6 @@ describe("executeJs", () => {
 				"  versionsNode: typeof process.versions.node,",
 				"  platform: process.platform,",
 				"  arch: process.arch,",
-				"  cwd: process.cwd(),",
-				"  frozen: Object.isFrozen(process) && Object.isFrozen(process.versions),",
 				"  hasEnv: 'env' in process,",
 				"  hasExit: 'exit' in process,",
 				"};",
@@ -107,10 +184,8 @@ describe("executeJs", () => {
 			versionsNode: "string",
 			platform: process.platform,
 			arch: process.arch,
-			cwd: tempDir.path(),
-			frozen: true,
-			hasEnv: false,
-			hasExit: false,
+			hasEnv: true,
+			hasExit: true,
 		});
 	});
 
@@ -119,7 +194,7 @@ describe("executeJs", () => {
 			[
 				"const uuid = crypto.randomUUID();",
 				"const digest = await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode('ok'));",
-				"const base = process.cwd();",
+				"const base = __omp_session__.cwd;",
 				"fs.mkdirSync(base + '/nested', { recursive: true });",
 				"fs.writeFileSync(base + '/nested/value.txt', 'hello');",
 				"await fs.promises.copyFile(base + '/nested/value.txt', base + '/nested/copy.txt');",
@@ -238,6 +313,54 @@ describe("executeJs", () => {
 		expect(execute.mock.calls[1]?.[1]).toEqual({ path: "agent://agent-42", _i: "js prelude" });
 	});
 
+	it("auto-displays the final awaited expression result", async () => {
+		const execute = vi.fn(
+			async (): Promise<AgentToolResult> => ({
+				content: [{ type: "text", text: "tool output" }],
+				details: { kind: "tool-result" },
+			}),
+		);
+		const toolSession: ToolSession = {
+			...session,
+			getToolByName: name => (name === "read" ? createTool("read", execute) : undefined),
+		};
+
+		const result = await executeJs("await tool.read({ path: 'package.json' });", {
+			sessionId,
+			session: toolSession,
+			sessionFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(getJsonData(result)).toEqual({
+			text: "tool output",
+			details: { kind: "tool-result" },
+			images: undefined,
+		});
+	});
+
+	it("awaits promise-valued final expressions before displaying", async () => {
+		const result = await executeJs("read('config.json');", {
+			sessionId,
+			session,
+			sessionFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe('{\n  "name": "demo",\n  "enabled": true\n}');
+	});
+
+	it("awaits identifier promise final expressions before displaying", async () => {
+		const result = await executeJs("const pending = read('config.json'); pending;", {
+			sessionId,
+			session,
+			sessionFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe('{\n  "name": "demo",\n  "enabled": true\n}');
+	});
+
 	it("auto-displays returned objects as structured output", async () => {
 		const result = await executeJs("return { answer: 42, nested: { ok: true } };", {
 			sessionId,
@@ -273,14 +396,24 @@ describe("executeJs", () => {
 		expect(result.output.trim()).toBe(path.join("a", "b"));
 	});
 
-	it("exposes a cwd-bound `require` and `createRequire`", async () => {
+	it("strips TypeScript syntax before executing user code", async () => {
 		const result = await executeJs(
-			'return { hasRequire: typeof require === "function", hasCreate: typeof createRequire === "function", path: require("node:path").sep };',
+			[
+				"interface Pair { a: number; b: number }",
+				"const make = (a: number, b: number): Pair => ({ a, b });",
+				"const p = make(3, 4) as Pair;",
+				"return p.a + p.b;",
+			].join("\n"),
 			{ sessionId, session, sessionFile },
 		);
 		expect(result.exitCode).toBe(0);
-		expect(result.displayOutputs).toEqual([
-			{ type: "json", data: { hasRequire: true, hasCreate: true, path: path.sep } },
-		]);
+		expect(result.output.trim()).toBe("7");
+	});
+	it("falls back to text display when the final expression value is not structured-cloneable", async () => {
+		const result = await executeJs("({ fn: () => 1 });", { sessionId, session, sessionFile });
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain("[object Object]");
+		// No JSON display because structuredClone fails on the embedded function.
+		expect(result.displayOutputs.filter(o => o.type === "json")).toHaveLength(0);
 	});
 });

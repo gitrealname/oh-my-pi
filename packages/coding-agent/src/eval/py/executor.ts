@@ -1,13 +1,17 @@
 import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { Settings } from "../../config/settings";
 import { OutputSink } from "../../session/streaming-output";
-import { shutdownSharedGateway } from "./gateway-coordinator";
+import type { ToolSession } from "../../tools";
+import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
+import type { JsStatusEvent } from "../js/shared/types";
+import type { KernelDisplayOutput } from "./display";
 import {
 	checkPythonKernelAvailability,
-	type KernelDisplayOutput,
 	type KernelExecuteOptions,
 	type KernelExecuteResult,
 	PythonKernel,
 } from "./kernel";
+import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
 
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_KERNEL_SESSIONS = 4;
@@ -35,13 +39,30 @@ export interface PythonExecutorOptions {
 	kernelMode?: PythonKernelMode;
 	/** Restart the kernel before executing */
 	reset?: boolean;
-	/** Use shared gateway across pi instances (default: true) */
-	useSharedGateway?: boolean;
 	/** Session file path for accessing task outputs */
 	sessionFile?: string;
+	/**
+	 * Effective artifacts directory for the current session. Subagents share
+	 * the parent's directory, so this can differ from `sessionFile`'s sibling
+	 * dir. When present, exported to the kernel as `PI_ARTIFACTS_DIR` and
+	 * preferred over `PI_SESSION_FILE`-derived paths.
+	 */
+	artifactsDir?: string;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
+	/**
+	 * ToolSession used to resolve host-side `tool.<name>(args)` calls made from
+	 * the Python prelude's bridge proxy. When omitted, the bridge env vars are
+	 * not injected and any `tool.foo(...)` raises in Python.
+	 */
+	toolSession?: ToolSession;
+	/** Callback for status events emitted by tool bridge invocations. */
+	emitStatus?: (event: JsStatusEvent) => void;
+	/** @internal Bridge session id, set by `executePython` before delegating. */
+	bridgeSessionId?: string;
+	/** @internal Bridge endpoint info, set by `executePython` before delegating. */
+	bridge?: { url: string; token: string };
 }
 
 export interface PythonKernelExecutor {
@@ -80,7 +101,6 @@ interface KernelSession {
 	restartCount: number;
 	dead: boolean;
 	needsRestart: boolean;
-	kernelInvalidatedByRecovery: boolean;
 	disposing: boolean;
 	disposeCapacityPromise?: Promise<void>;
 	resolveDisposeCapacity?: () => void;
@@ -100,11 +120,15 @@ const disposingKernelSessions = new Set<KernelSession>();
 let cleanupTimer: NodeJS.Timeout | null = null;
 
 interface KernelSessionExecutionOptions {
-	useSharedGateway?: boolean;
 	sessionFile?: string;
+	artifactsDir?: string;
 	signal?: AbortSignal;
 	deadlineMs?: number;
 	kernelOwnerId?: string;
+	/** Bridge session identifier exported into the kernel env as PI_TOOL_BRIDGE_SESSION. */
+	bridgeSessionId?: string;
+	/** Cached bridge connection info. When present, env vars for tool.<name>() get injected. */
+	bridge?: { url: string; token: string };
 }
 
 class PythonExecutionCancelledError extends Error {
@@ -121,6 +145,29 @@ function getExecutionDeadlineMs(options?: Pick<PythonExecutorOptions, "deadlineM
 	if (options?.deadlineMs !== undefined) return options.deadlineMs;
 	if (options?.timeoutMs === undefined) return undefined;
 	return Date.now() + options.timeoutMs;
+}
+
+/**
+ * Build the env block exposed to the Python kernel. Includes the session file
+ * (for things that need the raw session path) and the effective artifacts
+ * directory (preferred by the prelude when resolving output IDs, so subagents
+ * see the parent's flat dir instead of a non-existent sibling).
+ */
+function buildKernelEnv(options: {
+	sessionFile?: string;
+	artifactsDir?: string;
+	bridgeSessionId?: string;
+	bridge?: { url: string; token: string };
+}): Record<string, string> | undefined {
+	const env: Record<string, string> = {};
+	if (options.sessionFile) env.PI_SESSION_FILE = options.sessionFile;
+	if (options.artifactsDir) env.PI_ARTIFACTS_DIR = options.artifactsDir;
+	if (options.bridge && options.bridgeSessionId) {
+		env.PI_TOOL_BRIDGE_URL = options.bridge.url;
+		env.PI_TOOL_BRIDGE_TOKEN = options.bridge.token;
+		env.PI_TOOL_BRIDGE_SESSION = options.bridgeSessionId;
+	}
+	return Object.keys(env).length > 0 ? env : undefined;
 }
 
 function getRemainingTimeoutMs(deadlineMs?: number): number | undefined {
@@ -245,7 +292,6 @@ function buildKernelStartOptions(
 	return {
 		cwd,
 		env,
-		useSharedGateway: options.useSharedGateway,
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,
 	};
@@ -329,7 +375,6 @@ function finishDisposingKernelSession(session: KernelSession): void {
 	session.disposeResultPromise = undefined;
 	session.disposeResultTimeoutMs = undefined;
 	session.nextDisposalRetryAt = undefined;
-	session.kernelInvalidatedByRecovery = false;
 	syncCleanupTimer();
 }
 
@@ -453,58 +498,6 @@ async function ensureKernelAvailable(
 	}
 }
 
-function isResourceExhaustionError(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error);
-	return (
-		message.includes("Too many open files") ||
-		message.includes("EMFILE") ||
-		message.includes("ENFILE") ||
-		message.includes("resource temporarily unavailable")
-	);
-}
-
-function clearSharedGatewayDisposingKernelSessionTracking(): void {
-	for (const session of Array.from(disposingKernelSessions.values())) {
-		if (!session.kernel.isSharedGateway) continue;
-		if (session.heartbeatTimer) {
-			clearInterval(session.heartbeatTimer);
-			session.heartbeatTimer = undefined;
-		}
-		disposingKernelSessions.delete(session);
-		session.resolveDisposeCapacity?.();
-		session.resolveDisposeCapacity = undefined;
-		session.disposeCapacityPromise = undefined;
-		session.resolveDisposeAttempt?.();
-		session.resolveDisposeAttempt = undefined;
-		session.disposeAttemptPromise = undefined;
-		session.disposeResultPromise = undefined;
-		session.disposeResultTimeoutMs = undefined;
-		session.nextDisposalRetryAt = undefined;
-		session.kernelInvalidatedByRecovery = false;
-	}
-}
-
-function markLiveKernelSessionsForRecovery(): void {
-	for (const session of kernelSessions.values()) {
-		if (session.heartbeatTimer) {
-			clearInterval(session.heartbeatTimer);
-			session.heartbeatTimer = undefined;
-		}
-		session.needsRestart = true;
-		session.kernelInvalidatedByRecovery = session.kernel.isSharedGateway;
-		session.restartCount = 0;
-	}
-}
-
-async function recoverFromResourceExhaustion(): Promise<void> {
-	logger.warn("Resource exhaustion detected, recovering by restarting shared gateway");
-	stopCleanupTimer();
-	markLiveKernelSessionsForRecovery();
-	clearSharedGatewayDisposingKernelSessionTracking();
-	await shutdownSharedGateway();
-	syncCleanupTimer();
-}
-
 function ensureKernelHeartbeat(session: KernelSession): void {
 	if (session.heartbeatTimer) return;
 	session.heartbeatTimer = setInterval(() => {
@@ -520,24 +513,12 @@ async function createKernelSession(
 	sessionId: string,
 	cwd: string,
 	options: KernelSessionExecutionOptions = {},
-	isRetry?: boolean,
 ): Promise<KernelSession> {
 	requireRemainingTimeoutMs(options.deadlineMs);
-	const env: Record<string, string> | undefined = options.sessionFile
-		? { PI_SESSION_FILE: options.sessionFile }
-		: undefined;
+	const env = buildKernelEnv(options);
 	const startOptions = buildKernelStartOptions(cwd, env, options);
 
-	let kernel: PythonKernel;
-	try {
-		kernel = await logger.time("createKernelSession:PythonKernel.start", PythonKernel.start, startOptions);
-	} catch (err) {
-		if (!isRetry && isResourceExhaustionError(err)) {
-			await recoverFromResourceExhaustion();
-			return createKernelSession(sessionId, cwd, options, true);
-		}
-		throw err;
-	}
+	const kernel = await logger.time("createKernelSession:PythonKernel.start", PythonKernel.start, startOptions);
 
 	const hasFallbackOwner = options.kernelOwnerId === undefined;
 	const initialOwnerId = options.kernelOwnerId ?? sessionId;
@@ -548,7 +529,6 @@ async function createKernelSession(
 		restartCount: 0,
 		dead: false,
 		needsRestart: false,
-		kernelInvalidatedByRecovery: false,
 		disposing: false,
 		disposeResultPromise: undefined,
 		nextDisposalRetryAt: undefined,
@@ -573,28 +553,23 @@ async function restartKernelSession(
 	}
 	requireRemainingTimeoutMs(options.deadlineMs);
 	try {
-		if (!session.kernelInvalidatedByRecovery) {
-			const deadKernel = session.dead || !session.kernel.isAlive();
-			const shutdownTimeoutMs = requireRemainingTimeoutMs(options.deadlineMs);
-			const shutdownResult = await session.kernel.shutdown({ signal: options.signal, timeoutMs: shutdownTimeoutMs });
-			if (!shutdownResult.confirmed && !deadKernel) {
-				throw new Error("Failed to confirm crashed kernel shutdown before restart");
-			}
-			if (!shutdownResult.confirmed) {
-				logger.warn("Proceeding with retained kernel restart after unconfirmed dead-kernel shutdown", {
-					sessionId: session.id,
-				});
-			}
+		const deadKernel = session.dead || !session.kernel.isAlive();
+		const shutdownTimeoutMs = requireRemainingTimeoutMs(options.deadlineMs);
+		const shutdownResult = await session.kernel.shutdown({ signal: options.signal, timeoutMs: shutdownTimeoutMs });
+		if (!shutdownResult.confirmed && !deadKernel) {
+			throw new Error("Failed to confirm crashed kernel shutdown before restart");
 		}
-		const env: Record<string, string> | undefined = options.sessionFile
-			? { PI_SESSION_FILE: options.sessionFile }
-			: undefined;
+		if (!shutdownResult.confirmed) {
+			logger.warn("Proceeding with retained kernel restart after unconfirmed dead-kernel shutdown", {
+				sessionId: session.id,
+			});
+		}
+		const env = buildKernelEnv(options);
 		const startOptions = buildKernelStartOptions(cwd, env, options);
 		const kernel = await PythonKernel.start(startOptions);
 		session.kernel = kernel;
 		session.dead = false;
 		session.needsRestart = false;
-		session.kernelInvalidatedByRecovery = false;
 		session.lastUsedAt = Date.now();
 		ensureKernelHeartbeat(session);
 	} catch (err) {
@@ -608,9 +583,6 @@ type KernelDisposalResult = { status: "confirmed" } | { status: "unconfirmed" } 
 type KernelDisposalWaitResult = KernelDisposalResult | { status: "timedOut" };
 
 function createKernelDisposalResultPromise(session: KernelSession, timeoutMs?: number): Promise<KernelDisposalResult> {
-	if (session.kernelInvalidatedByRecovery) {
-		return Promise.resolve({ status: "confirmed" as const });
-	}
 	return Promise.resolve()
 		.then(() => session.kernel.shutdown(timeoutMs === undefined ? undefined : { timeoutMs }))
 		.then(
@@ -845,14 +817,31 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
+	const settings = await Settings.init();
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,
 		artifactId: options?.artifactId,
+		headBytes: resolveOutputSinkHeadBytes(settings),
+		maxColumns: resolveOutputMaxColumns(settings),
 	});
 	const displayOutputs: KernelDisplayOutput[] = [];
 	const deadlineMs = getExecutionDeadlineMs(options);
 	let executionTimeoutMs: number | undefined;
+
+	const emitStatus =
+		options?.emitStatus ??
+		((event: JsStatusEvent) => {
+			displayOutputs.push({ type: "status", event });
+		});
+	const unregisterBridge =
+		options?.toolSession && options?.bridgeSessionId
+			? registerPyToolBridge(options.bridgeSessionId, {
+					toolSession: options.toolSession,
+					signal: options.signal,
+					emitStatus,
+				})
+			: null;
 
 	try {
 		executionTimeoutMs = requireRemainingTimeoutMs(deadlineMs);
@@ -906,6 +895,8 @@ async function executeWithKernel(
 		const error = err instanceof Error ? err : new Error(String(err));
 		logger.error("Python execution failed", { error: error.message });
 		throw error;
+	} finally {
+		unregisterBridge?.();
 	}
 }
 
@@ -936,10 +927,22 @@ export async function executePython(code: string, options?: PythonExecutorOption
 		await ensureKernelAvailable(cwd);
 
 		const kernelMode = executionOptions.kernelMode ?? "session";
-		const sessionFile = executionOptions.sessionFile;
+
+		if (executionOptions.toolSession && !executionOptions.bridge) {
+			try {
+				executionOptions.bridge = await ensurePyToolBridge();
+			} catch (err) {
+				logger.warn("Failed to start Python tool bridge", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
 
 		if (kernelMode === "per-call") {
-			const env: Record<string, string> | undefined = sessionFile ? { PI_SESSION_FILE: sessionFile } : undefined;
+			if (executionOptions.bridge && !executionOptions.bridgeSessionId) {
+				executionOptions.bridgeSessionId = `py-bridge:${crypto.randomUUID()}`;
+			}
+			const env = buildKernelEnv(executionOptions);
 			requireRemainingTimeoutMs(deadlineMs);
 			const startOptions = buildKernelStartOptions(cwd, env, executionOptions);
 			const kernel = await PythonKernel.start(startOptions);
@@ -951,6 +954,9 @@ export async function executePython(code: string, options?: PythonExecutorOption
 		}
 
 		const sessionId = executionOptions.sessionId ?? `session:${cwd}`;
+		if (executionOptions.bridge && !executionOptions.bridgeSessionId) {
+			executionOptions.bridgeSessionId = sessionId;
+		}
 		if (executionOptions.reset) {
 			const existing = kernelSessions.get(sessionId);
 			if (existing) {

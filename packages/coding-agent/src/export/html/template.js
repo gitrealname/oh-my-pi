@@ -456,6 +456,10 @@
               const content = truncate(normalize(extractContent(msg.content)));
               return labelHtml + `<span class="tree-role-user">user:</span> ${escapeHtml(content)}`;
             }
+            if (msg.role === 'developer') {
+              const content = truncate(normalize(extractContent(msg.content)));
+              return labelHtml + `<span class="tree-role-developer">developer:</span> ${escapeHtml(content)}`;
+            }
             if (msg.role === 'assistant') {
               const textContent = truncate(normalize(extractContent(msg.content)));
               if (textContent) {
@@ -1151,16 +1155,6 @@
         return html;
       }
 
-      function renderExitPlanMode(name, args, result, ctx) {
-        const badges = args.title ? [String(args.title)] : null;
-        let html = toolHead('exit_plan_mode', '', badges);
-        if (result) {
-          const output = ctx.getResultText();
-          if (output) html += formatExpandableOutput(output, 8);
-        }
-        return html;
-      }
-
       function renderResolve(name, args, result, ctx) {
         const action = str(args.action) || '?';
         let html = toolHead('resolve', '', [action]);
@@ -1258,12 +1252,14 @@
         return html;
       }
 
-      // Parse `*** Begin <LANG>` cell headers (canonical) and the legacy
-      // `===== <info> =====` headers used by older transcripts. Cells emitted
-      // before the format cutover still need to render in HTML exports.
+      // Parse `*** Cell <attrs>` headers (canonical), plus legacy
+      // `*** Begin <LANG>` headers and `===== <info> =====` bars used in
+      // older transcripts. Cells emitted before each format cutover still
+      // need to render in HTML exports.
       function parseEvalCells(input) {
         const text = String(input);
-        if (/^[*]{2,}\s*Begin\b/im.test(text)) return parseEvalCellsNew(text);
+        if (/^[*]{2,}\s*Cell\b/im.test(text)) return parseEvalCellsCell(text);
+        if (/^[*]{2,}\s*Begin\b/im.test(text)) return parseEvalCellsBegin(text);
         return parseEvalCellsLegacy(text);
       }
 
@@ -1275,7 +1271,93 @@
         return null;
       }
 
-      function parseEvalCellsNew(text) {
+      // Tokenize a `*** Cell` header attribute list, preserving quoted
+      // segments. Mirrors `tokenizeCellAttrs` in src/eval/parse.ts.
+      function tokenizeCellAttrsHtml(input) {
+        const tokens = [];
+        let i = 0;
+        while (i < input.length) {
+          while (i < input.length && /\s/.test(input[i])) i++;
+          if (i >= input.length) break;
+          let tok = '';
+          while (i < input.length && !/\s/.test(input[i])) {
+            const ch = input[i];
+            if (ch === '"' || ch === "'") {
+              tok += ch; i++;
+              while (i < input.length && input[i] !== ch) { tok += input[i]; i++; }
+              if (i < input.length) { tok += input[i]; i++; }
+            } else { tok += ch; i++; }
+          }
+          tokens.push(tok);
+        }
+        return tokens;
+      }
+
+      function parseEvalCellsCell(text) {
+        const STARS = '\\*{2,}';
+        const CELL = new RegExp('^' + STARS + '\\s*Cell\\b\\s*(.*)$', 'i');
+        const END = new RegExp('^' + STARS + '\\s*End\\b.*$', 'i');
+        const ATTR = /^([a-zA-Z][\w-]*)(?::(?:"([^"]*)"|'([^']*)'|(.*)))?$/;
+        const DUR = /^\d+(?:ms|s|m)?$/;
+        const ID_KEYS = ['id', 'title', 'name', 'cell', 'file', 'label'];
+        const T_KEYS = ['t', 'timeout', 'duration', 'time'];
+        const RST_KEYS = ['rst', 'reset'];
+        const lines = text.split('\n');
+        if (lines.length && lines[lines.length - 1] === '') lines.pop();
+        const cells = [];
+        let i = 0;
+        while (i < lines.length && lines[i].trim() === '') i++;
+        while (i < lines.length) {
+          const m = CELL.exec(lines[i]);
+          if (!m) { i++; continue; }
+          const tokens = tokenizeCellAttrsHtml(m[1] || '');
+          let lang = null;
+          let title = '';
+          const attrs = [];
+          let bareReset = false;
+          const titleParts = [];
+          for (const tok of tokens) {
+            const lower = tok.toLowerCase();
+            if (RST_KEYS.indexOf(lower) >= 0) { bareReset = true; continue; }
+            const am = ATTR.exec(tok);
+            if (am && tok.indexOf(':') >= 0) {
+              const key = am[1].toLowerCase();
+              const value = am[2] !== undefined ? am[2] : am[3] !== undefined ? am[3] : (am[4] || '');
+              const lc = evalLangAlias(key);
+              if (lc) {
+                if (!lang) lang = lc;
+                if (!title && value) title = value;
+                continue;
+              }
+              if (ID_KEYS.indexOf(key) >= 0) { if (!title) title = value; continue; }
+              if (T_KEYS.indexOf(key) >= 0) { attrs.push('t=' + value); continue; }
+              if (RST_KEYS.indexOf(key) >= 0) { attrs.push('rst'); continue; }
+              continue;
+            }
+            const lc = evalLangAlias(tok);
+            if (lc && !lang) { lang = lc; continue; }
+            if (DUR.test(tok)) { attrs.push('t=' + tok); continue; }
+            titleParts.push(tok);
+          }
+          if (!title && titleParts.length) title = titleParts.join(' ');
+          if (bareReset) attrs.push('rst');
+          lang = lang || 'py';
+          i++;
+          const codeLines = [];
+          while (i < lines.length) {
+            if (END.test(lines[i])) { i++; break; }
+            if (CELL.test(lines[i])) break;
+            codeLines.push(lines[i]);
+            i++;
+          }
+          while (codeLines.length && codeLines[codeLines.length - 1].trim() === '') codeLines.pop();
+          cells.push({ lang, title, attrs, code: codeLines.join('\n') });
+          while (i < lines.length && lines[i].trim() === '') i++;
+        }
+        return cells;
+      }
+
+      function parseEvalCellsBegin(text) {
         const STARS = '\\*{2,}';
         const BEGIN = new RegExp('^' + STARS + '\\s*Begin\\b\\s*(\\S+)?\\s*$', 'i');
         const END = new RegExp('^' + STARS + '\\s*End\\b.*$', 'i');
@@ -1470,7 +1552,6 @@
         inspect_image: renderInspectImage,
         generate_image: renderGenerateImage,
         ask: renderAsk,
-        exit_plan_mode: renderExitPlanMode,
         resolve: renderResolve,
         github: renderGh,
         render_mermaid: renderMermaid,
@@ -1648,6 +1729,18 @@
             return html;
           }
 
+          if (msg.role === 'developer') {
+            let html = `<div class="user-message developer-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
+            const content = msg.content;
+            const text = typeof content === 'string' ? content :
+              content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+            if (text.trim()) {
+              html += `<div class="markdown-content">${safeMarkedParse(text)}</div>`;
+            }
+            html += '</div>';
+            return html;
+          }
+
           if (msg.role === 'assistant') {
             let html = `<div class="assistant-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
 
@@ -1750,7 +1843,7 @@
       // ============================================================
 
       function computeStats(entryList) {
-        let userMessages = 0, assistantMessages = 0, toolResults = 0;
+        let userMessages = 0, developerMessages = 0, assistantMessages = 0, toolResults = 0;
         let customMessages = 0, compactions = 0, branchSummaries = 0, toolCalls = 0;
         const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
         const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -1760,6 +1853,7 @@
           if (entry.type === 'message') {
             const msg = entry.message;
             if (msg.role === 'user') userMessages++;
+            if (msg.role === 'developer') developerMessages++;
             if (msg.role === 'assistant') {
               assistantMessages++;
               if (msg.model) models.add(msg.provider ? `${msg.provider}/${msg.model}` : msg.model);
@@ -1787,7 +1881,7 @@
           }
         }
 
-        return { userMessages, assistantMessages, toolResults, customMessages, compactions, branchSummaries, toolCalls, tokens, cost, models: Array.from(models) };
+        return { userMessages, developerMessages, assistantMessages, toolResults, customMessages, compactions, branchSummaries, toolCalls, tokens, cost, models: Array.from(models) };
       }
 
       const globalStats = computeStats(entries);
@@ -1803,6 +1897,7 @@
 
         const msgParts = [];
         if (globalStats.userMessages) msgParts.push(`${globalStats.userMessages} user`);
+        if (globalStats.developerMessages) msgParts.push(`${globalStats.developerMessages} developer`);
         if (globalStats.assistantMessages) msgParts.push(`${globalStats.assistantMessages} assistant`);
         if (globalStats.toolResults) msgParts.push(`${globalStats.toolResults} tool results`);
         if (globalStats.customMessages) msgParts.push(`${globalStats.customMessages} custom`);

@@ -8,7 +8,7 @@ import { jsBackend, parseEvalInput, pythonBackend, sniffEvalLanguage } from "../
 import type { ExecutorBackend } from "../eval/backend";
 import evalGrammar from "../eval/eval.lark" with { type: "text" };
 import { ABORT_WARNING, type ParsedEvalCell } from "../eval/parse";
-import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
+import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
@@ -16,7 +16,7 @@ import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
 import { resolveEvalBackends, type ToolSession } from ".";
-import { formatStyledTruncationWarning } from "./output-meta";
+import { formatStyledTruncationWarning, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
 import { formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -26,7 +26,7 @@ export const EVAL_DEFAULT_PREVIEW_LINES = 10;
 
 export const evalSchema = Type.Object({
 	input: Type.String({
-		description: "eval input as a sequence of `*** Begin <LANG>` cell headers followed by code",
+		description: 'eval input as a sequence of `*** Cell <lang>:"title"` cell headers followed by code',
 	}),
 });
 export type EvalToolParams = Static<typeof evalSchema>;
@@ -45,6 +45,38 @@ function formatJsonScalar(value: unknown): string {
 	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
 	if (typeof value === "function") return "[function]";
 	return "[object]";
+}
+
+/** Cap per `display()` value sent back to the model. */
+const MAX_DISPLAY_TEXT_BYTES = 8000;
+
+function formatDisplayJsonForText(value: unknown): string {
+	let text: string;
+	try {
+		text = JSON.stringify(value, null, 2) ?? String(value);
+	} catch {
+		text = String(value);
+	}
+	if (text.length > MAX_DISPLAY_TEXT_BYTES) {
+		text = `${text.slice(0, MAX_DISPLAY_TEXT_BYTES)}\n… (${text.length - MAX_DISPLAY_TEXT_BYTES} chars truncated)`;
+	}
+	return text;
+}
+
+/**
+ * Format display() JSON values into text the model can see. Images are surfaced
+ * separately as ImageContent so the model can actually inspect them; this helper
+ * intentionally does not touch images.
+ */
+function formatDisplayOutputsForText(outputs: EvalDisplayOutput[]): string {
+	const chunks: string[] = [];
+	let displayIndex = 0;
+	for (const output of outputs) {
+		if (output.type !== "json") continue;
+		displayIndex++;
+		chunks.push(`display[${displayIndex}]:\n${formatDisplayJsonForText(output.data)}`);
+	}
+	return chunks.join("\n\n");
 }
 
 function renderJsonTree(value: unknown, theme: Theme, expanded: boolean, maxDepth = expanded ? 6 : 2): string[] {
@@ -326,6 +358,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				outputSink = new OutputSink({
 					artifactPath,
 					artifactId,
+					headBytes: resolveOutputSinkHeadBytes(session.settings),
+					maxColumns: resolveOutputMaxColumns(session.settings),
 					onChunk: chunk => {
 						appendTail(chunk);
 						pushUpdate();
@@ -370,13 +404,16 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					const durationMs = Date.now() - startTime;
 
 					const cellStatusEvents: EvalStatusEvent[] = [];
+					const cellDisplayOutputs: EvalDisplayOutput[] = [];
 					let cellHasMarkdown = false;
 					for (const output of result.displayOutputs) {
 						if (output.type === "json") {
 							jsonOutputs.push(output.data);
+							cellDisplayOutputs.push(output);
 						}
 						if (output.type === "image") {
 							images.push({ type: "image", data: output.data, mimeType: output.mimeType });
+							cellDisplayOutputs.push(output);
 						}
 						if (output.type === "status") {
 							statusEvents.push(output.event);
@@ -387,7 +424,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						}
 					}
 
-					const cellOutput = result.output.trim();
+					const stdoutTrimmed = result.output.trim();
+					const displayText = formatDisplayOutputsForText(cellDisplayOutputs);
+					const cellOutput =
+						stdoutTrimmed && displayText ? `${stdoutTrimmed}\n\n${displayText}` : stdoutTrimmed || displayText;
 					cellResult.output = cellOutput;
 					cellResult.exitCode = result.exitCode;
 					cellResult.durationMs = durationMs;
@@ -431,14 +471,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							languages,
 							cells: cellResults,
 							jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-							images: images.length > 0 ? images : undefined,
 							statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 							isError: true,
 						};
 						if (notice) details.notice = notice;
 
 						return toolResult(details)
-							.text(outputText)
+							.content([{ type: "text", text: outputText }, ...images])
 							.truncationFromSummary(summaryForMeta, { direction: "tail" })
 							.done();
 					}
@@ -461,14 +500,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							languages,
 							cells: cellResults,
 							jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-							images: images.length > 0 ? images : undefined,
 							statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 							isError: true,
 						};
 						if (notice) details.notice = notice;
 
 						return toolResult(details)
-							.text(outputText)
+							.content([{ type: "text", text: outputText }, ...images])
 							.truncationFromSummary(summaryForMeta, { direction: "tail" })
 							.done();
 					}
@@ -479,9 +517,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 				const combinedOutput = cellOutputs.join("\n\n");
 				const abortSuffix = parsedInput.aborted ? `\n\n${ABORT_WARNING}` : "";
+				const hasImages = images.length > 0;
 				const outputText =
-					(combinedOutput || (jsonOutputs.length > 0 || images.length > 0 ? "(no text output)" : "(no output)")) +
-					abortSuffix;
+					(combinedOutput ||
+						(hasImages
+							? `(displayed ${images.length} image${images.length === 1 ? "" : "s"}; no text output)`
+							: "(no output)")) + abortSuffix;
 				const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 
 				const details: EvalToolDetails = {
@@ -489,13 +530,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					languages,
 					cells: cellResults,
 					jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-					images: images.length > 0 ? images : undefined,
 					statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 				};
 				if (notice) details.notice = notice;
 
 				return toolResult(details)
-					.text(outputText)
+					.content([{ type: "text", text: outputText }, ...images])
 					.truncationFromSummary(summaryForMeta, { direction: "tail" })
 					.done();
 			} finally {

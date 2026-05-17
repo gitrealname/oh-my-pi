@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { _resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	applyHashlineEdits,
 	buildCompactHashlineDiffPreview,
@@ -27,7 +27,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { Value } from "@sinclair/typebox/value";
 
 beforeAll(async () => {
-	_resetSettingsForTest();
+	resetSettingsForTest();
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
 });
 
@@ -386,6 +386,14 @@ describe("splitHashlineInput — @ headers", () => {
 
 	it("splits multiple edit sections", () => {
 		const input = ["@a.ts", "+ BOF", pl("a"), "@b.ts", "+ EOF", pl("b")].join("\n");
+		expect(splitHashlineInputs(input)).toEqual([
+			{ path: "a.ts", diff: `+ BOF\n${pl("a")}` },
+			{ path: "b.ts", diff: `+ EOF\n${pl("b")}` },
+		]);
+	});
+
+	it("tolerates extra '@' chars on the section header", () => {
+		const input = ["@@ a.ts", "+ BOF", pl("a"), "@@@b.ts", "+ EOF", pl("b")].join("\n");
 		expect(splitHashlineInputs(input)).toEqual([
 			{ path: "a.ts", diff: `+ BOF\n${pl("a")}` },
 			{ path: "b.ts", diff: `+ EOF\n${pl("b")}` },

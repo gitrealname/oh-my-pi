@@ -1,23 +1,18 @@
 Run code in a persistent kernel using codeblock cells.
 
 <instruction>
-Each cell is wrapped between `*** Begin <LANG>` and `*** End <LANG>`:
+Each cell starts with a single header line and runs until the next header (or end of input):
 
 ```
-*** Begin PY
-*** Title: optional title
-*** Timeout: 10s
-*** Reset
+*** Cell py:"optional title" t:10s rst
 print("hi")
-*** End PY
 ```
 
-- **Language**: {{#if py}}`PY` for Python{{/if}}{{#ifAll py js}}, {{/ifAll}}{{#if js}}`JS` / `TS` for JavaScript{{/if}}. The opening `<LANG>` and closing `<LANG>` **MUST** match.
-- **Attributes** (optional, in any order, immediately after `*** Begin`):
-  - `*** Title: …` — cell title shown in the UI.
-  - `*** Timeout: <duration>` — per-cell timeout. Digits with optional `ms` / `s` / `m` units (e.g. `500ms`, `15s`, `2m`). Default 30s.
-  - `*** Reset` — wipe this cell's own language kernel before running.{{#ifAll py js}} Other languages are untouched.{{/ifAll}}
-- Anything between the last attribute and `*** End <LANG>` is the cell's code, verbatim.
+- **Language + title**: `<lang>:"<title>"` — {{#if py}}`py` for Python{{/if}}{{#ifAll py js}}, {{/ifAll}}{{#if js}}`js` for JavaScript{{/if}}. Title may be empty (`py:""`).
+- **Attributes** (optional, in this order, after the language+title):
+  - `t:<duration>` — per-cell timeout. Digits with optional `ms` / `s` / `m` units (e.g. `500ms`, `15s`, `2m`). Default 30s.
+  - `rst` — wipe this cell's own language kernel before running.{{#ifAll py js}} Other languages are untouched.{{/ifAll}}
+- Anything after the header line, up to the next `*** Cell` header, is the cell's code, verbatim.
 - Stack multiple cells back-to-back; blank lines between cells are ignored.
 
 **Work incrementally:**
@@ -46,46 +41,36 @@ tree(path?=".", max_depth?=3, show_hidden?=False) → str
     Render a directory tree.
 diff(a, b) → str
     Unified diff between two files.
-run(cmd, cwd?=None, timeout?=None) → {stdout, stderr, exit_code}
-    Run a shell command.
 env(key?=None, value?=None) → str | None | dict
     No args → full environment as dict. One arg → value of `key`. Two args → set `key=value` and return value.
 output(*ids, format?="raw", query?=None, offset?=None, limit?=None) → str | dict | list[dict]
     Read task/agent output by ID. Single id returns text/dict; multiple ids return a list.
+tool.<name>(args) → unknown
+    Invoke any session tool by name. `args` is the tool's parameter object.
 ```
-
-{{#if js}}**JavaScript only:** `tool.<name>(args)` invokes any session tool directly (e.g. `await tool.read({ path: "src/foo.ts" })`).
-{{/if}}</prelude>
+</prelude>
 
 <output>
 Cells render like a Jupyter notebook. `display(value)` renders non-presentable data as an interactive JSON tree. Presentable values (figures, images, dataframes, etc.) use their native representation.
 </output>
 
 <caution>
-- In session mode, use `*** Reset` on a cell to wipe its language's kernel before running.{{#ifAll py js}} Reset is per-language: a python cell's `*** Reset` does not touch the JavaScript kernel and vice versa.{{/ifAll}}
-{{#if js}}- **js**: the VM exposes a selective `process` subset, Web APIs, `Buffer`, `fs/promises`.
+- In session mode, use `rst` on a cell to wipe its language's kernel before running.{{#ifAll py js}} Reset is per-language: a python cell's `rst` does not touch the JavaScript kernel and vice versa.{{/ifAll}}
+{{#if js}}- **js**: the VM exposes a selective `process` subset, Web APIs, `Buffer`, `fs/promises`, and the `Bun` global.
 {{/if}}</caution>
 
 <example>
-{{#if py}}*** Begin PY
-*** Title: imports
-*** Timeout: 10s
+{{#if py}}*** Cell py:"imports" t:10s
 import json
 from pathlib import Path
-*** End PY
 
-*** Begin PY
-*** Title: load config
+*** Cell py:"load config"
 data = json.loads(read('package.json'))
 display(data)
-*** End PY
 {{/if}}{{#ifAll py js}}
-{{/ifAll}}{{#if js}}*** Begin JS
-*** Title: js summary
-*** Reset
+{{/ifAll}}{{#if js}}*** Cell js:"summary" rst
 const data = JSON.parse(await read('package.json'));
 display(data);
 return data.name;
-*** End JS
 {{/if}}
 </example>

@@ -16,7 +16,6 @@ import { createMmemoryExtension } from "./mmemory-extension";
 import { createPromptTemplateExtension, setMPromptTemplateRoleResolver } from "./m-prompt-template/activate";
 import { resolveTemplateModelSpec } from "./utils/m-utils";
 import { createMpruneExtension } from "./extensibility/extensions/m-prune-extension";
-import { createMtuicontrolExtension } from "./extensibility/extensions/m-mtuicontrol-extension";
 import { createPromptEngine } from "./prompt-engine";
 import { type Settings, type SettingPath } from "./config/settings";
 import type { ExtensionFactory, ExtensionRunner } from "./extensibility/extensions";
@@ -76,9 +75,7 @@ export function registerCorpExtensions(
 		setMPromptTemplateRoleResolver((spec) => resolveTemplateModelSpec(spec, settings));
 		inlineExtensions.push(createPromptTemplateExtension);
 	}
-	if (settings.get("mtuicontrol.enabled" as SettingPath) === true) {
-		inlineExtensions.push(createMtuicontrolExtension);
-	}
+
 }
 
 // ---------------------------------------------------------------------------

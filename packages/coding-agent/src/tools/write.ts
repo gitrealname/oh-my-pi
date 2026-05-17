@@ -16,6 +16,13 @@ import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth }
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { assertEditableFile } from "./auto-generated-guard";
+import {
+	type ConflictEntry,
+	expandContentTokens,
+	getConflictHistory,
+	parseConflictUri,
+	spliceConflict,
+} from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { type OutputMeta, outputMeta } from "./output-meta";
 import { formatPathRelativeToCwd } from "./path-utils";
@@ -76,6 +83,21 @@ function stripWriteContent(session: ToolSession, content: string): { text: strin
 	const cleaned = stripHashlinePrefixes(lines);
 	if (cleaned === lines) return { text: content, stripped: false };
 	return { text: cleaned.join("\n"), stripped: true };
+}
+
+/**
+ * Append a trailing note line to the first text block of a tool result.
+ * Mutates `result` in place (the result object is owned by this call).
+ */
+function appendNoteToResult(result: AgentToolResult<WriteToolDetails>, note: string): void {
+	const firstText = result.content.find(
+		(block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string",
+	);
+	if (firstText) {
+		firstText.text = firstText.text.length > 0 ? `${firstText.text}\n${note}` : note;
+	} else {
+		result.content.push({ type: "text", text: note });
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -423,6 +445,210 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		}
 	}
 
+	/**
+	 * Resolve a single `conflict://<N>` write by splicing the recorded
+	 * marker region in the registered file with `replacementContent`,
+	 * then routing the new file content through the normal writethrough
+	 * pipeline so LSP format/diagnostics still run.
+	 *
+	 * Entry ids are session-stable: they keep working even after later
+	 * writes resolve other blocks in the same file. The recorded range
+	 * is re-validated on disk before splicing so an out-of-band edit
+	 * surfaces as a clear error instead of corrupting the file.
+	 */
+	async #resolveConflict(
+		entry: ConflictEntry,
+		replacementContent: string,
+		stripped: boolean,
+		signal: AbortSignal | undefined,
+		context: AgentToolContext | undefined,
+	): Promise<AgentToolResult<WriteToolDetails>> {
+		const absolutePath = entry.absolutePath;
+		if (!(await fs.exists(absolutePath))) {
+			throw new ToolError(`Conflict #${entry.id} target '${entry.displayPath}' no longer exists.`);
+		}
+
+		const expanded = expandContentTokens(replacementContent, entry);
+		const originalText = await Bun.file(absolutePath).text();
+		const newContent = spliceConflict(originalText, entry, expanded);
+
+		const batchRequest = getLspBatchRequest(context?.toolCall);
+		const diagnostics = await this.#writethrough(absolutePath, newContent, signal, undefined, batchRequest);
+		invalidateFsScanAfterWrite(absolutePath);
+		this.session.fileReadCache?.invalidate(absolutePath);
+		this.session.conflictHistory?.invalidate(entry.id);
+
+		const range =
+			entry.startLine === entry.endLine
+				? `line ${entry.startLine}`
+				: `lines ${entry.startLine}\u2013${entry.endLine}`;
+		let resultText = `Resolved conflict #${entry.id} at ${range} in ${entry.displayPath}.`;
+		if (stripped) {
+			resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
+		}
+
+		if (!diagnostics) {
+			return {
+				content: [{ type: "text", text: resultText }],
+				details: {},
+			};
+		}
+		return {
+			content: [{ type: "text", text: resultText }],
+			details: {
+				diagnostics,
+				meta: outputMeta()
+					.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
+					.get(),
+			},
+		};
+	}
+
+	/**
+	 * Look up a single conflict entry by id and dispatch to {@link #resolveConflict}.
+	 * Throws a clear `not found` error when the id has been invalidated.
+	 */
+	async #resolveSingleConflictById(
+		id: number,
+		replacementContent: string,
+		stripped: boolean,
+		signal: AbortSignal | undefined,
+		context: AgentToolContext | undefined,
+	): Promise<AgentToolResult<WriteToolDetails>> {
+		const entry = getConflictHistory(this.session).get(id);
+		if (!entry) {
+			throw new ToolError(
+				`Conflict #${id} not found. Conflict ids are registered when \`read\` surfaces a marker block; re-read the file to get a current id.`,
+			);
+		}
+		return this.#resolveConflict(entry, replacementContent, stripped, signal, context);
+	}
+
+	/**
+	 * Bulk-resolve every registered conflict via `conflict://*`.
+	 *
+	 * Entries are grouped by file and applied bottom-up by recorded start
+	 * line so each splice keeps later anchors valid. `content` tokens are
+	 * expanded *per entry*, so `content: "@ours"` keeps each block's own
+	 * ours side rather than collapsing every conflict to the first
+	 * block's ours.
+	 *
+	 * All-or-nothing semantics within a file: if any splice for a file
+	 * fails (stale anchors, missing base for `@base`, etc.), that file is
+	 * left untouched and the error is surfaced. Files that succeed are
+	 * still written. The result text reports per-file counts so the agent
+	 * can re-read the failed files and retry.
+	 */
+	async #resolveAllConflicts(
+		replacementContent: string,
+		stripped: boolean,
+		signal: AbortSignal | undefined,
+		context: AgentToolContext | undefined,
+	): Promise<AgentToolResult<WriteToolDetails>> {
+		const history = getConflictHistory(this.session);
+		const allEntries = history.entries();
+		if (allEntries.length === 0) {
+			throw new ToolError(
+				"`conflict://*` has nothing to resolve — no conflicts are currently registered. Re-read the file(s) with conflicts first.",
+			);
+		}
+
+		const byFile = new Map<string, ConflictEntry[]>();
+		for (const entry of allEntries) {
+			const bucket = byFile.get(entry.absolutePath) ?? [];
+			bucket.push(entry);
+			byFile.set(entry.absolutePath, bucket);
+		}
+
+		const batchRequest = getLspBatchRequest(context?.toolCall);
+		const allDiagnostics: FileDiagnosticsResult[] = [];
+		const succeededFiles: { displayPath: string; count: number }[] = [];
+		const failedFiles: { displayPath: string; count: number; error: string }[] = [];
+		let totalResolvedIds = 0;
+
+		for (const [absolutePath, fileEntries] of byFile) {
+			const sample = fileEntries[0]!;
+			if (!(await fs.exists(absolutePath))) {
+				failedFiles.push({
+					displayPath: sample.displayPath,
+					count: fileEntries.length,
+					error: "file no longer exists",
+				});
+				continue;
+			}
+
+			fileEntries.sort((a, b) => b.startLine - a.startLine);
+
+			let text: string;
+			try {
+				text = await Bun.file(absolutePath).text();
+				for (const entry of fileEntries) {
+					const expanded = expandContentTokens(replacementContent, entry);
+					text = spliceConflict(text, entry, expanded);
+				}
+			} catch (error) {
+				failedFiles.push({
+					displayPath: sample.displayPath,
+					count: fileEntries.length,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				continue;
+			}
+
+			const diagnostics = await this.#writethrough(absolutePath, text, signal, undefined, batchRequest);
+			invalidateFsScanAfterWrite(absolutePath);
+			this.session.fileReadCache?.invalidate(absolutePath);
+			for (const entry of fileEntries) history.invalidate(entry.id);
+			succeededFiles.push({ displayPath: sample.displayPath, count: fileEntries.length });
+			totalResolvedIds += fileEntries.length;
+			if (diagnostics) allDiagnostics.push(diagnostics);
+		}
+
+		const summaryLines: string[] = [];
+		const fileWord = (n: number) => (n === 1 ? "file" : "files");
+		const conflictWord = (n: number) => (n === 1 ? "conflict" : "conflicts");
+		if (succeededFiles.length > 0) {
+			summaryLines.push(
+				`Resolved ${totalResolvedIds} ${conflictWord(totalResolvedIds)} across ${succeededFiles.length} ${fileWord(succeededFiles.length)}:`,
+			);
+			for (const file of succeededFiles) {
+				summaryLines.push(`  ${file.displayPath}: ${file.count} ${conflictWord(file.count)}`);
+			}
+		}
+		if (failedFiles.length > 0) {
+			summaryLines.push(
+				`Failed to resolve ${failedFiles.length} ${fileWord(failedFiles.length)} — registered entries left intact for retry:`,
+			);
+			for (const file of failedFiles) {
+				summaryLines.push(`  ${file.displayPath}: ${file.count} ${conflictWord(file.count)} (${file.error})`);
+			}
+		}
+		if (stripped) {
+			summaryLines.push("Note: auto-stripped hashline display prefixes from content before writing.");
+		}
+		const resultText = summaryLines.join("\n");
+
+		if (allDiagnostics.length === 0) {
+			if (failedFiles.length > 0 && succeededFiles.length === 0) {
+				throw new ToolError(resultText);
+			}
+			return { content: [{ type: "text", text: resultText }], details: {} };
+		}
+		const mergedSummary = allDiagnostics.map(d => d.summary).join("\n");
+		const mergedMessages = allDiagnostics.flatMap(d => d.messages ?? []);
+		return {
+			content: [{ type: "text", text: resultText }],
+			details: {
+				meta: outputMeta().diagnostics(mergedSummary, mergedMessages).get(),
+			},
+		};
+	}
+
+	#routeWriteThroughBridge(absolutePath: string, content: string): Promise<void> | undefined {
+		const bridge = this.session.getClientBridge?.();
+		if (!bridge?.capabilities.writeTextFile || !bridge.writeTextFile) return undefined;
+		return bridge.writeTextFile({ path: absolutePath, content });
+	}
 	async execute(
 		_toolCallId: string,
 		{ path, content }: WriteParams,
@@ -433,6 +659,25 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		return untilAborted(signal, async () => {
 			// Strip hashline display prefixes (LINE+ID|) if the model copied them from read output
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
+			const conflictUri = parseConflictUri(path);
+			if (conflictUri) {
+				if (conflictUri.scope) {
+					throw new ToolError(
+						`Conflict URI scope '/${conflictUri.scope}' is read-only — read \`conflict://${conflictUri.id}/${conflictUri.scope}\` to inspect that side. To write, drop the scope (\`conflict://${conflictUri.id}\`) and put the chosen content (or shorthand like \`@${conflictUri.scope}\`) in \`content\`.`,
+					);
+				}
+				const result =
+					conflictUri.id === "*"
+						? await this.#resolveAllConflicts(cleanContent, stripped, signal, context)
+						: await this.#resolveSingleConflictById(conflictUri.id, cleanContent, stripped, signal, context);
+				if (conflictUri.recoveredPrefix !== undefined) {
+					appendNoteToResult(
+						result,
+						`Note: stripped erroneous '${conflictUri.recoveredPrefix}:' prefix from path; conflict URIs are global (use \`conflict://${conflictUri.id}\`, not \`<file>:conflict://${conflictUri.id}\`).`,
+					);
+				}
+				return result;
+			}
 			const resolvedArchivePath = await this.#resolveArchiveWritePath(path);
 			if (resolvedArchivePath) {
 				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
@@ -476,6 +721,23 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// Check if file exists and is auto-generated before overwriting
 			if (await fs.exists(absolutePath)) {
 				await assertEditableFile(absolutePath, path);
+			}
+
+			// Try ACP bridge first — no disk write when client handles it
+			const bridgePromise = this.#routeWriteThroughBridge(absolutePath, cleanContent);
+			if (bridgePromise !== undefined) {
+				try {
+					await bridgePromise;
+				} catch (error) {
+					throw new ToolError(error instanceof Error ? error.message : String(error));
+				}
+				invalidateFsScanAfterWrite(absolutePath);
+				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+				let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
+				if (stripped) {
+					resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
+				}
+				return { content: [{ type: "text", text: resultText }], details: {} };
 			}
 
 			const diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);

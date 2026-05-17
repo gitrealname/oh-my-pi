@@ -4,21 +4,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { runConfigCommand } from "../src/cli/config-cli";
-import { _resetSettingsForTest } from "../src/config/settings";
+import { resetSettingsForTest } from "../src/config/settings";
 
 let testAgentDir = "";
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 beforeEach(async () => {
-	_resetSettingsForTest();
+	resetSettingsForTest();
 	testAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-config-cli-"));
 	setAgentDir(testAgentDir);
 });
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	_resetSettingsForTest();
+	resetSettingsForTest();
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
 	} else {
@@ -29,40 +29,6 @@ afterEach(async () => {
 });
 
 describe("config CLI schema coverage", () => {
-	it("lists non-UI schema settings in JSON output", async () => {
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-		await runConfigCommand({ action: "list", flags: { json: true } });
-
-		expect(logSpy).toHaveBeenCalledTimes(1);
-		const payload = logSpy.mock.calls[0]?.[0];
-		expect(typeof payload).toBe("string");
-		const parsed = JSON.parse(String(payload)) as Record<string, { type: string; description: string }>;
-
-		expect(parsed.enabledModels).toBeDefined();
-		expect(parsed.enabledModels.type).toBe("array");
-		expect(parsed.enabledModels.description).toBe("");
-	});
-
-	it("gets non-UI schema settings by key", async () => {
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-		await runConfigCommand({ action: "get", key: "enabledModels", flags: { json: true } });
-
-		expect(logSpy).toHaveBeenCalledTimes(1);
-		const payload = logSpy.mock.calls[0]?.[0];
-		expect(typeof payload).toBe("string");
-		const parsed = JSON.parse(String(payload)) as {
-			key: string;
-			type: string;
-			description: string;
-		};
-
-		expect(parsed.key).toBe("enabledModels");
-		expect(parsed.type).toBe("array");
-		expect(parsed.description).toBe("");
-	});
-
 	it("renders record settings as JSON and with record type in text output", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 

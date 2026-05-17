@@ -1,4 +1,4 @@
-import { $env } from "@oh-my-pi/pi-utils";
+import { $env, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import OpenAI from "openai";
 import type {
 	ChatCompletionAssistantMessageParam,
@@ -16,6 +16,7 @@ import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
 	type Context,
+	getPriorityPremiumRequests,
 	type Message,
 	type MessageAttribution,
 	type Model,
@@ -53,7 +54,7 @@ import { parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
-import { callWithCopilotModelRetry, extractHttpStatusFromError } from "../utils/retry";
+import { callWithCopilotModelRetry } from "../utils/retry";
 import { adaptSchemaForStrict, NO_STRICT } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
@@ -63,6 +64,7 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { detectOpenAICompat, type ResolvedOpenAICompat, resolveOpenAICompat } from "./openai-completions-compat";
+import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -337,23 +339,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		let firstTokenTime: number | undefined;
 		let getCapturedErrorResponse: (() => CapturedHttpErrorResponse | undefined) | undefined;
 
-		const output: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-		};
+		const output: AssistantMessage = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		const abortTracker = createAbortSourceTracker(options?.signal);
 		const firstEventTimeoutAbortError = new Error(OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE);
@@ -377,6 +363,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.initiatorOverride,
 				options?.onSseEvent,
 			);
+			const priorityPremiumRequests = getPriorityPremiumRequests(options?.serviceTier, model.provider);
+			const premiumRequestsTotal =
+				copilotPremiumRequests !== undefined || priorityPremiumRequests > 0
+					? (copilotPremiumRequests ?? 0) + priorityPremiumRequests
+					: undefined;
 			getCapturedErrorResponse = captureErrorResponse;
 			let appliedToolStrictMode: AppliedToolStrictMode = "mixed";
 			const providerSessionState = getOpenAICompletionsProviderSessionState(
@@ -444,7 +435,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
 				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
 			);
-			if (copilotPremiumRequests !== undefined) output.usage.premiumRequests = copilotPremiumRequests;
+			if (premiumRequestsTotal !== undefined) {
+				output.usage.premiumRequests = premiumRequestsTotal;
+			}
 			stream.push({ type: "start", partial: output });
 
 			const parseMiniMaxThinkTags = model.provider === "minimax-code";
@@ -604,7 +597,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				output.responseId ||= chunk.id;
 
 				if (chunk.usage) {
-					output.usage = parseChunkUsage(chunk.usage, model, copilotPremiumRequests);
+					output.usage = parseChunkUsage(chunk.usage, model, premiumRequestsTotal);
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -613,7 +606,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!chunk.usage) {
 					const choiceUsage = getChoiceUsage(choice);
 					if (choiceUsage) {
-						output.usage = parseChunkUsage(choiceUsage, model, copilotPremiumRequests);
+						output.usage = parseChunkUsage(choiceUsage, model, premiumRequestsTotal);
 					}
 				}
 
@@ -1074,7 +1067,7 @@ function getChoiceUsage(choice: ChatCompletionChunk.Choice): object | undefined 
 export function parseChunkUsage(
 	rawUsage: object,
 	model: Model<"openai-completions">,
-	copilotPremiumRequests: number | undefined,
+	premiumRequests: number | undefined,
 ): AssistantMessage["usage"] {
 	const promptTokenDetails = getOptionalObjectProperty(rawUsage, "prompt_tokens_details");
 	const completionTokenDetails = getOptionalObjectProperty(rawUsage, "completion_tokens_details");
@@ -1105,7 +1098,7 @@ export function parseChunkUsage(
 		totalTokens: input + outputTokens + cachedTokens + cacheWriteTokens,
 		...(reasoningTokens > 0 ? { reasoningTokens } : {}),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		...(copilotPremiumRequests !== undefined ? { premiumRequests: copilotPremiumRequests } : {}),
+		...(premiumRequests !== undefined ? { premiumRequests } : {}),
 	};
 	calculateCost(model, usage);
 	return usage;

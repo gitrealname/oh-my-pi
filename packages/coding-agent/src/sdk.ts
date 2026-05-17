@@ -6,7 +6,7 @@ import {
 	INTENT_FIELD,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
-import type { Message, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { CredentialDisabledEvent, Message, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import {
 	getOpenAICodexTransportDetails,
 	prewarmOpenAICodexResponses,
@@ -28,9 +28,15 @@ import { AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { createAutoresearchExtension } from "./autoresearch";
 import { populateCorpSkillRoles, registerCorpExtensions, applyCorpExtensionRunner } from "./corp-sdk-extensions";
 import { loadCapability } from "./capability";
-import { type Rule, ruleCapability } from "./capability/rule";
+import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { ModelRegistry } from "./config/model-registry";
-import { formatModelString, parseModelPattern, parseModelString, resolveModelRoleValue } from "./config/model-resolver";
+import {
+	formatModelString,
+	parseModelPattern,
+	parseModelString,
+	resolveAllowedModels,
+	resolveModelRoleValue,
+} from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
@@ -60,30 +66,22 @@ import {
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
-import { loadSkills as loadSkillsInternal, type Skill, type SkillWarning } from "./extensibility/skills";
+import {
+	loadSkills as loadSkillsInternal,
+	type Skill,
+	type SkillWarning,
+	setActiveSkills,
+} from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
-import {
-	AgentProtocolHandler,
-	ArtifactProtocolHandler,
-	InternalUrlRouter,
-	JobsProtocolHandler,
-	LocalProtocolHandler,
-	type LocalProtocolOptions,
-	McpProtocolHandler,
-	MemoryProtocolHandler,
-	PiProtocolHandler,
-	RuleProtocolHandler,
-	SkillProtocolHandler,
-} from "./internal-urls";
+import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
-import { discoverAndLoadMCPTools, type MCPManager, type MCPToolsLoadResult } from "./mcp";
+import { discoverAndLoadMCPTools, MCPManager, type MCPToolsLoadResult } from "./mcp";
 import {
 	collectDiscoverableMCPTools,
 	formatDiscoverableMCPToolServerSummary,
 	selectDiscoverableMCPToolNamesByServer,
 } from "./mcp/discoverable-tool-metadata";
-import { getMemoryRoot } from "./memories";
 import { resolveMemoryBackend } from "./memory-backend";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
@@ -681,10 +679,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	registerSshCleanup();
 	registerPythonCleanup();
 
-	// Use provided or create AuthStorage and ModelRegistry
-	const authStorage = options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir));
-	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage);
-
+	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
+	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
+	// / session would silently miss credential_disabled events.
+	const modelRegistry =
+		options.modelRegistry ??
+		new ModelRegistry(options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir)));
+	const authStorage = modelRegistry.authStorage;
+	if (options.authStorage && options.authStorage !== authStorage) {
+		throw new Error(
+			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
+		);
+	}
+	// Subscribe before any getApiKey() call so startup model probes can't fire a
+	// credential_disabled event past us. An embedder's constructor handler makes the
+	// listener set non-empty from construction, which defeats AuthStorage's no-listener
+	// buffer — so we can't rely on it to catch startup events for the extension runner.
+	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
+	let credentialDisabledTarget: ExtensionRunner | undefined;
+	let unsubscribeCredentialDisabled: (() => void) | undefined = authStorage.onCredentialDisabled(event => {
+		if (credentialDisabledTarget) {
+			// Discard return: any handler error is routed through runner.onError listeners.
+			void credentialDisabledTarget.emitCredentialDisabled(event);
+		} else {
+			startupCredentialDisabledEvents.push(event);
+		}
+	});
 	const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
 	if (!options.modelRegistry) {
@@ -789,9 +809,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const modelMatchPreferences = {
 		usageOrder: settings.getStorage()?.getModelUsageOrder(),
 	};
-	// DEBUG: Log model resolution inputs
+	const allowedModels = await logger.time("resolveAllowedModels", () =>
+		resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
+	);
 	const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
-		resolveModelRoleValue(settings.getModelRole("default"), modelRegistry.getAvailable(), {
+		resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
 			settings,
 			matchPreferences: modelMatchPreferences,
 			modelRegistry,
@@ -947,34 +969,39 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		return preview;
 	};
-	const asyncJobManager = backgroundJobsEnabled
-		? new AsyncJobManager({
-				maxRunningJobs: asyncMaxJobs,
-				onJobComplete: async (jobId, result, job) => {
-					if (!session || asyncJobManager!.isDeliverySuppressed(jobId)) return;
-					const formattedResult = await formatAsyncResultForFollowUp(result);
-					if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
+	// Only top-level sessions own an AsyncJobManager. Subagents reach the
+	// parent's manager via `AsyncJobManager.instance()` (set below), so creating
+	// a second instance here just to leave it orphaned wastes a constructor and
+	// risks accidental disposal of the parent's manager on subagent teardown.
+	const asyncJobManager =
+		backgroundJobsEnabled && !options.parentTaskPrefix
+			? new AsyncJobManager({
+					maxRunningJobs: asyncMaxJobs,
+					onJobComplete: async (jobId, result, job) => {
+						if (!session || asyncJobManager!.isDeliverySuppressed(jobId)) return;
+						const formattedResult = await formatAsyncResultForFollowUp(result);
+						if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
 
-					const message = prompt.render(asyncResultTemplate, { jobId, result: formattedResult });
-					const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-					await session.sendCustomMessage(
-						{
-							customType: "async-result",
-							content: message,
-							display: true,
-							attribution: "agent",
-							details: {
-								jobId,
-								type: job?.type,
-								label: job?.label,
-								durationMs,
+						const message = prompt.render(asyncResultTemplate, { jobId, result: formattedResult });
+						const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
+						await session.sendCustomMessage(
+							{
+								customType: "async-result",
+								content: message,
+								display: true,
+								attribution: "agent",
+								details: {
+									jobId,
+									type: job?.type,
+									label: job?.label,
+									durationMs,
+								},
 							},
-						},
-						{ deliverAs: "followUp", triggerTurn: true },
-					);
-				},
-			})
-		: undefined;
+							{ deliverAs: "followUp", triggerTurn: true },
+						);
+					},
+				})
+			: undefined;
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1021,6 +1048,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getPlanModeState: () => session.getPlanModeState(),
+			getClientBridge: () => session?.clientBridge,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
@@ -1053,6 +1081,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					timestamp: Date.now(),
 				}),
 			peekQueueInvoker: () => session.peekQueueInvoker(),
+			peekStandingResolveHandler: () => session.peekStandingResolveHandler(),
+			setStandingResolveHandler: handler => session.setStandingResolveHandler(handler),
 			allocateOutputArtifact: async toolType => {
 				try {
 					return await sessionManager.allocateArtifactPath(toolType);
@@ -1060,44 +1090,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return {};
 				}
 			},
+			getArtifactManager: () => sessionManager.getArtifactManager(),
 			settings,
 			authStorage,
 			modelRegistry,
-			asyncJobManager,
 		};
 		populateCorpSkillRoles(skills, toolSession);
-		// Initialize internal URL router for internal protocols (agent://, artifact://, memory://, skill://, rule://, mcp://, local://)
-		const internalRouter = new InternalUrlRouter();
+
+		// Wire process-wide internal URL singletons owned by their real classes.
+		// Top-level sessions install the active snapshots; subagents inherit them.
+		// Artifact and agent-output URLs resolve via `AgentRegistry.global()` —
+		// the protocol handlers walk each ref's `sessionManager.getArtifactsDir()`,
+		// which collapses to the parent's dir for subagents (they adopt the
+		// parent's ArtifactManager) so one lookup hits everything.
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
-		internalRouter.register(new AgentProtocolHandler({ getArtifactsDir }));
-		internalRouter.register(new ArtifactProtocolHandler({ getArtifactsDir }));
-		internalRouter.register(
-			new MemoryProtocolHandler({
-				getMemoryRoot: () => getMemoryRoot(agentDir, settings.getCwd()),
-			}),
-		);
-		internalRouter.register(
-			new LocalProtocolHandler(
-				options.localProtocolOptions ?? {
-					getArtifactsDir,
-					getSessionId: () => sessionManager.getSessionId(),
-				},
-			),
-		);
-		internalRouter.register(
-			new SkillProtocolHandler({
-				getSkills: () => skills,
-			}),
-		);
-		internalRouter.register(
-			new RuleProtocolHandler({
-				getRules: () => [...rulebookRules, ...alwaysApplyRules],
-			}),
-		);
-		internalRouter.register(new PiProtocolHandler());
-		internalRouter.register(new JobsProtocolHandler({ getAsyncJobManager: () => asyncJobManager }));
-		internalRouter.register(new McpProtocolHandler({ getMcpManager: () => mcpManager }));
-		toolSession.internalRouter = internalRouter;
+		if (!options.parentTaskPrefix) {
+			setActiveSkills(skills);
+			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
+			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
+		}
+		if (options.localProtocolOptions) {
+			LocalProtocolHandler.setOverride(options.localProtocolOptions);
+		}
 		toolSession.getArtifactsDir = getArtifactsDir;
 		toolSession.agentOutputManager = new AgentOutputManager(
 			getArtifactsDir,
@@ -1146,7 +1160,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				customTools.push(...mcpResult.tools.map(loaded => loaded.tool));
 			}
 		}
-		toolSession.mcpManager = mcpManager;
+		// Only top-level sessions own the global MCPManager. Subagents already
+		// receive the parent's manager via `options.mcpManager`, and reassigning
+		// the singleton to the same value is a no-op \u2014 keep the gate explicit
+		// to mirror the AsyncJobManager ownership rule.
+		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
 
 		// Add image tools when the active model or configured image providers can generate images.
 		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
@@ -1258,13 +1276,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
-		// Fall back to first available model with a valid API key.
-		// Skip fallback if the user explicitly requested a model via --model that wasn't found.
+		// Fall back to first available model with a valid API key, honoring the
+		// path-scoped `enabledModels` allow-list when configured. Skip when the
+		// user explicitly requested a model via --model that wasn't found.
 		if (!model && !options.modelPattern) {
-			const allModels = modelRegistry.getAll();
-			for (const candidate of allModels) {
-				const hasKey = await hasModelApiKey(candidate);
-				if (hasKey) {
+			// Re-resolve the allowed set: extension factories above may have
+			// registered providers/models that weren't visible at startup.
+			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			for (const candidate of fallbackCandidates) {
+				if (await hasModelApiKey(candidate)) {
 					model = candidate;
 					break;
 				}
@@ -1274,8 +1294,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 				}
 			} else {
+				const patterns = settings.get("enabledModels");
 				modelFallbackMessage =
-					"No models available. Use /login or set an API key environment variable. Then use /model to select a model.";
+					patterns && patterns.length > 0
+						? `No model available matching enabledModels (${patterns.join(", ")}) with usable credentials. Configure auth for an allowed provider or adjust enabledModels.`
+						: "No models available. Use /login or set an API key environment variable. Then use /model to select a model.";
 			}
 		}
 
@@ -1300,6 +1323,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		}
 		applyCorpExtensionRunner(extensionRunner, taskDepth);
+
+		if (extensionRunner) {
+			credentialDisabledTarget = extensionRunner;
+			for (const event of startupCredentialDisabledEvents.splice(0)) {
+				// Discard return: any handler error is routed through runner.onError listeners.
+				void extensionRunner.emitCredentialDisabled(event);
+			}
+		} else {
+			// No runner to forward to; release our subscription. The embedder's own
+			// onCredentialDisabled (if any) keeps firing through its own subscription.
+			startupCredentialDisabledEvents.length = 0;
+			unsubscribeCredentialDisabled?.();
+			unsubscribeCredentialDisabled = undefined;
+		}
 
 		const getSessionContext = () => ({
 			sessionManager,
@@ -1475,7 +1512,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			(options.toolNames ? [...new Set(options.toolNames.map(name => name.toLowerCase()))] : undefined) ??
 			toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
-		const includeExitPlanMode = requestedToolNames.includes("exit_plan_mode");
 		// Effective discovery mode: tools.discoveryMode takes precedence; mcp.discoveryMode is back-compat alias.
 		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
 		const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
@@ -1488,9 +1524,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
-		const requestedActiveToolNames = includeExitPlanMode
-			? normalizedRequested
-			: normalizedRequested.filter(name => name !== "exit_plan_mode");
+		const requestedActiveToolNames = normalizedRequested;
 		const initialRequestedActiveToolNames = options.toolNames
 			? requestedActiveToolNames
 			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
@@ -1732,6 +1766,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			sessionManager,
 			settings,
 			evalKernelOwnerId,
+			// Defined only for top-level sessions (creation is gated above).
+			// AgentSession uses this to decide whether it may dispose the global
+			// AsyncJobManager on teardown; subagents inherit the parent's and
+			// **MUST NOT** tear it down.
+			ownedAsyncJobManager: asyncJobManager,
 			scopedModels: options.scopedModels,
 			promptTemplates,
 			slashCommands,
@@ -1768,7 +1807,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			defaultSelectedMCPServerNames: [...discoveryDefaultServers],
 			ttsrManager,
 			obfuscator,
-			asyncJobManager,
 			agentId: resolvedAgentId,
 			agentRegistry,
 			providerSessionId: options.providerSessionId,
@@ -1786,6 +1824,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await originalDispose();
 				} finally {
 					agentRegistry.unregister(resolvedAgentId);
+					unsubscribeCredentialDisabled?.();
 				}
 			};
 		}
@@ -1922,6 +1961,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			eventBus,
 		};
 	} catch (error) {
+		// Release the subscription if the throw happened after install but before the
+		// dispose-wrap took ownership. Idempotent with dispose() — Set.delete is a no-op
+		// for already-removed listeners.
+		unsubscribeCredentialDisabled?.();
 		try {
 			if (hasSession) {
 				await session.dispose();

@@ -1,10 +1,13 @@
 from __future__ import annotations
-# OMP IPython prelude helpers
+# OMP prelude helpers (loaded once into the runner namespace)
 if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
-    import os, json, shutil, subprocess
-    from IPython.display import display as _ipy_display, JSON
+    import os, json
+
+    # __omp_display is injected by runner.py before the prelude executes; it
+    # mirrors IPython's display() semantics with the same MIME bundle output.
+    _omp_display = __omp_display  # type: ignore[name-defined]
 
     _PRESENTABLE_REPRS = (
         "_repr_mimebundle_",
@@ -18,21 +21,22 @@ if "__omp_prelude_loaded__" not in globals():
     )
 
     def display(value):
-        """Render a value. Wraps plain dict/list values as interactive JSON."""
+        """Render a value. Falls back to a JSON+text/plain bundle for plain dict/list/tuple."""
         if any(hasattr(value, attr) for attr in _PRESENTABLE_REPRS):
-            _ipy_display(value)
+            _omp_display(value)
             return
         if isinstance(value, (dict, list, tuple)):
             try:
-                _ipy_display(JSON(value))
+                bundle = {"application/json": value, "text/plain": repr(value)}
+                _omp_display(bundle, raw=True)
                 return
             except Exception:
                 pass
-        _ipy_display(value)
+        _omp_display(value)
 
     def _emit_status(op: str, **data):
         """Emit structured status event for TUI rendering."""
-        _ipy_display({"application/x-omp-status": {"op": op, **data}}, raw=True)
+        _omp_display({"application/x-omp-status": {"op": op, **data}}, raw=True)
 
 
     def env(key: str | None = None, value: str | None = None):
@@ -79,79 +83,6 @@ if "__omp_prelude_loaded__" not in globals():
             f.write(content)
         _emit_status("append", path=str(p), chars=len(content))
         return p
-    class ShellResult:
-        """Result from shell command execution."""
-        __slots__ = ("args", "stdout", "stderr", "returncode")
-        def __init__(self, args: str, stdout: str, stderr: str, returncode: int):
-            self.args = args
-            self.stdout = stdout
-            self.stderr = stderr
-            self.returncode = returncode
-
-        @property
-        def code(self) -> int:
-            return self.returncode
-
-        @property
-        def exit_code(self) -> int:
-            return self.returncode
-
-        def check_returncode(self) -> None:
-            if self.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    self.returncode, self.args, output=self.stdout, stderr=self.stderr
-                )
-
-        def __repr__(self):
-            if self.returncode == 0:
-                return ""
-            return f"exit code {self.returncode}"
-
-        def __bool__(self):
-            return self.returncode == 0
-
-    def _make_shell_result(proc: subprocess.CompletedProcess[str], cmd: str) -> ShellResult:
-        """Create ShellResult and emit status."""
-        output = proc.stdout + proc.stderr if proc.stderr else proc.stdout
-        _emit_status("sh", cmd=cmd[:80], code=proc.returncode, output=output[:500])
-        return ShellResult(cmd, proc.stdout, proc.stderr, proc.returncode)
-
-    import signal as _signal
-
-    def _run_with_interrupt(args: list[str], cwd: str | None, timeout: int | None, cmd: str) -> ShellResult:
-        """Run subprocess with proper interrupt handling."""
-        proc = subprocess.Popen(
-            args,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except KeyboardInterrupt:
-            os.killpg(proc.pid, _signal.SIGINT)
-            try:
-                stdout, stderr = proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, _signal.SIGKILL)
-                stdout, stderr = proc.communicate()
-            result = subprocess.CompletedProcess(args, -_signal.SIGINT, stdout, stderr)
-            return _make_shell_result(result, cmd)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, _signal.SIGKILL)
-            stdout, stderr = proc.communicate()
-            result = subprocess.CompletedProcess(args, -_signal.SIGKILL, stdout, stderr)
-            return _make_shell_result(result, cmd)
-        result = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
-        return _make_shell_result(result, cmd)
-
-    def run(cmd: str, *, cwd: str | Path | None = None, timeout: int | None = None) -> ShellResult:
-        """Run a shell command. Returns ShellResult with stdout/stderr and returncode/exit_code fields."""
-        shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
-        args = [shell_path, "-c", cmd]
-        return _run_with_interrupt(args, str(cwd) if cwd else None, timeout, cmd)
 
     def sort(text: str, *, reverse: bool = False, unique: bool = False) -> str:
         """Sort lines of text."""
@@ -268,12 +199,16 @@ if "__omp_prelude_loaded__" not in globals():
             output('explore_0', offset=10, limit=20)  # Lines 10-29
             output('explore_0', 'reviewer_1')  # Read multiple outputs
         """
-        session_file = os.environ.get("PI_SESSION_FILE")
-        if not session_file:
-            _emit_status("output", error="No session file available")
-            raise RuntimeError("No session - output artifacts unavailable")
-        
-        artifacts_dir = session_file.rsplit(".", 1)[0]  # Strip .jsonl extension
+        # Prefer PI_ARTIFACTS_DIR so subagents resolve through the parent's
+        # shared artifacts dir; fall back to deriving from PI_SESSION_FILE
+        # for legacy callers / top-level sessions where the two coincide.
+        artifacts_dir = os.environ.get("PI_ARTIFACTS_DIR")
+        if not artifacts_dir:
+            session_file = os.environ.get("PI_SESSION_FILE")
+            if not session_file:
+                _emit_status("output", error="No session file available")
+                raise RuntimeError("No session - output artifacts unavailable")
+            artifacts_dir = session_file.rsplit(".", 1)[0]  # Strip .jsonl extension
         if not Path(artifacts_dir).exists():
             _emit_status("output", error="Artifacts directory not found", path=artifacts_dir)
             raise RuntimeError(f"No artifacts directory found: {artifacts_dir}")
@@ -441,3 +376,87 @@ if "__omp_prelude_loaded__" not in globals():
         
         return current
 
+
+    class _ToolCallable:
+        """Invokes one host-side tool via the loopback HTTP bridge."""
+
+        __slots__ = ("_proxy", "_name")
+
+        def __init__(self, proxy: "_ToolProxy", name: str):
+            self._proxy = proxy
+            self._name = name
+
+        def __repr__(self) -> str:
+            return f"<tool.{self._name}>"
+
+        def __call__(self, args=None, /, **kwargs):
+            import urllib.request, urllib.error
+            if args is None:
+                merged: dict = {}
+            elif isinstance(args, dict):
+                merged = dict(args)
+            else:
+                raise TypeError(
+                    f"tool.{self._name}(...) expects a dict of arguments (got {type(args).__name__})"
+                )
+            merged.update(kwargs)
+            if "_i" not in merged:
+                merged["_i"] = "py prelude"
+            payload = json.dumps(
+                {"session": self._proxy._session, "name": self._name, "args": merged}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self._proxy._base}/v1/tool",
+                data=payload,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._proxy._token}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    body = resp.read()
+            except urllib.error.HTTPError as exc:
+                body = exc.read()
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                raise RuntimeError(
+                    f"tool.{self._name}: bridge returned non-JSON response: {body[:200]!r}"
+                ) from None
+            if not isinstance(data, dict) or not data.get("ok"):
+                msg = (data or {}).get("error") if isinstance(data, dict) else None
+                raise RuntimeError(msg or f"tool.{self._name} failed")
+            return data.get("value")
+
+    class _ToolProxy:
+        """`tool.<name>(args)` proxy mirroring the JS runtime bridge."""
+
+        __slots__ = ("_base", "_token", "_session")
+
+        def __init__(self, base: str, token: str, session: str):
+            self._base = base.rstrip("/")
+            self._token = token
+            self._session = session
+
+        def __getattr__(self, name: str) -> _ToolCallable:
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return _ToolCallable(self, name)
+
+        def __getitem__(self, name: str) -> _ToolCallable:
+            return _ToolCallable(self, name)
+
+        def __repr__(self) -> str:
+            return f"<tool proxy session={self._session}>"
+
+    if all(
+        _k in os.environ
+        for _k in ("PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_TOKEN", "PI_TOOL_BRIDGE_SESSION")
+    ):
+        tool = _ToolProxy(
+            os.environ["PI_TOOL_BRIDGE_URL"],
+            os.environ["PI_TOOL_BRIDGE_TOKEN"],
+            os.environ["PI_TOOL_BRIDGE_SESSION"],
+        )

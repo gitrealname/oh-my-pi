@@ -25,7 +25,6 @@ export default {
 	},
 
 	async execute(code: string, opts: ExecutorBackendExecOptions): Promise<ExecutorBackendResult> {
-		const useSharedGateway = readSetting<boolean>(opts.session, "python.sharedGateway");
 		const kernelMode = readSetting<PythonExecutorOptions["kernelMode"]>(opts.session, "python.kernelMode");
 		const executorOptions: PythonExecutorOptions = {
 			cwd: opts.cwd,
@@ -33,13 +32,14 @@ export default {
 			signal: opts.signal,
 			sessionId: namespaceSessionId(opts.sessionId),
 			kernelMode,
-			useSharedGateway,
 			sessionFile: opts.sessionFile,
+			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
 			kernelOwnerId: opts.kernelOwnerId,
 			reset: opts.reset,
 			artifactPath: opts.artifactPath,
 			artifactId: opts.artifactId,
 			onChunk: opts.onChunk,
+			toolSession: opts.session,
 		};
 		const result = await executePython(code, executorOptions);
 		return {

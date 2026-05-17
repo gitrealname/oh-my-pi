@@ -3,7 +3,7 @@
 Skills are file-backed capability packs discovered at startup and exposed to the model as:
 
 - lightweight metadata in the system prompt (name + description)
-- on-demand content via `read skill://...`
+- on-demand content via the `read` tool against `skill://...`
 - optional interactive `/skill:<name>` commands
 
 This document covers current runtime behavior in `src/extensibility/skills.ts`, `src/discovery/builtin.ts`, `src/internal-urls/skill-protocol.ts`, and `src/discovery/agents-md.ts`.
@@ -136,8 +136,13 @@ If `skills.enableSkillCommands` is true, interactive mode registers one slash co
 
 - reads the skill file directly from `filePath`
 - strips frontmatter
-- injects skill body as a follow-up custom message
+- injects skill body as a custom message
+- delivery mode follows the **submission keybinding**:
+  - **Enter** → invokes the skill on the `steer` queue while streaming (matches free-text Enter, which also steers), or as a normal idle prompt when the agent is not streaming
+  - **Ctrl+Enter** (`app.message.followUp`) → invokes the skill on the `followUp` queue while streaming, or as a normal idle prompt when the agent is not streaming
 - appends metadata (`Skill: <path>`, optional `User: <args>`)
+
+There is no flag, mode-selector, or frontmatter knob to override this — the keybinding *is* the choice, identical to how free text is routed during streaming (`input-controller.ts:243-249` for Enter, `input-controller.ts:462-500` for Ctrl+Enter; both dispatch through `#invokeSkillCommand`).
 
 ## `skill://` URL behavior
 

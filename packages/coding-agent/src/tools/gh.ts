@@ -1,14 +1,17 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { StringEnum } from "@oh-my-pi/pi-ai";
-import { abortableSleep, getWorktreesDir, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { getWorktreesDir, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
+import type { Settings } from "../config/settings";
 import githubDescription from "../prompts/tools/github.md" with { type: "text" };
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
 import { formatShortSha } from "./gh-format";
+import { type CacheStatus, getOrFetchView, resolveGithubCacheAuthKey } from "./github-cache";
 import type { OutputMeta } from "./output-meta";
 import { ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -103,35 +106,81 @@ const GH_PR_CHECKOUT_FIELDS = [
 	"title",
 	"url",
 ];
-const GH_SEARCH_FIELDS = [
-	"author",
-	"createdAt",
-	"labels",
-	"number",
-	"repository",
-	"state",
-	"title",
-	"updatedAt",
-	"url",
-];
-const GH_SEARCH_CODE_FIELDS = ["path", "repository", "sha", "textMatches", "url"];
-const GH_SEARCH_COMMITS_FIELDS = ["author", "commit", "committer", "id", "repository", "sha", "url"];
-const GH_SEARCH_REPOS_FIELDS = [
-	"createdAt",
-	"description",
-	"forksCount",
-	"fullName",
-	"isArchived",
-	"isFork",
-	"isPrivate",
-	"language",
-	"openIssuesCount",
-	"owner",
-	"stargazersCount",
-	"updatedAt",
-	"url",
-	"visibility",
-];
+// /search/<endpoint> API response shapes (subset). Used when projecting raw
+// REST results into the normalized `GhSearch*Result` shapes the formatters
+// consume. We talk to the API directly because `gh search prs`/`issues`
+// quotes multi-token positional queries (`is:"merged is:pr"`) and returns 0
+// hits — see https://github.com/cli/cli for the upstream regression.
+interface GhApiSearchResponse<T> {
+	total_count?: number;
+	incomplete_results?: boolean;
+	items?: T[];
+}
+interface GhApiUser {
+	login?: string;
+	name?: string | null;
+}
+interface GhApiLabel {
+	name?: string;
+}
+interface GhApiPullRequestRef {
+	merged_at?: string | null;
+}
+interface GhApiSearchIssueItem {
+	number?: number;
+	title?: string;
+	state?: string;
+	state_reason?: string | null;
+	user?: GhApiUser | null;
+	labels?: GhApiLabel[];
+	created_at?: string;
+	updated_at?: string;
+	html_url?: string;
+	repository_url?: string;
+	pull_request?: GhApiPullRequestRef | null;
+}
+interface GhApiSearchCodeItem {
+	name?: string;
+	path?: string;
+	sha?: string;
+	html_url?: string;
+	repository?: { full_name?: string } | null;
+	text_matches?: Array<{ fragment?: string; property?: string }>;
+}
+interface GhApiSearchCommitGitActor {
+	name?: string;
+	email?: string;
+	date?: string;
+}
+interface GhApiSearchCommitItem {
+	sha?: string;
+	node_id?: string;
+	html_url?: string;
+	author?: GhApiUser | null;
+	committer?: GhApiUser | null;
+	commit?: {
+		author?: GhApiSearchCommitGitActor | null;
+		committer?: GhApiSearchCommitGitActor | null;
+		message?: string;
+	} | null;
+	repository?: { full_name?: string } | null;
+}
+interface GhApiSearchRepoItem {
+	full_name?: string;
+	description?: string | null;
+	language?: string | null;
+	stargazers_count?: number;
+	forks_count?: number;
+	open_issues_count?: number;
+	archived?: boolean;
+	fork?: boolean;
+	private?: boolean;
+	visibility?: string | null;
+	updated_at?: string;
+	created_at?: string;
+	html_url?: string;
+	owner?: GhApiUser | null;
+}
 const SEARCH_LIMIT_DEFAULT = 10;
 const SEARCH_LIMIT_MAX = 50;
 const FILE_PREVIEW_LIMIT = 50;
@@ -142,6 +191,7 @@ const RUN_WATCH_TAIL_MAX = 200;
 const REVIEW_COMMENTS_PAGE_SIZE = 100;
 const RUN_JOBS_PAGE_SIZE = 100;
 const PR_URL_PATTERN = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:\/.*)?$/;
+const ISSUE_URL_PATTERN = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)(?:\/.*)?$/;
 const RUN_URL_PATTERN = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(?:\/.*)?$/;
 const RUN_SUCCESS_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
 const RUN_FAILURE_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure"]);
@@ -151,10 +201,7 @@ const githubSchema = Type.Object({
 	op: StringEnum(
 		[
 			"repo_view",
-			"issue_view",
 			"pr_create",
-			"pr_view",
-			"pr_diff",
 			"pr_checkout",
 			"pr_push",
 			"search_issues",
@@ -178,12 +225,6 @@ const githubSchema = Type.Object({
 			examples: ["main", "develop"],
 		}),
 	),
-	issue: Type.Optional(
-		Type.String({
-			description: "issue number or url (issue_view)",
-			examples: ["123", "https://github.com/owner/repo/issues/123"],
-		}),
-	),
 	pr: Type.Optional(
 		Type.Union(
 			[
@@ -194,16 +235,9 @@ const githubSchema = Type.Object({
 			],
 			{
 				description:
-					"pr number, url, or branch (pr_view, pr_diff, pr_checkout); pass an array to batch-process multiple pull requests in one call",
+					"pr number, url, or branch (pr_checkout); pass an array to batch-process multiple pull requests in one call",
 			},
 		),
-	),
-	comments: Type.Optional(Type.Boolean({ description: "include comments (issue_view, pr_view)", default: true })),
-	nameOnly: Type.Optional(Type.Boolean({ description: "return file names only (pr_diff)" })),
-	exclude: Type.Optional(
-		Type.Array(Type.String({ description: "glob to exclude" }), {
-			description: "file globs to exclude (pr_diff)",
-		}),
 	),
 	force: Type.Optional(Type.Boolean({ description: "reset existing local branch (pr_checkout)" })),
 	forceWithLease: Type.Optional(Type.Boolean({ description: "force-with-lease push (pr_push)" })),
@@ -258,6 +292,27 @@ const githubSchema = Type.Object({
 		Type.String({
 			description: "search query (search_issues, search_prs, search_code, search_commits, search_repos)",
 			examples: ["is:open label:bug"],
+		}),
+	),
+	since: Type.Optional(
+		Type.String({
+			description:
+				"lower-bound date for search_issues/search_prs/search_commits/search_repos. Accepts a relative duration (`<n><unit>` with unit `m`/`h`/`d`/`w`/`mo`/`y`, e.g. `3d`, `12h`, `2w`) or an ISO date (`YYYY-MM-DD`) / datetime. Translated to a `created:>=…` (or `committer-date:`/`pushed:`) qualifier; not supported by search_code.",
+			examples: ["3d", "2w", "2026-05-01"],
+		}),
+	),
+	until: Type.Optional(
+		Type.String({
+			description:
+				"upper-bound date in the same format as `since`. With both, builds a `field:since..until` range qualifier.",
+			examples: ["1d", "2026-05-09"],
+		}),
+	),
+	dateField: Type.Optional(
+		StringEnum(["created", "updated"], {
+			description:
+				"date field used by `since`/`until`. issues/prs: `created` (default) or `updated`. repos: `created` (default) or `updated` (mapped to GitHub's `pushed:`). commits: ignored — always uses `committer-date`.",
+			default: "created",
 		}),
 	),
 	limit: Type.Optional(
@@ -678,27 +733,202 @@ function appendRepoFlag(args: string[], repo: string | undefined, identifier?: s
 	args.push("--repo", repo);
 }
 
-const SEARCH_FIELDS_BY_COMMAND: Record<"issues" | "prs" | "code" | "commits" | "repos", readonly string[]> = {
-	issues: GH_SEARCH_FIELDS,
-	prs: GH_SEARCH_FIELDS,
-	code: GH_SEARCH_CODE_FIELDS,
-	commits: GH_SEARCH_COMMITS_FIELDS,
-	repos: GH_SEARCH_REPOS_FIELDS,
+const REPO_API_URL_PREFIX = "https://api.github.com/repos/";
+
+const RELATIVE_DURATION_PATTERN = /^(\d+)\s*(m|h|d|w|mo|y)$/i;
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const FIXED_UNIT_MS: Record<string, number> = {
+	m: 60_000,
+	h: 3_600_000,
+	d: 86_400_000,
+	w: 7 * 86_400_000,
 };
 
-function buildGhSearchArgs(
-	command: "issues" | "prs" | "code" | "commits" | "repos",
+/**
+ * Resolve a search date bound to a GitHub-search-compatible literal. Returns
+ * either a `YYYY-MM-DD` date (relative durations and date-only inputs) or a
+ * full ISO 8601 datetime string (datetime inputs), so the caller can drop it
+ * straight into a qualifier like `created:>=<value>`.
+ */
+export function parseSearchDateBound(raw: string, now: Date = new Date()): string {
+	const trimmed = raw.trim();
+	if (!trimmed) {
+		throw new ToolError("date bound must not be empty");
+	}
+
+	const relMatch = trimmed.match(RELATIVE_DURATION_PATTERN);
+	if (relMatch) {
+		const count = Number(relMatch[1]);
+		const unit = relMatch[2].toLowerCase();
+		const fixedMs = FIXED_UNIT_MS[unit];
+		let bound: Date;
+		if (fixedMs !== undefined) {
+			bound = new Date(now.getTime() - count * fixedMs);
+		} else {
+			bound = new Date(now);
+			if (unit === "mo") {
+				bound.setUTCMonth(bound.getUTCMonth() - count);
+			} else {
+				bound.setUTCFullYear(bound.getUTCFullYear() - count);
+			}
+		}
+		return bound.toISOString().slice(0, 10);
+	}
+
+	if (ISO_DATE_PATTERN.test(trimmed)) {
+		return trimmed;
+	}
+
+	const parsedMs = Date.parse(trimmed);
+	if (!Number.isNaN(parsedMs)) {
+		return new Date(parsedMs).toISOString();
+	}
+
+	throw new ToolError(
+		`invalid date bound: ${raw}. Expected a relative duration like "3d", "12h", "2w", an ISO date "YYYY-MM-DD", or an ISO datetime.`,
+	);
+}
+
+/**
+ * Build the GitHub-search qualifier (e.g. `created:>=2026-05-09`) for the
+ * provided bounds, or `undefined` if neither bound is set.
+ */
+export function buildSearchDateQualifier(
+	field: string,
+	since: string | undefined,
+	until: string | undefined,
+	now?: Date,
+): string | undefined {
+	const sinceVal = since ? parseSearchDateBound(since, now) : undefined;
+	const untilVal = until ? parseSearchDateBound(until, now) : undefined;
+	if (sinceVal && untilVal) {
+		return `${field}:${sinceVal}..${untilVal}`;
+	}
+	if (sinceVal) {
+		return `${field}:>=${sinceVal}`;
+	}
+	if (untilVal) {
+		return `${field}:<=${untilVal}`;
+	}
+	return undefined;
+}
+
+function resolveSearchDateField(
+	command: "issues" | "prs" | "commits" | "repos",
+	requested: "created" | "updated" | undefined,
+): string {
+	if (command === "commits") {
+		return "committer-date";
+	}
+	const dateField = requested ?? "created";
+	if (command === "repos" && dateField === "updated") {
+		return "pushed";
+	}
+	return dateField;
+}
+
+function composeSearchQuery(parts: ReadonlyArray<string | undefined>): string {
+	const cleaned: string[] = [];
+	for (const part of parts) {
+		const trimmed = part?.trim();
+		if (trimmed) cleaned.push(trimmed);
+	}
+	if (cleaned.length === 0) {
+		throw new ToolError("query is required (or pass since/until to filter by date)");
+	}
+	return cleaned.join(" ");
+}
+
+function buildGhApiSearchArgs(
+	endpoint: "issues" | "code" | "commits" | "repositories",
 	query: string,
 	limit: number,
-	repo: string | undefined,
+	extraHeaders?: ReadonlyArray<string>,
 ): string[] {
-	const fields = SEARCH_FIELDS_BY_COMMAND[command];
-	const args = ["search", command, "--limit", String(limit), "--json", fields.join(",")];
-	if (command !== "repos") {
-		appendRepoFlag(args, repo);
+	const args = ["api", "-X", "GET", `/search/${endpoint}`, "-f", `q=${query}`, "-F", `per_page=${limit}`];
+	for (const header of extraHeaders ?? []) {
+		args.push("-H", header);
 	}
-	args.push("--", query);
 	return args;
+}
+
+function repoFromRepositoryUrl(value: string | undefined): string | undefined {
+	if (!value?.startsWith(REPO_API_URL_PREFIX)) return undefined;
+	return value.slice(REPO_API_URL_PREFIX.length);
+}
+
+function apiUserToGhUser(user: GhApiUser | null | undefined): GhUser | undefined {
+	if (!user) return undefined;
+	const login = user.login ?? undefined;
+	const name = user.name ?? undefined;
+	if (login === undefined && name === undefined) return undefined;
+	return { login, name };
+}
+
+function apiLabelsToGhLabels(labels: GhApiLabel[] | undefined): GhLabel[] {
+	return labels?.map(label => ({ name: label.name })) ?? [];
+}
+
+function apiIssueToSearchResult(item: GhApiSearchIssueItem): GhSearchResult {
+	const merged = Boolean(item.pull_request?.merged_at);
+	return {
+		author: apiUserToGhUser(item.user) ?? null,
+		createdAt: item.created_at,
+		labels: apiLabelsToGhLabels(item.labels),
+		number: item.number,
+		repository: { nameWithOwner: repoFromRepositoryUrl(item.repository_url) },
+		state: merged ? "merged" : item.state,
+		title: item.title,
+		updatedAt: item.updated_at,
+		url: item.html_url,
+	};
+}
+
+function apiCodeToSearchResult(item: GhApiSearchCodeItem): GhSearchCodeResult {
+	return {
+		path: item.path,
+		repository: { nameWithOwner: item.repository?.full_name },
+		sha: item.sha,
+		textMatches: item.text_matches?.map(match => ({ fragment: match.fragment, property: match.property })),
+		url: item.html_url,
+	};
+}
+
+function apiCommitToSearchResult(item: GhApiSearchCommitItem): GhSearchCommitResult {
+	return {
+		author: apiUserToGhUser(item.author) ?? null,
+		commit: item.commit
+			? {
+					author: item.commit.author ?? null,
+					committer: item.commit.committer ?? null,
+					message: item.commit.message,
+				}
+			: null,
+		committer: apiUserToGhUser(item.committer) ?? null,
+		id: item.node_id,
+		repository: { nameWithOwner: item.repository?.full_name },
+		sha: item.sha,
+		url: item.html_url,
+	};
+}
+
+function apiRepoToSearchResult(item: GhApiSearchRepoItem): GhSearchRepoResult {
+	return {
+		createdAt: item.created_at,
+		description: item.description,
+		forksCount: item.forks_count,
+		fullName: item.full_name,
+		isArchived: item.archived,
+		isFork: item.fork,
+		isPrivate: item.private,
+		language: item.language,
+		openIssuesCount: item.open_issues_count,
+		owner: apiUserToGhUser(item.owner) ?? null,
+		stargazersCount: item.stargazers_count,
+		updatedAt: item.updated_at,
+		url: item.html_url,
+		visibility: item.visibility ?? null,
+	};
 }
 
 function sanitizeRemoteName(value: string): string {
@@ -958,6 +1188,29 @@ function parsePullRequestUrl(value: string | undefined): { repo?: string; prNumb
 	return {
 		repo: match[1],
 		prNumber: Number(match[2]),
+	};
+}
+
+/**
+ * Parse a digit-only decimal positive integer or return undefined. Rejects
+ * `1e2`, `0x10`, `12.0`, leading +/-, or any other shape `Number()` would
+ * accept — those would otherwise key the cache against the wrong row.
+ */
+export function parsePositiveDecimalInt(value: string | undefined): number | undefined {
+	if (!value || !/^\d+$/.test(value)) return undefined;
+	const num = Number(value);
+	if (!Number.isSafeInteger(num) || num <= 0) return undefined;
+	return num;
+}
+
+function parseIssueUrl(value: string | undefined): { repo?: string; issueNumber?: number } {
+	const normalized = normalizeOptionalString(value);
+	if (!normalized) return {};
+	const match = normalized.match(ISSUE_URL_PATTERN);
+	if (!match) return {};
+	return {
+		repo: match[1],
+		issueNumber: Number(match[2]),
 	};
 }
 
@@ -1473,6 +1726,52 @@ async function resolveGitHubRepo(
 		signal,
 	);
 	return requireNonEmpty(resolved, "repo");
+}
+
+/**
+ * Process-lifetime cache of `gh repo view --json nameWithOwner` lookups keyed
+ * by absolute cwd. Avoids repeated `gh` chatter when the same protocol handler
+ * or tool call resolves the default repo many times in a row.
+ *
+ * The shared lookup is intentionally **not** bound to any caller's
+ * AbortSignal. Cancelling one caller would otherwise kill the underlying
+ * `gh repo view` for every concurrent waiter on the same cwd. Each caller's
+ * signal is honored at the wait point via `untilAborted` instead, so an abort
+ * unwinds only that caller.
+ */
+const DEFAULT_REPO_RESOLVED = new Map<string, string>();
+const DEFAULT_REPO_INFLIGHT = new Map<string, Promise<string>>();
+
+export async function resolveDefaultRepoMemoized(cwd: string, signal?: AbortSignal): Promise<string> {
+	const key = path.resolve(cwd);
+	const ready = DEFAULT_REPO_RESOLVED.get(key);
+	if (ready) return ready;
+	let pending = DEFAULT_REPO_INFLIGHT.get(key);
+	if (!pending) {
+		pending = (async () => {
+			// No caller signal: this lookup is shared across every concurrent
+			// waiter on the same cwd.
+			const resolved = await git.github.text(cwd, [
+				"repo",
+				"view",
+				"--json",
+				"nameWithOwner",
+				"-q",
+				".nameWithOwner",
+			]);
+			const value = requireNonEmpty(resolved, "repo");
+			DEFAULT_REPO_RESOLVED.set(key, value);
+			return value;
+		})();
+		// Drop the in-flight slot on settle so failures don't poison the cache
+		// and so a successful resolution survives only in `DEFAULT_REPO_RESOLVED`.
+		void pending.then(
+			() => DEFAULT_REPO_INFLIGHT.delete(key),
+			() => DEFAULT_REPO_INFLIGHT.delete(key),
+		);
+		DEFAULT_REPO_INFLIGHT.set(key, pending);
+	}
+	return untilAborted(signal, pending);
 }
 
 async function resolveGitHubBranchHead(
@@ -2112,14 +2411,8 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 			switch (params.op) {
 				case "repo_view":
 					return executeRepoView(this.session, params, signal);
-				case "issue_view":
-					return executeIssueView(this.session, params, signal);
 				case "pr_create":
 					return executePrCreate(this.session, params, signal);
-				case "pr_view":
-					return executePrView(this.session, params, signal);
-				case "pr_diff":
-					return executePrDiff(this.session, params, signal);
 				case "pr_checkout":
 					return executePrCheckout(this.session, params, signal);
 				case "pr_push":
@@ -2163,111 +2456,449 @@ async function executeRepoView(
 	return buildTextResult(formatRepoView(data, { repo, branch }), data.url);
 }
 
-async function executeIssueView(
-	session: ToolSession,
-	params: GithubInput,
-	signal: AbortSignal | undefined,
-): Promise<AgentToolResult<GhToolDetails>> {
-	const issue = requireNonEmpty(params.issue, "issue");
-	const repo = normalizeOptionalString(params.repo);
-	const includeComments = params.comments ?? true;
-	const args = ["issue", "view", issue];
-	appendRepoFlag(args, repo, issue);
-	args.push("--json", (includeComments ? GH_ISSUE_FIELDS : GH_ISSUE_FIELDS_NO_COMMENTS).join(","));
+// ────────────────────────────────────────────────────────────────────────────
+// Cached issue/PR view fetchers
+//
+// Used by `executeIssueView`/`executePrView` and by the `issue://` / `pr://`
+// internal-URL protocol handlers. The cache wrapper lives in `./github-cache`;
+// the fresh fetchers stay here to share the existing formatter helpers.
+// ────────────────────────────────────────────────────────────────────────────
 
-	const data = await git.github.json<GhIssueViewData>(session.cwd, args, signal, {
+export interface IssueViewLookupOptions {
+	cwd: string;
+	repo?: string;
+	/** Issue number or GitHub issue URL. */
+	issue: string;
+	includeComments?: boolean;
+	signal?: AbortSignal;
+	settings?: Settings;
+	cacheAuthKey?: string | null;
+}
+
+export interface PrViewLookupOptions {
+	cwd: string;
+	repo: string;
+	number: number;
+	includeComments?: boolean;
+	signal?: AbortSignal;
+	settings?: Settings;
+	cacheAuthKey?: string | null;
+}
+
+export interface ViewLookupResult<T> {
+	rendered: string;
+	sourceUrl: string | undefined;
+	payload: T;
+	status: CacheStatus;
+	fetchedAt: number;
+}
+
+async function fetchIssueViewFresh(
+	cwd: string,
+	repo: string | undefined,
+	identifier: string,
+	includeComments: boolean,
+	signal: AbortSignal | undefined,
+): Promise<{ rendered: string; sourceUrl: string | undefined; payload: GhIssueViewData }> {
+	const args = ["issue", "view", identifier];
+	appendRepoFlag(args, repo, identifier);
+	args.push("--json", (includeComments ? GH_ISSUE_FIELDS : GH_ISSUE_FIELDS_NO_COMMENTS).join(","));
+	const data = await git.github.json<GhIssueViewData>(cwd, args, signal, {
 		repoProvided: Boolean(repo),
 	});
-	return buildTextResult(formatIssueView(data, { issue, repo, comments: includeComments }), data.url);
+	const rendered = formatIssueView(data, { issue: identifier, repo, comments: includeComments });
+	return { rendered, sourceUrl: data.url, payload: data };
 }
 
-async function executePrView(
-	session: ToolSession,
-	params: GithubInput,
+async function fetchPrViewFresh(
+	cwd: string,
+	repo: string,
+	number: number,
+	includeComments: boolean,
 	signal: AbortSignal | undefined,
-): Promise<AgentToolResult<GhToolDetails>> {
-	const repo = normalizeOptionalString(params.repo);
-	const includeComments = params.comments ?? true;
-	const prList = normalizePrIdentifierList(params.pr);
-	const prRefs: (string | undefined)[] = prList.length > 0 ? prList : [undefined];
-
-	const views = await Promise.all(
-		prRefs.map(async prRef => {
-			const args = ["pr", "view"];
-			if (prRef) args.push(prRef);
-			appendRepoFlag(args, repo, prRef);
-			args.push("--json", (includeComments ? GH_PR_FIELDS : GH_PR_FIELDS_NO_COMMENTS).join(","));
-
-			const data = await git.github.json<GhPrViewData>(session.cwd, args, signal, {
-				repoProvided: Boolean(repo),
-			});
-			const resolvedRepo = repo ?? parsePullRequestUrl(data.url).repo;
-			if (includeComments && resolvedRepo && typeof data.number === "number") {
-				data.reviewComments = await fetchPrReviewComments(session.cwd, resolvedRepo, data.number, signal);
-			}
-			return { prRef, data };
-		}),
-	);
-
-	if (views.length === 1) {
-		const [view] = views;
-		return buildTextResult(
-			formatPrView(view.data, { pr: view.prRef, repo, comments: includeComments }),
-			view.data.url,
-		);
+): Promise<{ rendered: string; sourceUrl: string | undefined; payload: GhPrViewData }> {
+	const args = ["pr", "view", String(number)];
+	appendRepoFlag(args, repo, String(number));
+	args.push("--json", (includeComments ? GH_PR_FIELDS : GH_PR_FIELDS_NO_COMMENTS).join(","));
+	const data = await git.github.json<GhPrViewData>(cwd, args, signal, { repoProvided: true });
+	if (includeComments && typeof data.number === "number") {
+		data.reviewComments = await fetchPrReviewComments(cwd, repo, data.number, signal);
 	}
-
-	const sections = views.map(view => formatPrView(view.data, { pr: view.prRef, repo, comments: includeComments }));
-	const text = [`# ${views.length} Pull Requests`, "", ...joinSections(sections)].join("\n").trim();
-	return buildTextResult(text);
+	const rendered = formatPrView(data, { pr: String(number), repo, comments: includeComments });
+	return { rendered, sourceUrl: data.url, payload: data };
 }
 
-async function executePrDiff(
-	session: ToolSession,
-	params: GithubInput,
-	signal: AbortSignal | undefined,
-): Promise<AgentToolResult<GhToolDetails>> {
-	const repo = normalizeOptionalString(params.repo);
-	const prList = normalizePrIdentifierList(params.pr);
-	const prRefs: (string | undefined)[] = prList.length > 0 ? prList : [undefined];
-
-	const diffs = await Promise.all(
-		prRefs.map(async prRef => {
-			const args = ["pr", "diff"];
-			if (prRef) args.push(prRef);
-			appendRepoFlag(args, repo, prRef);
-			args.push("--color", "never");
-			if (params.nameOnly) args.push("--name-only");
-			for (const pattern of params.exclude ?? []) {
-				args.push("--exclude", requireNonEmpty(pattern, "exclude pattern"));
-			}
-			const output = await git.github.text(session.cwd, args, signal, {
-				repoProvided: Boolean(repo),
-				trimOutput: false,
-			});
-			return { prRef, output };
-		}),
-	);
-
-	const singleTitle = params.nameOnly ? "# Pull Request Files" : "# Pull Request Diff";
-	const emptyBody = params.nameOnly ? "No changed files." : "No diff output.";
-
-	if (diffs.length === 1) {
-		const [diff] = diffs;
-		const body = diff.output.length > 0 ? diff.output : emptyBody;
-		return buildTextResult(`${singleTitle}\n\n${body}`);
+/**
+ * Cache-aware issue/view fetcher. Used by both the `github` tool op and the
+ * `issue://` protocol handler so a single shared row services both surfaces.
+ */
+export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<ViewLookupResult<GhIssueViewData>> {
+	const identifier = requireNonEmpty(options.issue, "issue");
+	const includeComments = options.includeComments ?? true;
+	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
+	const urlParse = parseIssueUrl(identifier);
+	// Prefer the URL's repo when the identifier is a full URL; fall back to the
+	// explicit `repo` option, then to the cwd's default repo.
+	let repo = urlParse.repo ?? normalizeOptionalString(options.repo);
+	let cacheNumber = urlParse.issueNumber;
+	if (cacheNumber === undefined) {
+		cacheNumber = parsePositiveDecimalInt(identifier);
+	}
+	if (cacheNumber !== undefined && !repo) {
+		try {
+			repo = await resolveDefaultRepoMemoized(options.cwd, options.signal);
+		} catch {
+			// Resolution failure leaves `repo` undefined: we'll fall through to a
+			// direct fetch below so gh produces its own error message instead of
+			// us masking it with a friendlier one.
+			repo = undefined;
+		}
 	}
 
-	const header = params.nameOnly
-		? `# ${diffs.length} Pull Request File Lists`
-		: `# ${diffs.length} Pull Request Diffs`;
-	const sections = diffs.map(diff => {
-		const label = diff.prRef ? `PR ${diff.prRef}` : "PR (current branch)";
-		const body = diff.output.length > 0 ? diff.output : emptyBody;
-		return `## ${label}\n\n${body}`;
+	const doFetch = () => fetchIssueViewFresh(options.cwd, repo, identifier, includeComments, options.signal);
+
+	if (!repo || cacheNumber === undefined) {
+		const fresh = await doFetch();
+		return { ...fresh, status: "miss", fetchedAt: Date.now() };
+	}
+
+	const lookup = await getOrFetchView<GhIssueViewData>({
+		repo,
+		kind: "issue",
+		number: cacheNumber,
+		includeComments,
+		settings: options.settings,
+		authKey,
+		fetchFresh: doFetch,
 	});
-	const text = [header, "", ...joinSections(sections)].join("\n").trim();
-	return buildTextResult(text);
+	return {
+		rendered: lookup.rendered,
+		sourceUrl: lookup.sourceUrl,
+		payload: lookup.payload,
+		status: lookup.status,
+		fetchedAt: lookup.fetchedAt,
+	};
+}
+
+/**
+ * Cache-aware PR view fetcher. Caller must supply a numeric PR number;
+ * branch-name / current-branch lookups bypass the cache entirely upstream
+ * (see `executePrView`).
+ */
+export async function getOrFetchPr(options: PrViewLookupOptions): Promise<ViewLookupResult<GhPrViewData>> {
+	const includeComments = options.includeComments ?? true;
+	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
+	const doFetch = () => fetchPrViewFresh(options.cwd, options.repo, options.number, includeComments, options.signal);
+	const lookup = await getOrFetchView<GhPrViewData>({
+		repo: options.repo,
+		kind: "pr",
+		number: options.number,
+		includeComments,
+		settings: options.settings,
+		authKey,
+		fetchFresh: doFetch,
+	});
+	return {
+		rendered: lookup.rendered,
+		sourceUrl: lookup.sourceUrl,
+		payload: lookup.payload,
+		status: lookup.status,
+		fetchedAt: lookup.fetchedAt,
+	};
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// PR diff fetcher
+//
+// Used by the `pr://<n>/diff[/…]` internal-URL family. Stores the verbatim
+// `gh pr diff` text plus a parsed file index so the listing, full-diff, and
+// per-file slice variants all share one cache row.
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface PrDiffFile {
+	/** Display path. Prefers the post-image (`b/<path>`) when present. */
+	path: string;
+	additions: number;
+	deletions: number;
+	changeType: "modified" | "added" | "deleted" | "renamed" | "binary";
+	/** Pre-image path for renames/deletes; same as `path` otherwise. */
+	oldPath?: string;
+	/** Byte offset of the section's `diff --git` line in the unified diff. */
+	startOffset: number;
+	/** Byte offset of the next section (or end-of-text). */
+	endOffset: number;
+}
+
+export interface PrDiffPayload {
+	/** Full unified diff text as returned by `gh pr diff --color never`. */
+	unified: string;
+	files: PrDiffFile[];
+}
+
+export interface PrDiffLookupOptions {
+	cwd: string;
+	repo: string;
+	number: number;
+	signal?: AbortSignal;
+	settings?: Settings;
+	cacheAuthKey?: string | null;
+}
+/**
+ * Split `gh pr diff` output on `^diff --git ` boundaries and parse per-file
+ * metadata. The unified diff is preserved verbatim so callers can slice it by
+ * byte offsets without re-running gh.
+ */
+export function parsePrUnifiedDiff(text: string): PrDiffPayload {
+	const files: PrDiffFile[] = [];
+	if (text.length === 0) {
+		return { unified: text, files };
+	}
+
+	// Walk match positions manually so we capture each section's byte range.
+	const sectionStarts: number[] = [];
+	const re = /^diff --git /gm;
+	let m: RegExpExecArray | null = re.exec(text);
+	while (m !== null) {
+		sectionStarts.push(m.index);
+		// Avoid zero-length match infinite loop (regex has fixed prefix, but
+		// be explicit).
+		if (re.lastIndex === m.index) re.lastIndex += 1;
+		m = re.exec(text);
+	}
+
+	for (let i = 0; i < sectionStarts.length; i += 1) {
+		const startOffset = sectionStarts[i] ?? 0;
+		const endOffset = sectionStarts[i + 1] ?? text.length;
+		const section = text.slice(startOffset, endOffset);
+		files.push(parsePrDiffSection(section, startOffset, endOffset));
+	}
+	return { unified: text, files };
+}
+
+interface ParsedDiffHeaderToken {
+	value: string;
+	nextIndex: number;
+}
+
+function skipDiffHeaderSpaces(text: string, index: number): number {
+	let i = index;
+	while (text.charAt(i) === " ") i += 1;
+	return i;
+}
+
+function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffHeaderToken {
+	const next = text.charAt(slashIndex + 1);
+	if (next === "") return { value: "\\", nextIndex: slashIndex + 1 };
+
+	if (next >= "0" && next <= "7") {
+		let end = slashIndex + 1;
+		while (end < text.length && end < slashIndex + 4) {
+			const digit = text.charAt(end);
+			if (digit < "0" || digit > "7") break;
+			end += 1;
+		}
+		return {
+			value: String.fromCharCode(Number.parseInt(text.slice(slashIndex + 1, end), 8)),
+			nextIndex: end,
+		};
+	}
+
+	switch (next) {
+		case "a":
+			return { value: "\x07", nextIndex: slashIndex + 2 };
+		case "b":
+			return { value: "\b", nextIndex: slashIndex + 2 };
+		case "f":
+			return { value: "\f", nextIndex: slashIndex + 2 };
+		case "n":
+			return { value: "\n", nextIndex: slashIndex + 2 };
+		case "r":
+			return { value: "\r", nextIndex: slashIndex + 2 };
+		case "t":
+			return { value: "\t", nextIndex: slashIndex + 2 };
+		case "v":
+			return { value: "\v", nextIndex: slashIndex + 2 };
+		case "\\":
+		case '"':
+			return { value: next, nextIndex: slashIndex + 2 };
+		default:
+			return { value: next, nextIndex: slashIndex + 2 };
+	}
+}
+
+function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
+	if (text.charAt(startIndex) !== '"') return undefined;
+	let value = "";
+	for (let i = startIndex + 1; i < text.length; i += 1) {
+		const ch = text.charAt(i);
+		if (ch === '"') return { value, nextIndex: i + 1 };
+		if (ch !== "\\") {
+			value += ch;
+			continue;
+		}
+		const escaped = parseDiffQuotedEscape(text, i);
+		value += escaped.value;
+		i = escaped.nextIndex - 1;
+	}
+	return undefined;
+}
+
+function parseDiffHeaderToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
+	const start = skipDiffHeaderSpaces(text, startIndex);
+	if (start >= text.length) return undefined;
+	const quoted = parseDiffQuotedToken(text, start);
+	if (quoted) return quoted;
+	const end = text.indexOf(" ", start);
+	if (end === -1) return { value: text.slice(start), nextIndex: text.length };
+	return { value: text.slice(start, end), nextIndex: end };
+}
+
+function stripPrDiffPathPrefix(value: string, prefix: "a/" | "b/"): string | undefined {
+	return value.startsWith(prefix) ? value.slice(prefix.length) : undefined;
+}
+
+function parsePrDiffHeaderPaths(header: string): { oldPath?: string; newPath?: string } {
+	const trail = header.slice("diff --git ".length);
+	if (trail.startsWith('"')) {
+		const oldToken = parseDiffQuotedToken(trail, 0);
+		if (!oldToken) return {};
+		const newToken = parseDiffHeaderToken(trail, oldToken.nextIndex);
+		if (!newToken) return {};
+		return {
+			oldPath: stripPrDiffPathPrefix(oldToken.value, "a/"),
+			newPath: stripPrDiffPathPrefix(newToken.value, "b/"),
+		};
+	}
+
+	const bIdx = trail.indexOf(" b/");
+	if (trail.startsWith("a/") && bIdx > 0) {
+		return {
+			oldPath: trail.slice(2, bIdx),
+			newPath: trail.slice(bIdx + 3),
+		};
+	}
+	return {};
+}
+
+function isPrDiffFileHeaderLine(line: string): boolean {
+	return (
+		line === "--- /dev/null" ||
+		line === "+++ /dev/null" ||
+		line.startsWith("--- a/") ||
+		line.startsWith("+++ b/") ||
+		line.startsWith('--- "a/') ||
+		line.startsWith('+++ "b/')
+	);
+}
+
+function parsePrDiffSection(section: string, startOffset: number, endOffset: number): PrDiffFile {
+	const lines = section.split("\n");
+	const header = lines[0] ?? "";
+	const headerPaths = parsePrDiffHeaderPaths(header);
+	let oldPath = headerPaths.oldPath;
+	let newPath = headerPaths.newPath;
+
+	let changeType: PrDiffFile["changeType"] = "modified";
+	let isBinary = false;
+	let additions = 0;
+	let deletions = 0;
+
+	let inHunk = false;
+	for (let li = 1; li < lines.length; li += 1) {
+		const line = lines[li] ?? "";
+		if (line.startsWith("new file mode")) {
+			changeType = "added";
+			continue;
+		}
+		if (line.startsWith("deleted file mode")) {
+			changeType = "deleted";
+			continue;
+		}
+		if (line.startsWith("rename from ")) {
+			changeType = "renamed";
+			oldPath = line.slice("rename from ".length);
+			continue;
+		}
+		if (line.startsWith("rename to ")) {
+			newPath = line.slice("rename to ".length);
+			continue;
+		}
+		if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
+			isBinary = true;
+			continue;
+		}
+		if (line.startsWith("@@ ")) {
+			inHunk = true;
+			continue;
+		}
+		if (!inHunk && isPrDiffFileHeaderLine(line)) continue;
+		if (line.startsWith("+")) {
+			additions += 1;
+		} else if (line.startsWith("-")) {
+			deletions += 1;
+		}
+	}
+
+	if (isBinary) {
+		if (changeType === "modified") changeType = "binary";
+		additions = 0;
+		deletions = 0;
+	}
+
+	const displayPath =
+		changeType === "deleted" ? (oldPath ?? newPath ?? "(unknown)") : (newPath ?? oldPath ?? "(unknown)");
+	const file: PrDiffFile = {
+		path: displayPath,
+		additions,
+		deletions,
+		changeType,
+		startOffset,
+		endOffset,
+	};
+	if (oldPath && oldPath !== displayPath) {
+		file.oldPath = oldPath;
+	}
+	return file;
+}
+
+async function fetchPrDiffFresh(
+	cwd: string,
+	repo: string,
+	number: number,
+	signal: AbortSignal | undefined,
+): Promise<{ rendered: string; sourceUrl: string | undefined; payload: PrDiffPayload }> {
+	const args = ["pr", "diff", String(number), "--color", "never"];
+	appendRepoFlag(args, repo, String(number));
+	const text = await git.github.text(cwd, args, signal, { repoProvided: true, trimOutput: false });
+	const payload = parsePrUnifiedDiff(text);
+	return { rendered: text, sourceUrl: undefined, payload };
+}
+
+/**
+ * Cache-aware PR diff fetcher. Stores the full unified diff plus a parsed
+ * file index in a single `pr-diff` cache row so the listing, full-diff, and
+ * per-file slice variants of `pr://<n>/diff` share one `gh pr diff`
+ * invocation.
+ */
+export async function getOrFetchPrDiff(options: PrDiffLookupOptions): Promise<ViewLookupResult<PrDiffPayload>> {
+	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
+	const doFetch = () => fetchPrDiffFresh(options.cwd, options.repo, options.number, options.signal);
+	const lookup = await getOrFetchView<PrDiffPayload>({
+		repo: options.repo,
+		kind: "pr-diff",
+		number: options.number,
+		includeComments: false,
+		settings: options.settings,
+		authKey,
+		fetchFresh: doFetch,
+	});
+	return {
+		rendered: lookup.rendered,
+		sourceUrl: lookup.sourceUrl,
+		payload: lookup.payload,
+		status: lookup.status,
+		fetchedAt: lookup.fetchedAt,
+	};
 }
 
 function joinSections(sections: string[]): string[] {
@@ -2636,15 +3267,17 @@ async function executeSearchIssues(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const query = requireNonEmpty(params.query, "query");
 	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
-	const args = buildGhSearchArgs("issues", query, limit, repo);
+	const dateField = resolveSearchDateField("issues", params.dateField);
+	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
+	const displayQuery = composeSearchQuery([params.query, dateQualifier]);
+	const apiQuery = composeSearchQuery([displayQuery, repo ? `repo:${repo}` : undefined, "is:issue"]);
+	const args = buildGhApiSearchArgs("issues", apiQuery, limit);
 
-	const items = await git.github.json<GhSearchResult[]>(session.cwd, args, signal, {
-		repoProvided: Boolean(repo),
-	});
-	return buildTextResult(formatSearchResults("issues", query, repo, items));
+	const response = await git.github.json<GhApiSearchResponse<GhApiSearchIssueItem>>(session.cwd, args, signal);
+	const items = (response.items ?? []).map(apiIssueToSearchResult);
+	return buildTextResult(formatSearchResults("issues", displayQuery, repo, items));
 }
 
 async function executeSearchPrs(
@@ -2652,15 +3285,17 @@ async function executeSearchPrs(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const query = requireNonEmpty(params.query, "query");
 	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
-	const args = buildGhSearchArgs("prs", query, limit, repo);
+	const dateField = resolveSearchDateField("prs", params.dateField);
+	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
+	const displayQuery = composeSearchQuery([params.query, dateQualifier]);
+	const apiQuery = composeSearchQuery([displayQuery, repo ? `repo:${repo}` : undefined, "is:pr"]);
+	const args = buildGhApiSearchArgs("issues", apiQuery, limit);
 
-	const items = await git.github.json<GhSearchResult[]>(session.cwd, args, signal, {
-		repoProvided: Boolean(repo),
-	});
-	return buildTextResult(formatSearchResults("pull requests", query, repo, items));
+	const response = await git.github.json<GhApiSearchResponse<GhApiSearchIssueItem>>(session.cwd, args, signal);
+	const items = (response.items ?? []).map(apiIssueToSearchResult);
+	return buildTextResult(formatSearchResults("pull requests", displayQuery, repo, items));
 }
 
 async function executeSearchCode(
@@ -2669,13 +3304,16 @@ async function executeSearchCode(
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
 	const query = requireNonEmpty(params.query, "query");
+	if (params.since !== undefined || params.until !== undefined) {
+		throw new ToolError("search_code does not support since/until; GitHub code search has no date qualifier.");
+	}
 	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
-	const args = buildGhSearchArgs("code", query, limit, repo);
+	const apiQuery = composeSearchQuery([query, repo ? `repo:${repo}` : undefined]);
+	const args = buildGhApiSearchArgs("code", apiQuery, limit, ["Accept: application/vnd.github.text-match+json"]);
 
-	const items = await git.github.json<GhSearchCodeResult[]>(session.cwd, args, signal, {
-		repoProvided: Boolean(repo),
-	});
+	const response = await git.github.json<GhApiSearchResponse<GhApiSearchCodeItem>>(session.cwd, args, signal);
+	const items = (response.items ?? []).map(apiCodeToSearchResult);
 	return buildTextResult(formatSearchCodeResults(query, repo, items));
 }
 
@@ -2684,15 +3322,17 @@ async function executeSearchCommits(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const query = requireNonEmpty(params.query, "query");
 	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
-	const args = buildGhSearchArgs("commits", query, limit, repo);
+	const dateField = resolveSearchDateField("commits", params.dateField);
+	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
+	const displayQuery = composeSearchQuery([params.query, dateQualifier]);
+	const apiQuery = composeSearchQuery([displayQuery, repo ? `repo:${repo}` : undefined]);
+	const args = buildGhApiSearchArgs("commits", apiQuery, limit);
 
-	const items = await git.github.json<GhSearchCommitResult[]>(session.cwd, args, signal, {
-		repoProvided: Boolean(repo),
-	});
-	return buildTextResult(formatSearchCommitsResults(query, repo, items));
+	const response = await git.github.json<GhApiSearchResponse<GhApiSearchCommitItem>>(session.cwd, args, signal);
+	const items = (response.items ?? []).map(apiCommitToSearchResult);
+	return buildTextResult(formatSearchCommitsResults(displayQuery, repo, items));
 }
 
 async function executeSearchRepos(
@@ -2700,11 +3340,14 @@ async function executeSearchRepos(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const query = requireNonEmpty(params.query, "query");
 	const limit = resolveSearchLimit(params.limit);
-	const args = buildGhSearchArgs("repos", query, limit, undefined);
+	const dateField = resolveSearchDateField("repos", params.dateField);
+	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
+	const query = composeSearchQuery([params.query, dateQualifier]);
+	const args = buildGhApiSearchArgs("repositories", query, limit);
 
-	const items = await git.github.json<GhSearchRepoResult[]>(session.cwd, args, signal);
+	const response = await git.github.json<GhApiSearchResponse<GhApiSearchRepoItem>>(session.cwd, args, signal);
+	const items = (response.items ?? []).map(apiRepoToSearchResult);
 	return buildTextResult(formatSearchReposResults(query, items));
 }
 
@@ -2758,7 +3401,7 @@ async function executeRunWatch(
 							note,
 						}),
 					});
-					await abortableSleep(graceSeconds * 1000, signal);
+					await scheduler.wait(graceSeconds * 1000, { signal });
 					run = await fetchRunSnapshot(session.cwd, repo, runId, signal);
 				}
 
@@ -2793,7 +3436,7 @@ async function executeRunWatch(
 				return buildTextResult(formatRunWatchResult(repo, run, [], tail), run.url, finalDetails);
 			}
 
-			await abortableSleep(intervalSeconds * 1000, signal);
+			await scheduler.wait(intervalSeconds * 1000, { signal });
 		}
 	}
 
@@ -2835,7 +3478,7 @@ async function executeRunWatch(
 						note,
 					}),
 				});
-				await abortableSleep(graceSeconds * 1000, signal);
+				await scheduler.wait(graceSeconds * 1000, { signal });
 				runs = await fetchRunsForCommit(session.cwd, repo, headSha, branch, signal);
 			}
 
@@ -2891,11 +3534,11 @@ async function executeRunWatch(
 					note,
 				}),
 			});
-			await abortableSleep(intervalSeconds * 1000, signal);
+			await scheduler.wait(intervalSeconds * 1000, { signal });
 			continue;
 		}
 
 		settledSuccessSignature = undefined;
-		await abortableSleep(intervalSeconds * 1000, signal);
+		await scheduler.wait(intervalSeconds * 1000, { signal });
 	}
 }

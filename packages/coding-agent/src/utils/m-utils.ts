@@ -14,6 +14,11 @@
  *   1. createSidecar  — embedded-file / local-override pattern
  *   2. resolveRoleModel — role → model resolution with standard fallback chain
  *   3. callWithRole   — LLM call with role resolution in one step
+ *   4. formatBlock    — XML block renderer for system prompt injection
+ *   5. showMPanel     — render a panel into chat, excluded from LLM context
+ *   6. appendCustomResult / flushCustomResults — inject tool output into LLM
+ *      context with the same streaming guard as recordBashResult. Use this
+ *      when the LLM must see the output (unlike showMPanel / showStatus).
  *
  * Candidates for future extraction (not yet here):
  *   - mreview-style "open in browser" event-bus pattern
@@ -325,4 +330,41 @@ export function showMPanel(
 export function resolveTemplateModelSpec(spec: string, settings: import("../config/settings").Settings): string {
 	const roles = settings.get("modelRoles") as Record<string, string | undefined>;
 	return roles[spec] ?? spec;
+}
+// ══════════════════════════════════════════════════════════════════════════════
+// 6. appendCustomResult
+// ══════════════════════════════════════════════════════════════════════════════
+// Injects tool output into LLM context WITHOUT triggering a new LLM turn and
+// WITHOUT rendering to the session view.
+//
+// Mechanism: agent.appendMessage with display:false — synchronous array push to
+// agent.#state.messages. No events emitted. No render triggered. convertToLlm
+// does not check the display flag, so LLM sees content verbatim on next turn.
+// scheduleInput fires via setImmediate (next tick), by which point the message
+// is already in agent.#state.messages.
+//
+// Use alongside showStatus in asyncDisplay:
+//   showStatus(text)                  → "!" panel for user (real-time visibility)
+//   appendCustomResult(session, ...) → LLM context only (seen when woken)
+//
+// The combination does NOT wake the LLM — waking is done exclusively by asyncSubmit.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Minimal session shape — avoids circular import with agent-session.ts. */
+interface CustomResultSession {
+	readonly agent: {
+		appendMessage(msg: { role: "custom"; customType: string; content: string; display: boolean; timestamp: number }): void;
+	};
+}
+
+/**
+ * Inject content into LLM context for the next turn — no rendering, no LLM wake.
+ * Caller must also call showStatus(text) for user visibility via "!" panel.
+ *
+ * @param session    AgentSession (runtime.ctx.session)
+ * @param customType Label stored on the message, e.g. "mtuicontrol"
+ * @param content    Text the LLM will see verbatim when woken by asyncSubmit
+ */
+export function appendCustomResult(session: CustomResultSession, customType: string, content: string): void {
+	session.agent.appendMessage({ role: "custom", customType, content, display: false, timestamp: Date.now() });
 }

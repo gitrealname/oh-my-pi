@@ -1,5 +1,6 @@
-import { getPuppeteerDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { getPuppeteerDir, isCompiledBinary, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { Page, Target } from "puppeteer-core";
+import { callSessionTool } from "../../eval/js/tool-bridge";
 import type { ToolSession } from "../../sdk";
 import { expandPath } from "../path-utils";
 import { ToolAbortError, ToolError } from "../tool-errors";
@@ -17,14 +18,32 @@ import type {
 	WorkerOutbound,
 } from "./tab-protocol";
 
+// Worker entry. The literal string in `new Worker("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts", …)`
+// below is what Bun's `--compile` static analyzer needs to bundle the worker
+// (registered as an additional entrypoint in `scripts/build-binary.ts`); in
+// dev we resolve the same source via `import.meta.url`. Replaces the older
+// `with { type: "file" }` pattern, which only copied the entry as a raw
+// asset and could not resolve the worker's relative imports inside a
+// compiled binary (issue #1011 was a false-positive fix — the regression
+// test only checked emission, not actual worker startup).
+
 interface WorkerHandle {
 	send(msg: WorkerInbound, transferList?: Transferable[]): void;
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
+	onError(handler: (error: Error) => void): () => void;
 	terminate(): Promise<void>;
 	readonly mode: "worker" | "inline";
 }
 
 export type DialogPolicy = "accept" | "dismiss";
+
+export interface PendingRun {
+	resolve(result: RunResultOk): void;
+	reject(error: unknown): void;
+	session: ToolSession;
+	signal?: AbortSignal;
+	toolCalls: Map<string, AbortController>;
+}
 
 export interface TabSession {
 	name: string;
@@ -33,7 +52,7 @@ export interface TabSession {
 	worker: WorkerHandle;
 	state: "alive" | "dead";
 	info: ReadyInfo;
-	pending: Map<string, { resolve: (result: RunResultOk) => void; reject: (error: unknown) => void }>;
+	pending: Map<string, PendingRun>;
 	dialogPolicy?: DialogPolicy;
 	kindTag: BrowserKindTag;
 }
@@ -71,10 +90,6 @@ export function getTab(name: string): TabSession | undefined {
 	return tabs.get(name);
 }
 
-export function listTabs(): TabSession[] {
-	return [...tabs.values()];
-}
-
 export async function acquireTab(
 	name: string,
 	browser: BrowserHandle,
@@ -106,23 +121,14 @@ export async function acquireTab(
 
 	const initPayload = await buildInitPayload(browser, opts);
 	const worker = await spawnTabWorker();
-	const { promise, resolve, reject } = Promise.withResolvers<ReadyInfo>();
-	const unlisten = worker.onMessage(msg => {
-		if (msg.type === "ready") resolve(msg.info);
-		else if (msg.type === "init-failed") reject(errorFromPayload(msg.error));
-		else if (msg.type === "log") logWorkerMessage(msg);
-	});
 	let info: ReadyInfo;
 	try {
-		worker.send({ type: "init", payload: initPayload });
-		info = await raceWithTimeout(promise, opts.timeoutMs + GRACE_MS, "Timed out initializing browser tab worker");
+		info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
 	} catch (error) {
-		unlisten();
 		await worker.terminate().catch(() => undefined);
 		if (browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 		throw error;
 	}
-	unlisten();
 
 	holdBrowser(browser);
 	const tab: TabSession = {
@@ -144,14 +150,14 @@ export async function acquireTab(
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {
 	return await runInTabWithSnapshot(
 		name,
-		{ code: opts.code, timeoutMs: opts.timeoutMs, signal: opts.signal },
+		{ code: opts.code, timeoutMs: opts.timeoutMs, signal: opts.signal, session: opts.session },
 		{ cwd: opts.session.cwd, browserScreenshotDir: expandBrowserScreenshotDir(opts.session) },
 	);
 }
 
 async function runInTabWithSnapshot(
 	name: string,
-	opts: { code: string; timeoutMs: number; signal?: AbortSignal },
+	opts: { code: string; timeoutMs: number; signal?: AbortSignal; session?: ToolSession },
 	snapshot: SessionSnapshot,
 ): Promise<RunResultOk> {
 	const tab = tabs.get(name);
@@ -159,8 +165,18 @@ async function runInTabWithSnapshot(
 	if (tab.pending.size > 0) throw new ToolError(`Tab ${JSON.stringify(name)} is busy`);
 	const id = Snowflake.next();
 	const { promise, resolve, reject } = Promise.withResolvers<RunResultOk>();
-	tab.pending.set(id, { resolve, reject });
-	const abort = (): void => tab.worker.send({ type: "abort", id });
+	const pending: PendingRun = {
+		resolve,
+		reject,
+		session: opts.session ?? ({} as ToolSession),
+		signal: opts.signal,
+		toolCalls: new Map(),
+	};
+	tab.pending.set(id, pending);
+	const abort = (): void => {
+		tab.worker.send({ type: "abort", id });
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(opts.signal?.reason);
+	};
 	if (opts.signal?.aborted) abort();
 	else opts.signal?.addEventListener("abort", abort, { once: true });
 	try {
@@ -266,7 +282,69 @@ function handleTabMessage(tab: TabSession, msg: WorkerOutbound): void {
 		tab.info = msg.info;
 		return;
 	}
+	if (msg.type === "tool-call") {
+		void dispatchToolCall(tab, msg);
+		return;
+	}
 	if (msg.type === "log") logWorkerMessage(msg);
+}
+
+async function dispatchToolCall(tab: TabSession, msg: Extract<WorkerOutbound, { type: "tool-call" }>): Promise<void> {
+	const pending = tab.pending.get(msg.runId);
+	if (!pending?.session.cwd) {
+		safeSend(tab, {
+			type: "tool-reply",
+			id: msg.id,
+			reply: {
+				ok: false,
+				error: { name: "ToolError", message: "No active run for tool call", isToolError: true, isAbort: false },
+			},
+		});
+		return;
+	}
+	const ctrl = new AbortController();
+	pending.toolCalls.set(msg.id, ctrl);
+	const onParentAbort = (): void => ctrl.abort(pending.signal?.reason);
+	if (pending.signal?.aborted) onParentAbort();
+	else pending.signal?.addEventListener("abort", onParentAbort, { once: true });
+	try {
+		const value = await callSessionTool(msg.name, msg.args, {
+			session: pending.session,
+			signal: ctrl.signal,
+			emitStatus: () => {
+				// Status events from tool calls aren't piped back to user code yet; the worker
+				// already pushes its own helper status via the display channel.
+			},
+		});
+		safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
+	} catch (error) {
+		safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toErrorPayload(error) } });
+	} finally {
+		pending.toolCalls.delete(msg.id);
+		pending.signal?.removeEventListener("abort", onParentAbort);
+	}
+}
+
+function safeSend(tab: TabSession, msg: WorkerInbound): void {
+	if (tab.state !== "alive") return;
+	try {
+		tab.worker.send(msg);
+	} catch (err) {
+		logger.debug("tab worker send failed", { error: err instanceof Error ? err.message : String(err) });
+	}
+}
+
+function toErrorPayload(error: unknown): RunErrorPayload {
+	if (error instanceof Error) {
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+			isAbort: error.name === "AbortError" || error.name === "ToolAbortError",
+			isToolError: error instanceof ToolError || error.name === "ToolError",
+		};
+	}
+	return { name: "Error", message: String(error), isAbort: false, isToolError: false };
 }
 
 async function forceKillTab(name: string, reason: string): Promise<void> {
@@ -364,8 +442,9 @@ async function raceWithTimeout<T>(
 
 async function spawnTabWorker(): Promise<WorkerHandle> {
 	try {
-		const url = new URL("./tab-worker-entry.ts", import.meta.url);
-		const worker = new Worker(url.href, { type: "module" });
+		const worker = isCompiledBinary()
+			? new Worker("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts", { type: "module" })
+			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
 		return wrapBunWorker(worker);
 	} catch (err) {
 		logger.warn("Bun Worker spawn failed; using inline tab worker (no sync-loop guard)", {
@@ -385,6 +464,17 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 			const wrap = (event: MessageEvent): void => handler(event.data as WorkerOutbound);
 			worker.addEventListener("message", wrap);
 			return () => worker.removeEventListener("message", wrap);
+		},
+		onError(handler) {
+			const onError = (event: ErrorEvent): void => handler(errorFromWorkerEvent(event));
+			const onMessageError = (event: MessageEvent): void =>
+				handler(new ToolError(`Tab worker message error: ${String(event.data)}`));
+			worker.addEventListener("error", onError);
+			worker.addEventListener("messageerror", onMessageError);
+			return () => {
+				worker.removeEventListener("error", onError);
+				worker.removeEventListener("messageerror", onMessageError);
+			};
 		},
 		async terminate() {
 			worker.terminate();
@@ -424,6 +514,44 @@ async function spawnInlineWorker(): Promise<WorkerHandle> {
 			hostListeners.add(handler);
 			return () => hostListeners.delete(handler);
 		},
+		onError: () => () => {},
 		async terminate() {},
 	};
+}
+
+async function initializeTabWorker(
+	worker: WorkerHandle,
+	payload: WorkerInitPayload,
+	timeoutMs: number,
+): Promise<ReadyInfo> {
+	const { promise, resolve, reject } = Promise.withResolvers<ReadyInfo>();
+	const unlisten = worker.onMessage(msg => {
+		if (msg.type === "ready") resolve(msg.info);
+		else if (msg.type === "init-failed") reject(errorFromPayload(msg.error));
+		else if (msg.type === "log") logWorkerMessage(msg);
+	});
+	const unlistenError = worker.onError(error => {
+		reject(new ToolError(`Tab worker failed during startup: ${error.message}`));
+	});
+	try {
+		worker.send({ type: "init", payload });
+		return await raceWithTimeout(promise, timeoutMs, "Timed out initializing browser tab worker");
+	} finally {
+		unlisten();
+		unlistenError();
+	}
+}
+
+export function initializeTabWorkerForTest(
+	worker: WorkerHandle,
+	payload: WorkerInitPayload,
+	timeoutMs: number,
+): Promise<ReadyInfo> {
+	return initializeTabWorker(worker, payload, timeoutMs);
+}
+
+function errorFromWorkerEvent(event: ErrorEvent): Error {
+	if (event.error instanceof Error) return event.error;
+	if (event.message) return new Error(event.message);
+	return new Error("Unknown tab worker error");
 }

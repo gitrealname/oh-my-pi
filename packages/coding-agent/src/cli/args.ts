@@ -7,7 +7,7 @@ import chalk from "chalk";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
 
-export type Mode = "text" | "json" | "rpc" | "acp";
+export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
@@ -80,7 +80,7 @@ export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "
 			result.allowHome = true;
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
-			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp") {
+			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp" || mode === "rpc-ui") {
 				result.mode = mode;
 			}
 		} else if (arg === "--continue" || arg === "-c") {
@@ -112,6 +112,8 @@ export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "
 			result.appendSystemPrompt = args[++i];
 		} else if (arg === "--provider-session-id" && i + 1 < args.length) {
 			result.providerSessionId = args[++i];
+		} else if (arg === "--rpc-pipe" && i + 1 < args.length) {
+			i++; // consume the value; rpc-pipe is handled separately in main.ts via process.argv
 		} else if (arg === "--no-session") {
 			result.noSession = true;
 		} else if (arg === "--session-dir" && i + 1 < args.length) {

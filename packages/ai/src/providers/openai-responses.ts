@@ -7,10 +7,10 @@ import type {
 } from "openai/resources/responses/responses";
 import { getEnvApiKey } from "../stream";
 import {
-	type Api,
 	type AssistantMessage,
 	type CacheRetention,
 	type Context,
+	getPriorityPremiumRequests,
 	type MessageAttribution,
 	type Model,
 	type OpenAICompat,
@@ -18,7 +18,6 @@ import {
 	type ServiceTier,
 	type StreamFunction,
 	type StreamOptions,
-	shouldSendServiceTier,
 	type Tool,
 	type ToolChoice,
 } from "../types";
@@ -53,10 +52,13 @@ import {
 import { compactGrammarDefinition } from "./grammar";
 import {
 	appendResponsesToolResultMessages,
+	applyCommonResponsesSamplingParams,
+	applyResponsesReasoningParams,
 	collectCustomCallIds,
 	collectKnownCallIds,
 	convertResponsesAssistantMessage,
 	convertResponsesInputContent,
+	createInitialResponsesAssistantMessage,
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
 } from "./openai-responses-shared";
@@ -186,23 +188,11 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
 
-		const output: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: "openai-responses" as Api,
-			provider: model.provider,
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-		};
+		const output: AssistantMessage = createInitialResponsesAssistantMessage(
+			"openai-responses",
+			model.provider,
+			model.id,
+		);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		const abortTracker = createAbortSourceTracker(options?.signal);
 		const firstEventTimeoutAbortError = new Error(OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE);
@@ -221,6 +211,11 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				cacheSessionId,
 				options?.onSseEvent,
 			);
+			const priorityPremiumRequests = getPriorityPremiumRequests(options?.serviceTier, model.provider);
+			const premiumRequestsTotal =
+				copilotPremiumRequests !== undefined || priorityPremiumRequests > 0
+					? (copilotPremiumRequests ?? 0) + priorityPremiumRequests
+					: undefined;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const { params } = buildParams(model, context, options, providerSessionState, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
@@ -247,7 +242,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
 				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
 			);
-			if (copilotPremiumRequests !== undefined) output.usage.premiumRequests = copilotPremiumRequests;
+			if (premiumRequestsTotal !== undefined) output.usage.premiumRequests = premiumRequestsTotal;
 			stream.push({ type: "start", partial: output });
 
 			const nativeOutputItems: Array<Record<string, unknown>> = [];
@@ -272,7 +267,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					},
 				},
 			);
-			if (copilotPremiumRequests !== undefined) output.usage.premiumRequests = copilotPremiumRequests;
+			if (premiumRequestsTotal !== undefined) output.usage.premiumRequests = premiumRequestsTotal;
 
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			if (firstEventTimeoutError) {
@@ -412,31 +407,7 @@ function buildParams(
 		store: false,
 	};
 
-	if (options?.maxTokens) {
-		params.max_output_tokens = options?.maxTokens;
-	}
-
-	if (options?.temperature !== undefined) {
-		params.temperature = options?.temperature;
-	}
-	if (options?.topP !== undefined) {
-		params.top_p = options.topP;
-	}
-	if (options?.topK !== undefined) {
-		params.top_k = options.topK;
-	}
-	if (options?.minP !== undefined) {
-		params.min_p = options.minP;
-	}
-	if (options?.presencePenalty !== undefined) {
-		params.presence_penalty = options.presencePenalty;
-	}
-	if (options?.repetitionPenalty !== undefined) {
-		params.repetition_penalty = options.repetitionPenalty;
-	}
-	if (shouldSendServiceTier(options?.serviceTier, model.provider)) {
-		params.service_tier = options.serviceTier;
-	}
+	applyCommonResponsesSamplingParams(params, options, model.provider);
 
 	if (context.tools) {
 		params.tools = convertTools(context.tools, supportsStrictMode(model), model);
@@ -454,36 +425,9 @@ function buildParams(
 		}
 	}
 
-	if (model.reasoning) {
-		// Always request encrypted reasoning content so reasoning items can be
-		// replayed in multi-turn conversations when store is false (items aren't
-		// persisted server-side, so we must include the full content).
-		// See: https://github.com/can1357/oh-my-pi/issues/41
-		params.include = ["reasoning.encrypted_content"];
-
-		if (options?.reasoning || options?.reasoningSummary !== undefined) {
-			const reasoningParams: NonNullable<typeof params.reasoning> = {
-				effort: mapReasoningEffort(options?.reasoning || "medium", model.compat?.reasoningEffortMap) as NonNullable<
-					OpenAIResponsesSamplingParams["reasoning"]
-				>["effort"],
-			};
-			if (options?.reasoningSummary !== null) {
-				reasoningParams.summary = options?.reasoningSummary || "auto";
-			}
-			params.reasoning = reasoningParams;
-		} else if (model.name.startsWith("gpt-5")) {
-			// Jesus Christ, see https://community.openai.com/t/need-reasoning-false-option-for-gpt-5/1351588/7
-			messages.push({
-				role: "developer",
-				content: [
-					{
-						type: "input_text",
-						text: "# Juice: 0 !important",
-					},
-				],
-			});
-		}
-	}
+	applyResponsesReasoningParams(params, model, options, messages, effort =>
+		mapReasoningEffort(effort as NonNullable<OpenAIResponsesOptions["reasoning"]>, model.compat?.reasoningEffortMap),
+	);
 
 	return { conversationMessages, params };
 }

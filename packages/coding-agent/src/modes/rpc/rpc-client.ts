@@ -88,6 +88,9 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_start",
 	"tool_execution_update",
 	"tool_execution_end",
+	// corp extensions: tui_output + exec_step_result frames from headed+pipe child sessions
+	"tui_output" as AgentEvent["type"],
+	"exec_step_result" as AgentEvent["type"],
 ]);
 
 function isRpcResponse(value: unknown): value is RpcResponse {
@@ -293,7 +296,7 @@ export class RpcClient {
 
 	/** Escape hatch for extension commands not in the base RpcCommand union. */
 	_sendCommand(command: object, timeoutMs = 30_000): Promise<unknown> {
-	    return this.#send(command as Parameters<typeof this.#send>[0], timeoutMs);
+	    return this.#send(command as RpcCommandBody, timeoutMs);
 	}
 
 	/**
@@ -319,7 +322,6 @@ export class RpcClient {
 			}
 		};
 	}
-
 	/**
 	 * Get collected stderr output (useful for debugging).
 	 */
@@ -649,7 +651,7 @@ export class RpcClient {
 	    void this.#send({ type: "get_state" })
 	        .then(resp => {
 	            const state = this.#getData<RpcSessionState>(resp);
-	            if (!state.streaming) settle(true);
+	            if (!state.isStreaming) settle(true);
 	        })
 	        .catch(() => { /* fall through to agent_end listener */ });
 
