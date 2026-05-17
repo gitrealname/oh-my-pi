@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { basename, resolve as resolvePath } from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { Type } from "@sinclair/typebox";
+import { z } from "zod/v4";
 import type { ToolSession } from "..";
 import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
 import { toolResult } from "../tool-result";
@@ -10,8 +10,8 @@ import embeddedDesc from "../../sidecars/mreview.tool-desc.md" with { type: "tex
 import { createSidecar, sidecarPath } from "../../utils/m-utils";
 const resolveDesc = createSidecar(sidecarPath("mreview.tool-desc.md"), embeddedDesc);
 
-const schema = Type.Object({
-	file_path: Type.String({ description: "Absolute path to the markdown file to review" }),
+const schema = z.object({
+	file_path: z.string().describe("Absolute path to the markdown file to review"),
 });
 
 // Debounce guard: prevents re-entry if the same file was scheduled within the last 10 seconds.

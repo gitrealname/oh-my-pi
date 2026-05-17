@@ -13,9 +13,10 @@
  * `types.ts` files and is documented there.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
-import type { CompactionPreparation, CompactionResult } from "../session/compaction";
+import type { Goal, GoalModeState } from "../goals/state";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-manager";
 import type { TodoItem } from "../tools/todo-write";
 
@@ -129,6 +130,11 @@ export interface SessionTreeEvent {
 }
 
 /** Union of all session event types */
+export interface GoalUpdatedEvent {
+	type: "goal_updated";
+	goal: Goal | null;
+	state?: GoalModeState;
+}
 export type SessionEvent =
 	| SessionStartEvent
 	| SessionBeforeSwitchEvent
@@ -140,7 +146,8 @@ export type SessionEvent =
 	| SessionCompactEvent
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent
-	| SessionTreeEvent;
+	| SessionTreeEvent
+	| GoalUpdatedEvent;
 
 // ============================================================================
 // Agent / Turn Events

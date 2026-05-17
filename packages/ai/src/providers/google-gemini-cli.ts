@@ -5,8 +5,7 @@
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
-import type { Content, FunctionCallingConfigMode, ThinkingConfig } from "@google/genai";
-import { fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
+import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -24,8 +23,9 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { refreshAntigravityToken } from "../utils/oauth/google-antigravity";
 import { refreshGoogleCloudToken } from "../utils/oauth/google-gemini-cli";
-import { sanitizeSchemaForCCA } from "../utils/schema";
+import { normalizeSchemaForCCA } from "../utils/schema";
 import { ANTIGRAVITY_SYSTEM_INSTRUCTION, getAntigravityUserAgent, getGeminiCliHeaders } from "./google-gemini-headers";
+import type { Content, FunctionCallingConfigMode, ThinkingConfig } from "./google-shared";
 import {
 	convertMessages,
 	convertTools,
@@ -362,6 +362,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					maxAttempts: MAX_RETRIES + 1,
 					defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
 					maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
+					fetch: options?.fetch,
 				},
 			);
 			if (!response.ok) {
@@ -545,7 +546,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						throw new Error("Missing request URL");
 					}
 
-					currentResponse = await fetch(requestUrl, {
+					currentResponse = await (options?.fetch ?? fetch)(requestUrl, {
 						method: "POST",
 						headers: requestHeaders,
 						body: requestBodyJson,
@@ -595,6 +596,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorStatus = extractHttpStatusFromError(error);
 			output.errorMessage = await appendRawHttpRequestDumpFor400(
 				error instanceof Error ? error.message : JSON.stringify(error),
 				error,
@@ -687,7 +689,7 @@ function normalizeAntigravityTools(
 			const { parametersJsonSchema, ...rest } = declaration;
 			return {
 				...rest,
-				parameters: sanitizeSchemaForCCA(parametersJsonSchema),
+				parameters: normalizeSchemaForCCA(parametersJsonSchema),
 			};
 		}),
 	}));

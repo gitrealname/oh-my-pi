@@ -19,7 +19,9 @@ import type {
 	Model,
 	OptionsForApi,
 } from "../types";
+import { type AbortSourceTracker, createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream as EventStreamImpl } from "../utils/event-stream";
+import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 import type { BedrockOptions } from "./amazon-bedrock";
 import type { AnthropicOptions } from "./anthropic";
 import type { AzureOpenAIResponsesOptions } from "./azure-openai-responses";
@@ -155,6 +157,9 @@ export function setBedrockProviderModule(module: BedrockProviderModule): void {
 // Stream forwarding / error helpers
 // ---------------------------------------------------------------------------
 
+const LAZY_STREAM_IDLE_TIMEOUT_ERROR = "Provider stream stalled while waiting for the next event";
+const LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
+
 function hasFinalResult(
 	source: AsyncIterable<AssistantMessageEvent>,
 ): source is AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> } {
@@ -165,10 +170,29 @@ function forwardStream<TApi extends Api>(
 	target: EventStreamImpl,
 	source: AsyncIterable<AssistantMessageEvent>,
 	model: Model<TApi>,
+	options: OptionsForApi<TApi>,
+	abortTracker: AbortSourceTracker,
 ): void {
 	(async () => {
 		try {
-			for await (const event of source) {
+			const idleTimeoutMs = options.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const watchedSource = iterateWithIdleTimeout(source, {
+				idleTimeoutMs,
+				firstItemTimeoutMs: options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
+				errorMessage: LAZY_STREAM_IDLE_TIMEOUT_ERROR,
+				firstItemErrorMessage: LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR,
+				onIdle: () => abortTracker.abortLocally(new Error(LAZY_STREAM_IDLE_TIMEOUT_ERROR)),
+				onFirstItemTimeout: () => abortTracker.abortLocally(new Error(LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
+				abortSignal: options.signal,
+				// The synthetic `start` event is yielded immediately by every provider before
+				// the upstream model has emitted any tokens. Treating it as the first "real"
+				// item would flip the watchdog from `firstItemTimeoutMs` to the much shorter
+				// `idleTimeoutMs` while we're still legitimately waiting on the model's
+				// first response (slow first-token from reasoning models, cold proxies, etc.).
+				isProgressItem: event => (event as AssistantMessageEvent).type !== "start",
+			});
+
+			for await (const event of watchedSource) {
 				target.push(event);
 			}
 			if (hasFinalResult(source)) {
@@ -177,14 +201,19 @@ function forwardStream<TApi extends Api>(
 				target.end();
 			}
 		} catch (error) {
-			const message = createLazyLoadErrorMessage(model, error);
-			target.push({ type: "error", reason: "error", error: message });
+			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
+			const message = createLazyLoadErrorMessage(model, error, stopReason);
+			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
 	})();
 }
 
-function createLazyLoadErrorMessage<TApi extends Api>(model: Model<TApi>, error: unknown): AssistantMessage {
+function createLazyLoadErrorMessage<TApi extends Api>(
+	model: Model<TApi>,
+	error: unknown,
+	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -199,8 +228,9 @@ function createLazyLoadErrorMessage<TApi extends Api>(model: Model<TApi>, error:
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
+		stopReason,
+		errorMessage:
+			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
 		timestamp: Date.now(),
 	};
 }
@@ -214,11 +244,14 @@ function createLazyStream<TApi extends Api>(
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
+		const streamOptions = (options ?? {}) as OptionsForApi<TApi>;
 
 		loadModule()
 			.then(module => {
-				const inner = module.stream(model, context, options);
-				forwardStream(outer, inner, model);
+				const abortTracker = createAbortSourceTracker(streamOptions.signal);
+				const providerOptions = { ...streamOptions, signal: abortTracker.requestSignal } as OptionsForApi<TApi>;
+				const inner = module.stream(model, context, providerOptions);
+				forwardStream(outer, inner, model, streamOptions, abortTracker);
 			})
 			.catch(error => {
 				const message = createLazyLoadErrorMessage(model, error);

@@ -11,9 +11,8 @@
  * are identical to the upstream BrowserTool.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { StringEnum } from "@oh-my-pi/pi-ai";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+import { z } from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
@@ -31,62 +30,43 @@ export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } fro
 
 const DEFAULT_TAB_NAME = "main";
 
-const appSchema = Type.Object({
-	path: Type.Optional(
-		Type.String({
-			description: "absolute path to a binary to spawn (single-instance reuse)",
-			examples: ["/Applications/Cursor.app/Contents/MacOS/Cursor"],
-		}),
-	),
-	cdp_url: Type.Optional(
-		Type.String({
-			description: "existing CDP endpoint (overrides browser.connectUrl setting)",
-		}),
-	),
-	args: Type.Optional(Type.Array(Type.String(), { description: "extra CLI args when spawning" })),
-	target: Type.Optional(Type.String({ description: "substring matched against url+title to pick a BrowserWindow" })),
+const appSchema = z.object({
+	path: z.string().describe("absolute path to a binary to spawn (single-instance reuse)").optional(),
+	cdp_url: z.string().describe("existing CDP endpoint (overrides browser.connectUrl setting)").optional(),
+	args: z.array(z.string()).describe("extra CLI args when spawning").optional(),
+	target: z.string().describe("substring matched against url+title to pick a BrowserWindow").optional(),
 });
 
-const mbrowserSchema = Type.Object({
-	action: StringEnum(["open", "close", "run"], { description: "tab/browser operation" }),
-	name: Type.Optional(
-		Type.String({
-			description: "tab id; default 'main'. Multiple tabs can coexist; reusable across run() calls and subagents.",
-			examples: ["main", "docs", "gh"],
-		}),
-	),
-	url: Type.Optional(Type.String({ description: "open: navigate after acquiring tab" })),
-	app: Type.Optional(appSchema),
-	viewport: Type.Optional(
-		Type.Object({
-			width: Type.Number(),
-			height: Type.Number(),
-			scale: Type.Optional(Type.Number()),
-		}),
-	),
-	wait_until: Type.Optional(
-		StringEnum(["load", "domcontentloaded", "networkidle0", "networkidle2"], {
-			description: "navigation wait condition for url",
-		}),
-	),
-	dialogs: Type.Optional(
-		StringEnum(["accept", "dismiss"], {
-			description: "open: auto-handle alert/confirm/beforeunload dialogs (default: leave for caller to handle)",
-		}),
-	),
-	code: Type.Optional(
-		Type.String({
-			description:
-				"run: JS body executed with `page`, `browser`, `tab`, `display`, `assert`, `wait` in scope. Treated as the body of an async function. Use `display(value)` to attach text/JSON/images; the function's return value is JSON-serialized as a final block.",
-		}),
-	),
-	timeout: Type.Optional(Type.Number({ description: "timeout in seconds", default: 30 })),
-	all: Type.Optional(Type.Boolean({ description: "close: close every tab" })),
-	kill: Type.Optional(Type.Boolean({ description: "close: also kill spawned-app browsers (default: leave running)" })),
+const mbrowserSchema = z.object({
+	action: z.union([z.literal("open"), z.literal("close"), z.literal("run")]).describe("tab/browser operation"),
+	name: z.string().describe("tab id; default 'main'. Multiple tabs can coexist; reusable across run() calls and subagents.").optional(),
+	url: z.string().describe("open: navigate after acquiring tab").optional(),
+	app: appSchema.optional(),
+	viewport: z.object({
+		width: z.number(),
+		height: z.number(),
+		scale: z.number().optional(),
+	}).optional(),
+	wait_until: z.union([
+		z.literal("load"),
+		z.literal("domcontentloaded"),
+		z.literal("networkidle0"),
+		z.literal("networkidle2"),
+	]).describe("navigation wait condition for url").optional(),
+	dialogs: z.union([z.literal("accept"), z.literal("dismiss")]).describe("open: auto-handle alert/confirm/beforeunload dialogs (default: leave for caller to handle)").optional(),
+	code: z
+		.string()
+		.describe(
+			"run: JS body executed with `page`, `browser`, `tab`, `display`, `assert`, `wait` in scope. Treated as the body of an async function. Use `display(value)` to attach text/JSON/images; the function's return value is JSON-serialized as a final block.",
+		)
+		.optional(),
+	timeout: z.number().describe("timeout in seconds").optional(),
+	all: z.boolean().describe("close: close every tab").optional(),
+	kill: z.boolean().describe("close: also kill spawned-app browsers (default: leave running)").optional(),
 });
 
 /** Input schema for the mbrowser tool. */
-export type MBrowserParams = Static<typeof mbrowserSchema>;
+export type MBrowserParams = z.infer<typeof mbrowserSchema>;
 
 /** Details describing an mbrowser tool execution result. */
 export interface MBrowserToolDetails {

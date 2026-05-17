@@ -117,8 +117,8 @@
 
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { completeSimple, type CompleteSimpleOptions } from "@oh-my-pi/pi-ai";
-import { Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
+import { completeSimple, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { type Component, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { getAgentDir, logger } from "@oh-my-pi/pi-utils";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getMarkdownTheme, theme } from "../modes/theme/theme";
@@ -203,10 +203,10 @@ export function resolveRoleModel(
 	const effectiveRole =
 		(roleValue && roleValue !== "default" ? roleValue : undefined) ??
 		extras
-			.map(k => settings.get(`modelRoles.${k}` as "modelRoles.smol"))
+			.map(k => settings.get("modelRoles")[k])
 			.find(v => v != null) ??
-		settings.get("modelRoles.smol") ??
-		settings.get("modelRoles.default" as "modelRoles.smol");
+		settings.get("modelRoles")["smol"] ??
+		settings.get("modelRoles")["default"];
 
 	const resolved = resolveModelRoleValue(effectiveRole, registry.getAvailable(), {
 		modelRegistry: registry as ModelRegistry,
@@ -247,11 +247,11 @@ export async function callWithRole(
 	}
 	try {
 		const response = await completeSimple(model, {
-			systemPrompt: opts.systemPrompt,
+			systemPrompt: opts.systemPrompt ? [opts.systemPrompt] : undefined,
 			messages: [
 				{ role: "user", content: [{ type: "text", text: opts.userMessage }], timestamp: Date.now() },
 			],
-		} as CompleteSimpleOptions, {
+		}, {
 			maxTokens: opts.maxTokens ?? 1024,
 		});
 		return (response.content ?? [])
@@ -305,7 +305,7 @@ export function formatBlock(tag: string, lines: string[]): string {
  * @param markdown  Markdown body to render
  */
 export function showMPanel(
-	ctx: { chatContainer: { addChild: (c: unknown) => void }; ui: { requestRender: () => void } },
+	ctx: { chatContainer: { addChild: (c: Component) => void }; ui: { requestRender: () => void } },
 	title: string,
 	markdown: string,
 ): void {

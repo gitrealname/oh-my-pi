@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mapWithConcurrencyLimit } from "../src/task/parallel.ts";
+import { mapWithConcurrencyLimit } from "../src/task/parallel";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -6,7 +6,7 @@ import { describe, expect, it } from "bun:test";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let mod: any = null;
 try {
-	mod = await import("../src/workspace-tree.ts");
+	mod = await import("../src/workspace-tree");
 } catch {
 	// native unavailable — mod stays null; all tests below skip gracefully
 }

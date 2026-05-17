@@ -10,7 +10,6 @@ import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
-import { normalizeCommandForWindows } from "./bash-win-normalize";
 
 export interface BashExecutorOptions {
 	cwd?: string;
@@ -54,24 +53,16 @@ const HARD_TIMEOUT_GRACE_MS = 5_000;
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
 
-const IS_WINDOWS = process.platform === "win32";
-
 async function resolveShellCwd(cwd: string | undefined): Promise<string | undefined> {
 	if (!cwd) return undefined;
 
 	try {
 		// Brush preserves the working directory string verbatim, so resolve symlinks
 		// up front to keep `pwd` aligned with tools like `git worktree list`.
-		const real = await fs.realpath(cwd);
-		return IS_WINDOWS ? normalizeCwdForWindows(real) : real;
+		return await fs.realpath(cwd);
 	} catch {
-		return IS_WINDOWS ? normalizeCwdForWindows(cwd) : cwd;
+		return cwd;
 	}
-}
-
-function normalizeCwdForWindows(cwd: string): string {
-	// Convert backslashes to forward slashes for Git Bash
-	return cwd.replace(/\\/g, "/");
 }
 
 /** Translate `ShellMinimizerSettings` into native `MinimizerOptions`, or `undefined` when disabled. */
@@ -96,14 +87,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const commandCwd = await resolveShellCwd(options?.cwd);
 	const commandEnv = options?.env ? { ...NON_INTERACTIVE_ENV, ...options.env } : NON_INTERACTIVE_ENV;
 
-	// On Windows with a bash execution shell: normalise /dev/null → NUL, backslash
-	// paths → forward slashes, and bare .cmd invocations → cmd /c.
-	// Skip when the execution shell is cmd or PowerShell — those handle Windows
-	// paths natively and don't need this treatment.
+	// Apply command prefix if configured
 	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
-	const finalCommand = IS_WINDOWS && shell.includes("bash")
-		? normalizeCommandForWindows(prefixedCommand)
-		: prefixedCommand;
+	const finalCommand = prefixedCommand;
 
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({
@@ -266,7 +252,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 					outputBytes: minimized.outputBytes,
 				});
 				if (artifactId) {
-					sink.push(`\n[raw output: artifact://${artifactId}]\n`);
+					const sep = minimized.text.endsWith("\n") ? "" : "\n";
+					sink.push(`${sep}[raw output: artifact://${artifactId}]\n`);
 				}
 			}
 		}

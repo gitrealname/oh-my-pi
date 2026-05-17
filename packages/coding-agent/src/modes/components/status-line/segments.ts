@@ -2,8 +2,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, getProjectDir, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
-import { theme } from "../../../modes/theme/theme";
+import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
+import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
@@ -30,6 +30,33 @@ function stripDisplayRoot(pwd: string): string {
 
 function normalizePremiumRequests(value: number): number {
 	return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+const SCRATCH_ROOTS: readonly string[] = (() => {
+	const roots = new Set<string>([os.tmpdir(), path.join(os.homedir(), "tmp")]);
+	if (process.platform === "win32") {
+		const { TEMP, TMP, SystemRoot } = process.env;
+		if (TEMP) roots.add(TEMP);
+		if (TMP) roots.add(TMP);
+		if (SystemRoot) roots.add(path.join(SystemRoot, "Temp"));
+	} else {
+		roots.add("/tmp");
+		roots.add("/var/tmp");
+		if (process.platform === "darwin") {
+			roots.add("/private/tmp");
+			roots.add("/private/var/tmp");
+		}
+	}
+	return [...roots];
+})();
+
+function classifyProjectDir(pwd: string): { scratch: boolean; relative: string | null } {
+	for (const root of SCRATCH_ROOTS) {
+		if (pathIsWithin(root, pwd)) {
+			return { scratch: true, relative: relativePathWithinRoot(root, pwd) };
+		}
+	}
+	return { scratch: false, relative: null };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -76,15 +103,63 @@ const modelSegment: StatusLineSegment = {
 	},
 };
 
+function formatGoalBudget(current: number, budget?: number): string {
+	const used = formatNumber(current);
+	if (budget === undefined) return used;
+	return `${used}/${formatNumber(budget)}`;
+}
+
+function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: boolean }): RenderedSegment {
+	const goal = ctx.session.getGoalModeState()?.goal;
+	const status = goal?.status ?? (mode.paused ? "paused" : "active");
+
+	let icon: string = theme.icon.goal;
+	let color: ThemeColor = "accent";
+	switch (status) {
+		case "paused":
+			icon = theme.icon.pause || theme.symbol("status.pending");
+			color = "warning";
+			break;
+		case "complete":
+			icon = theme.symbol("status.success");
+			color = "success";
+			break;
+		case "budget-limited":
+			icon = theme.symbol("status.warning");
+			color = "warning";
+			break;
+		case "dropped":
+			icon = theme.symbol("status.aborted");
+			color = "dim";
+			break;
+		default:
+			break;
+	}
+
+	const parts: string[] = [withIcon(icon, "Goal")];
+	const showBudget = ctx.session.settings.get("goal.statusInFooter") === true;
+	if (showBudget && goal) {
+		parts.push(formatGoalBudget(goal.tokensUsed, goal.tokenBudget));
+	}
+	return { content: theme.fg(color, parts.join(" ")), visible: true };
+}
+
 const modeSegment: StatusLineSegment = {
 	id: "mode",
 	render(ctx) {
+		const pauseSuffix = theme.icon.pause ? ` ${theme.icon.pause}` : " (paused)";
+
 		const plan = ctx.planMode;
 		if (plan && (plan.enabled || plan.paused)) {
-			const label = plan.paused ? "Plan ⏸" : "Plan";
+			const label = plan.paused ? `Plan${pauseSuffix}` : "Plan";
 			const content = withIcon(theme.icon.plan, label);
 			const color = plan.paused ? "warning" : "accent";
 			return { content: theme.fg(color, content), visible: true };
+		}
+
+		const goal = ctx.goalMode;
+		if (goal && (goal.enabled || goal.paused)) {
+			return renderGoalMode(ctx, goal);
 		}
 
 		const loop = ctx.loopMode;
@@ -102,10 +177,16 @@ const pathSegment: StatusLineSegment = {
 	render(ctx) {
 		const opts = ctx.options.path ?? {};
 
-		let pwd = getProjectDir();
+		const projectDir = getProjectDir();
+		const { scratch, relative } = classifyProjectDir(projectDir);
+		let pwd = projectDir;
 
 		if (opts.stripWorkPrefix !== false) {
-			pwd = stripDisplayRoot(pwd);
+			if (scratch) {
+				if (relative) pwd = relative;
+			} else {
+				pwd = stripDisplayRoot(pwd);
+			}
 		}
 		if (opts.abbreviate !== false) {
 			pwd = shortenPath(pwd);
@@ -118,7 +199,9 @@ const pathSegment: StatusLineSegment = {
 			pwd = `${ellipsis}${pwd.slice(-sliceLen)}`;
 		}
 
-		const content = withIcon(theme.icon.folder, pwd);
+		const showScratchIcon = scratch && opts.stripWorkPrefix !== false;
+		const icon = showScratchIcon ? theme.icon.scratchFolder : theme.icon.folder;
+		const content = withIcon(icon, pwd);
 		return { content: theme.fg("statusLinePath", content), visible: true };
 	},
 };

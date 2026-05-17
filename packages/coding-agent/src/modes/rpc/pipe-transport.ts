@@ -28,9 +28,9 @@ import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 export function genPipeName(): string {
 	if (process.platform === "win32") {
 		// Will be replaced by the actual port once the server is created
-		return `omp-rpc-${Snowflake.generate()}`;
+		return `omp-rpc-${Snowflake.next()}`;
 	}
-	return path.join(os.tmpdir(), `omp-rpc-${Snowflake.generate()}.sock`);
+	return path.join(os.tmpdir(), `omp-rpc-${Snowflake.next()}.sock`);
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ export function createPipeServer(): Promise<PipeServer> {
 }
 
 function createUnixServer(): Promise<PipeServer> {
-	const sockPath = path.join(os.tmpdir(), `omp-rpc-${Snowflake.generate()}.sock`);
+	const sockPath = path.join(os.tmpdir(), `omp-rpc-${Snowflake.next()}.sock`);
 	try { fs.unlinkSync(sockPath); } catch { /* stale socket ok */ }
 
 	return new Promise((resolve, reject) => {
@@ -248,10 +248,9 @@ export class PipeConnection implements RpcTransport {
 		const proc = ptree.spawn(cmd, {
 			cwd: options.cwd,
 			env: { ...Bun.env, ...options.env },
-			stdin: options.isBunModule ? (options.headedMode ? "inherit" : "pipe") : "ignore",
-			stdout: options.isBunModule ? (options.headedMode ? "inherit" : "pipe") : "ignore",
-			// Non-bun executables (e.g. omp.exe via cmd.exe) have their own console
-			// window (opened by `start /WAIT ""`); stdin/stdout are not used.
+			// stdin: null = inherit parent terminal (headed mode), "pipe" = piped (non-headed bun module),
+			// "ignore" = no stdin (non-bun executables that have their own console window).
+			stdin: options.isBunModule ? (options.headedMode ? null : "pipe") : "ignore",
 		});
 		// Fail fast if the child never connects (crash, wrong args, etc.)
 		// rather than hanging forever on waitForClient().

@@ -29,6 +29,7 @@ interface FakeAcpBuiltinSession {
 	getTodoPhases(): Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
 	refreshBaseSystemPrompt(): Promise<void>;
+	refreshSshTool(options?: { activateIfAvailable?: boolean }): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
@@ -88,6 +89,7 @@ function createRuntime() {
 		getContextUsage: () => undefined,
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
 		async setModel(_model: unknown) {},
+		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
 	const fakeSessionManager = {
@@ -218,6 +220,7 @@ describe("ACP builtin slash commands", () => {
 		runtime.session.getAsyncJobSnapshot = () => ({
 			running: [{ id: "j1", type: "bash", status: "running", label: "npm install", startTime: Date.now() - 5000 }],
 			recent: [{ id: "j2", type: "task", status: "completed", label: "build done", startTime: Date.now() - 60_000 }],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
 		});
 
 		const result = await executeAcpBuiltinSlashCommand("/jobs", runtime);
@@ -865,7 +868,11 @@ describe("wave 5 — adapters and polish", () => {
 	it("/jobs: empty-state output mentions background jobs definition", async () => {
 		const { output, runtime } = createRuntime();
 		// Return empty snapshot (running=[], recent=[])
-		runtime.session.getAsyncJobSnapshot = () => ({ running: [], recent: [] });
+		runtime.session.getAsyncJobSnapshot = () => ({
+			running: [],
+			recent: [],
+			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+		});
 		const result = await executeAcpBuiltinSlashCommand("/jobs", runtime);
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("background jobs");

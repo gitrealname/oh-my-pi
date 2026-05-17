@@ -81,7 +81,7 @@ describe("ModelRegistry", () => {
 	}
 
 	function writeCachedOllamaModels(models: Model<"openai-completions">[]) {
-		writeModelCache("ollama", Date.now(), models, true, cacheDbPath);
+		writeModelCache("ollama", Date.now(), models, true, "", cacheDbPath);
 	}
 
 	function getModelsForProvider(registry: ModelRegistry, provider: string) {
@@ -341,11 +341,11 @@ describe("ModelRegistry", () => {
 		test("applies explicit equivalence overrides from config", () => {
 			writeRawModelsConfig({
 				providers: {
-					"p-anthropic": providerConfig("https://demo.example.com/v1", [{ id: "corp-sonnet" }]),
+					"proxy-anthropic": providerConfig("https://demo.example.com/v1", [{ id: "corp-sonnet" }]),
 				},
 				equivalence: {
 					overrides: {
-						"p-anthropic/corp-sonnet": "claude-sonnet-4-5",
+						"proxy-anthropic/corp-sonnet": "claude-sonnet-4-5",
 					},
 				},
 			});
@@ -353,7 +353,7 @@ describe("ModelRegistry", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const variants = registry.getCanonicalVariants("claude-sonnet-4-5");
 
-			expect(variants.some(variant => variant.selector === "p-anthropic/corp-sonnet")).toBe(true);
+			expect(variants.some(variant => variant.selector === "proxy-anthropic/corp-sonnet")).toBe(true);
 		});
 
 		test("exclusions keep variants out of canonical grouping", () => {
@@ -488,6 +488,26 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("apiKey-only override supplies fallback auth for built-in models", async () => {
+			const originalOpenAiKey = Bun.env.OPENAI_API_KEY;
+			delete Bun.env.OPENAI_API_KEY;
+			try {
+				writeRawModelsJson({
+					openai: {
+						apiKey: "issue-typed-key",
+					},
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const openaiModels = getModelsForProvider(registry, "openai");
+
+				expect(openaiModels.length).toBeGreaterThan(0);
+				await expect(registry.getApiKey(openaiModels[0])).resolves.toBe("issue-typed-key");
+			} finally {
+				if (originalOpenAiKey === undefined) delete Bun.env.OPENAI_API_KEY;
+				else Bun.env.OPENAI_API_KEY = originalOpenAiKey;
+			}
+		});
 		test("baseUrl-only override does not affect other providers", () => {
 			writeRawModelsJson({
 				anthropic: overrideConfig("https://my-proxy.example.com/v1"),
@@ -551,6 +571,9 @@ describe("ModelRegistry", () => {
 					compat: {
 						supportsUsageInStreaming: false,
 						supportsStrictMode: false,
+						supportsMultipleSystemMessages: false,
+						disableReasoningOnToolChoice: true,
+						allowsSyntheticReasoningContentForToolCalls: false,
 					},
 				},
 			});
@@ -561,6 +584,9 @@ describe("ModelRegistry", () => {
 			for (const model of models) {
 				expect(getOpenAICompat(model)?.supportsUsageInStreaming).toBe(false);
 				expect(getOpenAICompat(model)?.supportsStrictMode).toBe(false);
+				expect(getOpenAICompat(model)?.supportsMultipleSystemMessages).toBe(false);
+				expect(getOpenAICompat(model)?.disableReasoningOnToolChoice).toBe(true);
+				expect(getOpenAICompat(model)?.allowsSyntheticReasoningContentForToolCalls).toBe(false);
 			}
 		});
 
@@ -1043,6 +1069,7 @@ describe("ModelRegistry", () => {
 				mode: "anthropic-adaptive",
 				minLevel: Effort.Minimal,
 				maxLevel: Effort.High,
+				levels: [Effort.Minimal, Effort.High],
 			};
 
 			writeModelsJson({
@@ -2005,7 +2032,7 @@ describe("ModelRegistry", () => {
 	describe("provider auth: oauth", () => {
 		test("models from a provider with auth: oauth are marked isOAuth=true", async () => {
 			writeRawModelsJson({
-				"p-anthropic": {
+				"proxy-anthropic": {
 					baseUrl: "https://proxy.example.com",
 					apiKey: "literal-key",
 					api: "anthropic-messages",
@@ -2023,19 +2050,19 @@ describe("ModelRegistry", () => {
 					],
 				},
 			});
-			await authStorage.setRuntimeApiKey("p-anthropic", "literal-key");
+			await authStorage.setRuntimeApiKey("proxy-anthropic", "literal-key");
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refresh("offline");
 
-			const model = registry.find("p-anthropic", "claude-sonnet-4-5");
+			const model = registry.find("proxy-anthropic", "claude-sonnet-4-5");
 			expect(model).toBeDefined();
 			expect(model?.isOAuth).toBe(true);
 		});
 
 		test("anthropic-messages providers default to isOAuth=true even without explicit auth", async () => {
 			writeRawModelsJson({
-				"p-anthropic": {
+				"proxy-anthropic": {
 					baseUrl: "https://proxy.example.com",
 					apiKey: "literal-key",
 					api: "anthropic-messages",
@@ -2052,19 +2079,19 @@ describe("ModelRegistry", () => {
 					],
 				},
 			});
-			await authStorage.setRuntimeApiKey("p-anthropic", "literal-key");
+			await authStorage.setRuntimeApiKey("proxy-anthropic", "literal-key");
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refresh("offline");
 
-			const model = registry.find("p-anthropic", "claude-sonnet-4-5");
+			const model = registry.find("proxy-anthropic", "claude-sonnet-4-5");
 			expect(model).toBeDefined();
 			expect(model?.isOAuth).toBe(true);
 		});
 
 		test("auth: apiKey opts out of the anthropic-messages default", async () => {
 			writeRawModelsJson({
-				"p-anthropic": {
+				"proxy-anthropic": {
 					baseUrl: "https://proxy.example.com",
 					apiKey: "literal-key",
 					api: "anthropic-messages",
@@ -2082,19 +2109,19 @@ describe("ModelRegistry", () => {
 					],
 				},
 			});
-			await authStorage.setRuntimeApiKey("p-anthropic", "literal-key");
+			await authStorage.setRuntimeApiKey("proxy-anthropic", "literal-key");
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refresh("offline");
 
-			const model = registry.find("p-anthropic", "claude-sonnet-4-5");
+			const model = registry.find("proxy-anthropic", "claude-sonnet-4-5");
 			expect(model).toBeDefined();
 			expect(model?.isOAuth).toBeUndefined();
 		});
 
 		test("non-anthropic apis do not get the OAuth default", async () => {
 			writeRawModelsJson({
-				"p-openai": {
+				"proxy-openai": {
 					baseUrl: "https://proxy.example.com/v1",
 					apiKey: "literal-key",
 					api: "openai-completions",
@@ -2111,12 +2138,12 @@ describe("ModelRegistry", () => {
 					],
 				},
 			});
-			await authStorage.setRuntimeApiKey("p-openai", "literal-key");
+			await authStorage.setRuntimeApiKey("proxy-openai", "literal-key");
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refresh("offline");
 
-			const model = registry.find("p-openai", "gpt-5");
+			const model = registry.find("proxy-openai", "gpt-5");
 			expect(model).toBeDefined();
 			expect(model?.isOAuth).toBeUndefined();
 		});
@@ -2164,5 +2191,25 @@ describe("ModelRegistry", () => {
 		expect(model!.contextWindow).toBeGreaterThan(100_000);
 		expect(model!.maxTokens).not.toBe(8_888);
 		expect(model!.maxTokens).toBeGreaterThan(1000);
+	});
+
+	test("loads cached standard provider discovery models on startup", () => {
+		const cachedModel: Model<"ollama-chat"> = {
+			id: "deepseek-v4-pro",
+			name: "DeepSeek V4 Pro",
+			api: "ollama-chat",
+			provider: "ollama-cloud",
+			baseUrl: "https://ollama.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 384_000,
+		};
+		writeModelCache("ollama-cloud", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("ollama-cloud", "deepseek-v4-pro")?.maxTokens).toBe(384_000);
 	});
 });

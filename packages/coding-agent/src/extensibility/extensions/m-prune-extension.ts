@@ -25,7 +25,7 @@ import { getAgentDir, logger } from "@oh-my-pi/pi-utils";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { resolveRoleModel } from "../../utils/m-utils";
 import { settings } from "../../config/settings";
-import { captureBatch, serializeBatchForSummarizer, type PruneBatch } from "../../session/compaction/mprune-batch";
+import { captureBatch, serializeBatchForSummarizer, type PruneBatch, type ToolResultEntry } from "../../session/compaction/mprune-batch";
 import { findAgedImages, makePlaceholder } from "../../session/compaction/mprune-images";
 import { buildSummarizerPrompt } from "../../session/compaction/mprune-prompt";
 import {
@@ -263,7 +263,7 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 		const entries = sessionEntries;
 		const prunedAt = Date.now();
 		const prunedIds = new Set(
-			batchesToFlush.flatMap(b => b.toolResults.map(r => r.toolCallId)),
+		batchesToFlush.flatMap(b => b.toolResults.map((r: ToolResultEntry) => r.toolCallId)),
 		);
 		for (const entry of entries) {
 			if (entry.type !== "message") continue;

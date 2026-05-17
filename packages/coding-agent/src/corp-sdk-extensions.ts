@@ -20,7 +20,7 @@ import { createPromptEngine } from "./prompt-engine";
 import { type Settings, type SettingPath } from "./config/settings";
 import type { ExtensionFactory, ExtensionRunner } from "./extensibility/extensions";
 import type { Skill } from "./extensibility/skills";
-import type { ToolSession } from "./tool-session";
+import type { ToolSession } from "./tools";
 
 // ---------------------------------------------------------------------------
 // 1. populateCorpSkillRoles

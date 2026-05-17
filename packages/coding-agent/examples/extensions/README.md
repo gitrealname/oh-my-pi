@@ -71,9 +71,10 @@ See [docs/extensions.md](../../docs/extensions.md) for full documentation.
 
 ```typescript
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
 
 export default function (pi: ExtensionAPI) {
+	const z = pi.zod;
+
 	// Subscribe to lifecycle events
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName === "bash" && event.input.command?.includes("rm -rf")) {
@@ -87,8 +88,8 @@ export default function (pi: ExtensionAPI) {
 		name: "greet",
 		label: "Greeting",
 		description: "Generate a greeting",
-		parameters: Type.Object({
-			name: Type.String({ description: "Name to greet" }),
+		parameters: z.object({
+			name: z.string().describe("Name to greet"),
 		}),
 		async execute(toolCallId, params, onUpdate, ctx, signal) {
 			return {
@@ -107,19 +108,16 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 ```
-
 ## Key Patterns
 
-**Use StringEnum for string parameters** (required for Google API compatibility):
+**Use `z.enum` for discriminated string tool args:**
 
 ```typescript
-import { StringEnum } from "@oh-my-pi/pi-ai";
+const { z } = pi.zod;
 
-// Good
-action: StringEnum(["list", "add"] as const);
-
-// Bad - doesn't work with Google
-action: Type.Union([Type.Literal("list"), Type.Literal("add")]);
+parameters: z.object({
+	action: z.enum(["list", "add"]),
+});
 ```
 
 **State persistence via details:**

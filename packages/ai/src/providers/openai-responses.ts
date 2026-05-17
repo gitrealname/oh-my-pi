@@ -1,4 +1,4 @@
-import { $env, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { $env, extractHttpStatusFromError, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
@@ -6,20 +6,20 @@ import type {
 	ResponseInput,
 } from "openai/resources/responses/responses";
 import { getEnvApiKey } from "../stream";
-import {
-	type AssistantMessage,
-	type CacheRetention,
-	type Context,
-	getPriorityPremiumRequests,
-	type MessageAttribution,
-	type Model,
-	type OpenAICompat,
-	type ProviderSessionState,
-	type ServiceTier,
-	type StreamFunction,
-	type StreamOptions,
-	type Tool,
-	type ToolChoice,
+import type {
+	AssistantMessage,
+	CacheRetention,
+	Context,
+	FetchImpl,
+	MessageAttribution,
+	Model,
+	OpenAICompat,
+	ProviderSessionState,
+	ServiceTier,
+	StreamFunction,
+	StreamOptions,
+	Tool,
+	ToolChoice,
 } from "../types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -41,7 +41,7 @@ import {
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
-import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses } from "../utils/schema";
+import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice, type OpenAIResponsesToolChoice } from "../utils/tool-choice";
 import {
@@ -171,6 +171,7 @@ type OpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	min_p?: number;
 	presence_penalty?: number;
 	repetition_penalty?: number;
+	stream_options?: { include_obfuscation?: boolean };
 };
 
 /**
@@ -210,12 +211,9 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.initiatorOverride,
 				cacheSessionId,
 				options?.onSseEvent,
+				options?.fetch,
 			);
-			const priorityPremiumRequests = getPriorityPremiumRequests(options?.serviceTier, model.provider);
-			const premiumRequestsTotal =
-				copilotPremiumRequests !== undefined || priorityPremiumRequests > 0
-					? (copilotPremiumRequests ?? 0) + priorityPremiumRequests
-					: undefined;
+			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const { params } = buildParams(model, context, options, providerSessionState, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
@@ -292,6 +290,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			for (const block of output.content) delete (block as { index?: number }).index;
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
+			output.errorStatus = extractHttpStatusFromError(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;
@@ -312,6 +311,7 @@ function createClient(
 	initiatorOverride?: MessageAttribution,
 	sessionId?: string,
 	onSseEvent?: OpenAIResponsesOptions["onSseEvent"],
+	fetchOverride?: FetchImpl,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -349,6 +349,7 @@ function createClient(
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
+	const baseFetch = fetchOverride ?? fetch;
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -356,7 +357,7 @@ function createClient(
 			dangerouslyAllowBrowser: true,
 			maxRetries: 5,
 			defaultHeaders: headers,
-			fetch: onSseEvent ? wrapFetchForSseDebug(fetch, event => onSseEvent(event, model)) : fetch,
+			fetch: onSseEvent ? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model)) : baseFetch,
 		}),
 		copilotPremiumRequests,
 		baseUrl,
@@ -405,9 +406,14 @@ function buildParams(
 		prompt_cache_key: promptCacheKey,
 		prompt_cache_retention: promptCacheKey ? getPromptCacheRetention(model.baseUrl, cacheRetention) : undefined,
 		store: false,
+		stream_options: model.provider === "openai" ? { include_obfuscation: false } : undefined,
 	};
 
 	applyCommonResponsesSamplingParams(params, options, model.provider);
+	// TODO: openai responses has no top-level `stop`/`stop_sequences`; surface via reasoning.stop?
+	// `StreamOptions.stopSequences` is intentionally dropped for this provider.
+	// TODO: openai responses has no top-level `frequency_penalty` field as of the current SDK;
+	// `StreamOptions.frequencyPenalty` is intentionally dropped for this provider.
 
 	if (context.tools) {
 		params.tools = convertTools(context.tools, supportsStrictMode(model), model);
@@ -588,7 +594,7 @@ export function convertTools(tools: Tool[], strictMode: boolean, model: Model<"o
 			} as unknown as OpenAITool;
 		}
 		const strict = !NO_STRICT && strictMode && tool.strict !== false;
-		const baseParameters = tool.parameters as unknown as Record<string, unknown>;
+		const baseParameters = toolWireSchema(tool);
 		const responseParameters = sanitizeSchemaForOpenAIResponses(baseParameters);
 		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(responseParameters, strict);
 		return {

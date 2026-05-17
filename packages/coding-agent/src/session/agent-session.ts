@@ -18,14 +18,34 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import {
+	type AfterToolCallContext,
+	type AfterToolCallResult,
 	type Agent,
 	AgentBusyError,
 	type AgentEvent,
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	resolveTelemetry,
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
+import {
+	AUTO_HANDOFF_THRESHOLD_FOCUS,
+	CompactionCancelledError,
+	type CompactionPreparation,
+	type CompactionResult,
+	calculateContextTokens,
+	calculatePromptTokens,
+	collectEntriesForBranchSummary,
+	compact,
+	estimateTokens,
+	generateBranchSummary,
+	generateHandoff,
+	prepareCompaction,
+	type SummaryOptions,
+	shouldCompact,
+} from "@oh-my-pi/pi-agent-core/compaction";
+import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
 	Context,
@@ -61,7 +81,8 @@ import {
 	prompt,
 	Snowflake,
 } from "@oh-my-pi/pi-utils";
-import { type AsyncJob, AsyncJobManager } from "../async";
+import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import { MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
@@ -75,7 +96,8 @@ import {
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
-import { normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
+import { loadCapability } from "../discovery";
+import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import {
 	disposeKernelSessionsByOwner,
 	executePython as executePythonCommand,
@@ -110,6 +132,8 @@ import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import { GoalRuntime } from "../goals/runtime";
+import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import {
@@ -124,9 +148,7 @@ import { resolveMemoryBackend } from "../memory-backend";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
-import autoHandoffThresholdFocusPrompt from "../prompts/system/auto-handoff-threshold-focus.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
-import handoffDocumentPrompt from "../prompts/system/handoff-document.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
@@ -134,8 +156,10 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
+import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -158,21 +182,7 @@ import { extractFileMentions, generateFileMentionMessages } from "../utils/file-
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
-import {
-	CompactionCancelledError,
-	type CompactionPreparation,
-	type CompactionResult,
-	calculateContextTokens,
-	calculatePromptTokens,
-	collectEntriesForBranchSummary,
-	compact,
-	estimateTokens,
-	generateBranchSummary,
-	prepareCompaction,
-	type SummaryOptions,
-	shouldCompact,
-} from "./compaction";
-import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "./compaction/pruning";
+
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -217,7 +227,8 @@ export type AgentSessionEvent =
 	| { type: "todo_auto_clear" }
 	| { type: "irc_message"; message: CustomMessage }
 	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string }
-	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined };
+	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -226,6 +237,7 @@ export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "la
 export interface AsyncJobSnapshot {
 	running: AsyncJobSnapshotItem[];
 	recent: AsyncJobSnapshotItem[];
+	delivery: AsyncJobDeliveryState;
 }
 
 // ============================================================================
@@ -271,6 +283,9 @@ export interface AgentSessionConfig {
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
 	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	/** Rebuild the SSH tool from current capability discovery results. */
+	reloadSshTool?: () => Promise<AgentTool | null>;
+	requestedToolNames?: ReadonlySet<string>;
 	/**
 	 * Optional accessor for live MCP server instructions. Read by the session's
 	 * `rebuildSystemPrompt`-skip optimization to detect server-side instruction
@@ -331,6 +346,17 @@ export interface PromptOptions {
 	skipCompactionCheck?: boolean;
 }
 
+/** Result from a handoff operation. */
+export interface HandoffResult {
+	document: string;
+	savedPath?: string;
+}
+
+export interface SessionHandoffOptions {
+	autoTriggered?: boolean;
+	signal?: AbortSignal;
+}
+
 /** Result from cycleModel() */
 export interface ModelCycleResult {
 	model: Model;
@@ -366,25 +392,12 @@ export interface SessionStats {
 	cost: number;
 }
 
-/** Result from handoff() */
-export interface HandoffResult {
-	document: string;
-	savedPath?: string;
-}
-
-interface HandoffOptions {
-	autoTriggered?: boolean;
-	signal?: AbortSignal;
-}
-
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
 // Constants
 // ============================================================================
 
 /** Standard thinking levels */
-
-const AUTO_HANDOFF_THRESHOLD_FOCUS = prompt.render(autoHandoffThresholdFocusPrompt);
 
 type RetryFallbackChains = Record<string, string[]>;
 
@@ -509,6 +522,153 @@ const noOpUIContext: ExtensionUIContext = {
 	setToolsExpanded: () => {},
 };
 
+function createHandoffContext(document: string): string {
+	return `<handoff-context>\n${document}\n</handoff-context>\n\nThe above is a handoff document from a previous session. Use this context to continue the work seamlessly.`;
+}
+
+function createHandoffFileName(date = new Date()): string {
+	const fileTimestamp = date.toISOString().replace(/[:.]/g, "-");
+	return `handoff-${fileTimestamp}.md`;
+}
+
+
+function getStringProperty(value: Record<string, unknown>, key: string): string | undefined {
+	const candidate = value[key];
+	return typeof candidate === "string" ? candidate : undefined;
+}
+
+function collectStringPaths(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+	const a = args as Record<string, unknown>;
+
+	const edits = Array.isArray(a.edits) ? a.edits : undefined;
+	if (edits) {
+		const path = getStringProperty(a, "path");
+		if (path) {
+			for (const edit of edits) {
+				if (!edit || typeof edit !== "object" || Array.isArray(edit)) continue;
+				const op = getStringProperty(edit as Record<string, unknown>, "op");
+				if (op === "delete") return { kind: "delete", paths: [path] };
+			}
+		}
+		for (const edit of edits) {
+			if (!edit || typeof edit !== "object" || Array.isArray(edit)) continue;
+			const entry = edit as Record<string, unknown>;
+			const op = getStringProperty(entry, "op");
+			const rename = getStringProperty(entry, "rename");
+			if (op !== "create" && rename) return { kind: "move", paths: path ? [path, rename] : [rename] };
+		}
+	}
+
+	const input = getStringProperty(a, "input");
+	if (input) {
+		try {
+			const entries = expandApplyPatchToEntries({ input });
+			const deleteEntry = entries.find(entry => entry.op === "delete");
+			if (deleteEntry) return { kind: "delete", paths: [deleteEntry.path] };
+			const moveEntry = entries.find(entry => entry.rename);
+			if (moveEntry?.rename) return { kind: "move", paths: [moveEntry.path, moveEntry.rename] };
+		} catch {
+			// If the edit input is not an apply_patch envelope, it is not a delete/move operation.
+		}
+	}
+
+	return undefined;
+}
+
+function getPermissionIntent(
+	toolName: string,
+	args: unknown,
+): { toolName: string; title: string; paths?: string[]; cacheKey: string } | undefined {
+	const a = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+	if (toolName === "bash") {
+		const cmd = getStringProperty(a, "command")?.slice(0, 80);
+		return { toolName, title: cmd || toolName, cacheKey: toolName };
+	}
+	if (toolName === "delete") {
+		const p = getStringProperty(a, "path");
+		return { toolName, title: p ? `Delete ${p}` : toolName, paths: p ? [p] : undefined, cacheKey: toolName };
+	}
+	if (toolName === "move") {
+		const from = getStringProperty(a, "oldPath") ?? getStringProperty(a, "path") ?? getStringProperty(a, "from");
+		const to = getStringProperty(a, "newPath") ?? getStringProperty(a, "to") ?? getStringProperty(a, "destination");
+		if (from && to) return { toolName, title: `Move ${from} to ${to}`, paths: [from, to], cacheKey: toolName };
+		return {
+			toolName,
+			title: from ? `Move ${from}` : toolName,
+			paths: from ? [from] : undefined,
+			cacheKey: toolName,
+		};
+	}
+	if (toolName === "edit") {
+		const intent = getEditDestructiveIntent(args);
+		if (!intent) return undefined;
+		if (intent.kind === "delete") {
+			return {
+				toolName,
+				title: `Delete ${intent.paths[0] ?? "edit target"}`,
+				paths: intent.paths,
+				cacheKey: "edit:delete",
+			};
+		}
+		const from = intent.paths[0];
+		const to = intent.paths[1];
+		return {
+			toolName,
+			title: from && to ? `Move ${from} to ${to}` : `Move ${from ?? to ?? "edit target"}`,
+			paths: intent.paths,
+			cacheKey: "edit:move",
+		};
+	}
+	return undefined;
+}
+
+function extractPermissionLocations(
+	args: unknown,
+	cwd: string,
+	explicitPaths?: string[],
+): { path: string; line?: number }[] {
+	if (!args || typeof args !== "object") return [];
+	const a = args as Record<string, unknown>;
+	const out: { path: string; line?: number }[] = [];
+	const pushPath = (value: unknown) => {
+		if (typeof value !== "string" || value.length === 0) return;
+		// ACP locations carry file paths that the editor host will open or focus;
+		// they must be absolute or the client cannot resolve them. Resolve raw
+		// tool args (often cwd-relative) against the session cwd before sending.
+		let resolved: string;
+		try {
+			resolved = resolveToCwd(value, cwd);
+		} catch {
+			return;
+		}
+		if (out.some(location => location.path === resolved)) return;
+		out.push({ path: resolved });
+	};
+	if (explicitPaths) {
+		for (const p of explicitPaths) {
+			pushPath(p);
+		}
+		return out;
+	}
+	pushPath(a.path);
+	pushPath(a.file);
+	for (const p of collectStringPaths(a.paths)) {
+		pushPath(p);
+	}
+	pushPath(a.oldPath);
+	pushPath(a.newPath);
+	pushPath(a.from);
+	pushPath(a.to);
+	pushPath(a.source);
+	pushPath(a.destination);
+	return out;
+}
+
 // ============================================================================
 // ACP Permission Gate
 // ============================================================================
@@ -565,39 +725,6 @@ function derivePermissionTitle(toolName: string, args: unknown): string {
 	return toolName;
 }
 
-function extractPermissionLocations(args: unknown, cwd: string): { path: string; line?: number }[] {
-	if (!args || typeof args !== "object") return [];
-	const a = args as Record<string, unknown>;
-	const out: { path: string; line?: number }[] = [];
-	const pushPath = (value: unknown) => {
-		if (typeof value !== "string" || value.length === 0) return;
-		// ACP locations carry file paths that the editor host will open or focus;
-		// they must be absolute or the client cannot resolve them. Resolve raw
-		// tool args (often cwd-relative) against the session cwd before sending.
-		let resolved: string;
-		try {
-			resolved = resolveToCwd(value, cwd);
-		} catch {
-			return;
-		}
-		if (out.some(location => location.path === resolved)) return;
-		out.push({ path: resolved });
-	};
-	pushPath(a.path);
-	pushPath(a.file);
-	if (Array.isArray(a.paths)) {
-		for (const p of a.paths) {
-			pushPath(p);
-		}
-	}
-	pushPath(a.oldPath);
-	pushPath(a.newPath);
-	pushPath(a.from);
-	pushPath(a.to);
-	pushPath(a.source);
-	pushPath(a.destination);
-	return out;
-}
 
 // ============================================================================
 // AgentSession Class
@@ -641,9 +768,13 @@ export class AgentSession {
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#planModeState: PlanModeState | undefined;
+	#goalModeState: GoalModeState | undefined;
+	#goalRuntime: GoalRuntime;
+	#goalTurnCounter = 0;
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
 	#clientBridge: ClientBridge | undefined;
+	#allowAcpAgentInitiatedTurns = false;
 	/** Per-session memory of allow_always / reject_always decisions for gated tools. */
 	#acpPermissionDecisions: Map<string, "allow_always" | "reject_always"> = new Map();
 
@@ -726,6 +857,8 @@ export class AgentSession {
 		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
 		| undefined;
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
+	#reloadSshTool: (() => Promise<AgentTool | null>) | undefined;
+	#requestedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
 	/**
 	 * Signature of the (toolNames, tool descriptions) tuple passed to the most
@@ -749,6 +882,10 @@ export class AgentSession {
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
 	#pendingTtsrInjections: Rule[] = [];
+	/** Per-tool TTSR rules whose `interruptMode` opted out of aborting the stream.
+	 *  These are folded into the matched tool call's `toolResult` content as an
+	 *  in-band system reminder, instead of spawning a separate follow-up turn. */
+	#perToolTtsrInjections = new Map<string, Rule[]>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -778,6 +915,15 @@ export class AgentSession {
 
 	#streamingEditFileCache = new Map<string, string>();
 	#promptInFlightCount = 0;
+	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
+	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
+	// checks in #handleAgentEvent) still fire on the original schedule — only the
+	// `#emit(event)` that reaches external subscribers (rpc-mode stdout, ACP bridge,
+	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
+	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
+	// has decremented #promptInFlightCount, hitting AgentBusyError. Flushed from
+	// both #endInFlight (normal) and #resetInFlight (abort).
+	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
 	#pendingRewindReport: string | undefined = undefined;
@@ -833,12 +979,21 @@ export class AgentSession {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
+			this.#flushPendingAgentEnd();
 		}
 	}
 
 	#resetInFlight(): void {
 		this.#promptInFlightCount = 0;
 		this.#releasePowerAssertion();
+		this.#flushPendingAgentEnd();
+	}
+
+	#flushPendingAgentEnd(): void {
+		const pending = this.#pendingAgentEndEmit;
+		if (!pending) return;
+		this.#pendingAgentEndEmit = undefined;
+		this.#emit(pending);
 	}
 
 	constructor(config: AgentSessionConfig) {
@@ -860,24 +1015,38 @@ export class AgentSession {
 		this.#modelRegistry = config.modelRegistry;
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#onPayload = config.onPayload;
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
+		// Avoid wrapping in an `async` closure when no user callback is configured: the
+		// outer await on `#onResponse` (provider-response.ts) tolerates a sync void return,
+		// and skipping the wrapper drops a per-event `newPromiseCapability` allocation that
+		// shows up as ~3.5% self time in streaming profiles.
 		const configuredOnResponse = config.onResponse;
-		this.#onResponse = async (response, model) => {
-			this.rawSseDebugBuffer.recordResponse(response, model);
-			await configuredOnResponse?.(response, model);
-		};
+		this.#onResponse = configuredOnResponse
+			? async (response, model) => {
+					this.rawSseDebugBuffer.recordResponse(response, model);
+					await configuredOnResponse(response, model);
+				}
+			: (response, model) => {
+					this.rawSseDebugBuffer.recordResponse(response, model);
+				};
 		const configuredOnSseEvent = config.onSseEvent;
-		this.#onSseEvent = (event, model) => {
-			this.rawSseDebugBuffer.recordEvent(event, model);
-			configuredOnSseEvent?.(event, model);
-		};
+		this.#onSseEvent = configuredOnSseEvent
+			? (event, model) => {
+					this.rawSseDebugBuffer.recordEvent(event, model);
+					configuredOnSseEvent(event, model);
+				}
+			: (event, model) => {
+					this.rawSseDebugBuffer.recordEvent(event, model);
+				};
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
 		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
 		this.#getMcpServerInstructions = config.getMcpServerInstructions;
+		this.#reloadSshTool = config.reloadSshTool;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
@@ -914,9 +1083,49 @@ export class AgentSession {
 			this.#preCacheStreamingEditFile(event);
 			this.#maybeAbortStreamingEdit(event);
 		});
+		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
+		this.agent.afterToolCall = ctx => this.#ttsrAfterToolCall(ctx);
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#syncTodoPhasesFromBranch();
+		this.#goalRuntime = new GoalRuntime({
+			getState: () => this.#goalModeState,
+			setState: state => {
+				this.#goalModeState = state;
+			},
+			getCurrentUsage: () => {
+				const usage = this.getSessionStats().tokens;
+				return {
+					input: usage.input,
+					output: usage.output,
+					cacheRead: usage.cacheRead,
+					cacheWrite: usage.cacheWrite,
+				};
+			},
+			emit: event => {
+				if (event.type === "goal_updated") {
+					return this.#emitSessionEvent({ type: "goal_updated", goal: event.goal, state: event.state });
+				}
+			},
+			persist: (mode, state) => {
+				if (mode === "none") {
+					this.sessionManager.appendModeChange("none");
+				} else if (state) {
+					this.sessionManager.appendModeChange(mode, { goal: state.goal });
+				}
+			},
+			sendHiddenMessage: async message => {
+				await this.sendCustomMessage(
+					{
+						customType: message.customType,
+						content: message.content,
+						display: false,
+						attribution: "agent",
+					},
+					{ deliverAs: message.deliverAs },
+				);
+			},
+		});
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
@@ -1055,21 +1264,23 @@ export class AgentSession {
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
 		const manager = AsyncJobManager.instance();
 		if (!manager) return null;
-		const running = manager.getRunningJobs().map(job => ({
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		const running = manager.getRunningJobs(ownerFilter).map(job => ({
 			id: job.id,
 			type: job.type,
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
 		}));
-		const recent = manager.getRecentJobs(options?.recentLimit ?? 5).map(job => ({
+		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
 			id: job.id,
 			type: job.type,
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
 		}));
-		return { running, recent };
+		const delivery = manager.getDeliveryState(ownerFilter);
+		return { running, recent, delivery };
 	}
 
 	/**
@@ -1082,6 +1293,7 @@ export class AgentSession {
 		if (!this.#agentId) return;
 		AsyncJobManager.instance()?.cancelAll({ ownerId: this.#agentId });
 	}
+
 
 	// =========================================================================
 	// Event Subscription
@@ -1127,6 +1339,18 @@ export class AgentSession {
 			return;
 		}
 		await this.#emitExtensionEvent(event);
+		// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
+		// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
+		// emitting while #promptInFlightCount > 0 lets a client fire its next
+		// `prompt` into a session that still reports isStreaming === true. Flush
+		// happens in #endInFlight / #resetInFlight. A later agent_end (e.g. from
+		// an auto-compaction turn that starts before the original prompt unwinds)
+		// supersedes the pending one, which is what subscribers want — they only
+		// care about the final settle.
+		if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+			this.#pendingAgentEndEmit = event;
+			return;
+		}
 		this.#emit(event);
 	}
 
@@ -1211,6 +1435,16 @@ export class AgentSession {
 			}
 		}
 
+		if (event.type === "turn_start") {
+			const usage = this.getSessionStats().tokens;
+			this.#goalRuntime.onTurnStart(`turn-${++this.#goalTurnCounter}`, {
+				input: usage.input,
+				output: usage.output,
+				cacheRead: usage.cacheRead,
+				cacheWrite: usage.cacheWrite,
+			});
+		}
+
 		await this.#emitSessionEvent(displayEvent);
 
 		if (event.type === "turn_start") {
@@ -1232,6 +1466,13 @@ export class AgentSession {
 				this.#toolChoiceQueue.reject(msg.stopReason === "error" ? "error" : "aborted");
 			} else {
 				this.#toolChoiceQueue.resolve();
+			}
+		}
+		if (event.type === "tool_execution_end") {
+			if (event.toolName === "goal") {
+				await this.#goalRuntime.onGoalToolCompleted();
+			} else {
+				await this.#goalRuntime.onToolCompleted(event.toolName);
 			}
 		}
 		if (event.type === "tool_execution_end" && event.toolName === "yield" && !event.isError) {
@@ -1259,77 +1500,87 @@ export class AgentSession {
 			if (matchContext && "delta" in assistantEvent) {
 				const matches = this.#ttsrManager.checkDelta(assistantEvent.delta, matchContext);
 				if (matches.length > 0) {
-					// Queue rules for injection; mark as injected only after successful enqueue.
-
-					this.#addPendingTtsrInjections(matches);
-
-					if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
-						// Abort the stream immediately — do not gate on extension callbacks
-						this.#ttsrAbortPending = true;
-						this.#ensureTtsrResumePromise();
-						this.agent.abort();
-						// Notify extensions (fire-and-forget, does not block abort)
+					// Decide first: a non-interrupting tool-source match attaches to the
+					// specific tool call's result instead of driving a loop-wide follow-up.
+					const shouldInterrupt = this.#shouldInterruptForTtsrMatch(matches, matchContext);
+					const perToolId = shouldInterrupt ? undefined : this.#extractTtsrToolCallId(matchContext);
+					if (perToolId) {
+						this.#addPerToolTtsrInjections(perToolId, matches);
 						this.#emitSessionEvent({ type: "ttsr_triggered", rules: matches }).catch(() => {});
-						// Schedule retry after a short delay
-						const retryToken = ++this.#ttsrRetryToken;
-						const generation = this.#promptGeneration;
-						const targetMessageTimestamp =
-							event.message.role === "assistant" ? event.message.timestamp : undefined;
-						this.#schedulePostPromptTask(
-							async () => {
-								if (this.#ttsrRetryToken !== retryToken) {
-									this.#resolveTtsrResume();
-									return;
-								}
+					} else {
+						// Queue rules for injection; mark as injected only after successful enqueue.
+						this.#addPendingTtsrInjections(matches);
 
-								const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
-								if (
-									!this.#ttsrAbortPending ||
-									this.#promptGeneration !== generation ||
-									targetAssistantIndex === -1
-								) {
+						if (shouldInterrupt) {
+							// Abort the stream immediately — do not gate on extension callbacks
+							this.#ttsrAbortPending = true;
+							this.#ensureTtsrResumePromise();
+							this.agent.abort();
+							// Notify extensions (fire-and-forget, does not block abort)
+							this.#emitSessionEvent({ type: "ttsr_triggered", rules: matches }).catch(() => {});
+							// Schedule retry after a short delay
+							const retryToken = ++this.#ttsrRetryToken;
+							const generation = this.#promptGeneration;
+							const targetMessageTimestamp =
+								event.message.role === "assistant" ? event.message.timestamp : undefined;
+							this.#schedulePostPromptTask(
+								async () => {
+									if (this.#ttsrRetryToken !== retryToken) {
+										this.#resolveTtsrResume();
+										return;
+									}
+
+									const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
+									if (
+										!this.#ttsrAbortPending ||
+										this.#promptGeneration !== generation ||
+										targetAssistantIndex === -1
+									) {
+										this.#ttsrAbortPending = false;
+										this.#pendingTtsrInjections = [];
+										this.#perToolTtsrInjections.clear();
+										this.#resolveTtsrResume();
+										return;
+									}
 									this.#ttsrAbortPending = false;
-									this.#pendingTtsrInjections = [];
-									this.#resolveTtsrResume();
-									return;
-								}
-								this.#ttsrAbortPending = false;
-								const ttsrSettings = this.#ttsrManager?.getSettings();
-								if (ttsrSettings?.contextMode === "discard") {
-									// Remove the partial/aborted assistant turn from agent state
-									this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex));
-								}
-								// Inject TTSR rules as system reminder before retry
-								const injection = this.#getTtsrInjectionContent();
-								if (injection) {
-									const details = { rules: injection.rules.map(rule => rule.name) };
-									this.agent.appendMessage({
-										role: "custom",
-										customType: "ttsr-injection",
-										content: injection.content,
-										display: false,
-										details,
-										attribution: "agent",
-										timestamp: Date.now(),
-									});
-									this.sessionManager.appendCustomMessageEntry(
-										"ttsr-injection",
-										injection.content,
-										false,
-										details,
-										"agent",
-									);
-									this.#markTtsrInjected(details.rules);
-								}
-								try {
-									await this.agent.continue();
-								} catch {
-									this.#resolveTtsrResume();
-								}
-							},
-							{ delayMs: 50 },
-						);
-						return;
+									this.#perToolTtsrInjections.clear();
+									const ttsrSettings = this.#ttsrManager?.getSettings();
+									if (ttsrSettings?.contextMode === "discard") {
+										// Remove the partial/aborted assistant turn from agent state
+										this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex));
+									}
+									// Inject TTSR rules as system reminder before retry
+									const injection = this.#getTtsrInjectionContent();
+									if (injection) {
+										const details = { rules: injection.rules.map(rule => rule.name) };
+										this.agent.appendMessage({
+											role: "custom",
+											customType: "ttsr-injection",
+											content: injection.content,
+											display: false,
+											details,
+											attribution: "agent",
+											timestamp: Date.now(),
+										});
+										this.sessionManager.appendCustomMessageEntry(
+											"ttsr-injection",
+											injection.content,
+											false,
+											details,
+											"agent",
+										);
+										this.#markTtsrInjected(details.rules);
+									}
+									try {
+										await this.agent.continue();
+									} catch {
+										this.#resolveTtsrResume();
+									}
+								},
+								{ delayMs: 50 },
+							);
+							return;
+						}
 					}
 				}
 			}
@@ -1469,6 +1720,15 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			const usage = this.getSessionStats().tokens;
+			await this.#goalRuntime.onAgentEnd({
+				currentUsage: {
+					input: usage.input,
+					output: usage.output,
+					cacheRead: usage.cacheRead,
+					cacheWrite: usage.cacheWrite,
+				},
+			});
 			const fallbackAssistant = [...event.messages]
 				.reverse()
 				.find((message): message is AssistantMessage => message.role === "assistant");
@@ -1624,7 +1884,10 @@ export class AgentSession {
 				try {
 					await this.#maybeRestoreRetryFallbackPrimary();
 					await this.agent.continue();
-				} catch {
+				} catch (error) {
+					logger.warn("agent.continue failed after scheduling", {
+						error: error instanceof Error ? error.message : String(error),
+					});
 					options?.onError?.();
 				}
 			},
@@ -1726,6 +1989,61 @@ export class AgentSession {
 		}
 	}
 
+	/** Tool-call id whose argument deltas triggered a TTSR match, when known. */
+	#extractTtsrToolCallId(matchContext: TtsrMatchContext): string | undefined {
+		if (matchContext.source !== "tool") return undefined;
+		const key = matchContext.streamKey;
+		if (typeof key !== "string" || !key.startsWith("toolcall:")) return undefined;
+		const id = key.slice("toolcall:".length);
+		return id.length > 0 ? id : undefined;
+	}
+
+	#addPerToolTtsrInjections(toolCallId: string, rules: Rule[]): void {
+		const bucket = this.#perToolTtsrInjections.get(toolCallId) ?? [];
+		const seen = new Set(bucket.map(rule => rule.name));
+		// Dedupe against rules already bucketed for other tool calls in this
+		// same assistant message so one rule attaches to exactly one tool call.
+		const claimedElsewhere = new Set<string>();
+		for (const [otherId, otherBucket] of this.#perToolTtsrInjections) {
+			if (otherId === toolCallId) continue;
+			for (const rule of otherBucket) claimedElsewhere.add(rule.name);
+		}
+		const newlyAdded: string[] = [];
+		for (const rule of rules) {
+			if (seen.has(rule.name) || claimedElsewhere.has(rule.name)) continue;
+			bucket.push(rule);
+			seen.add(rule.name);
+			newlyAdded.push(rule.name);
+		}
+		if (bucket.length === 0) return;
+		this.#perToolTtsrInjections.set(toolCallId, bucket);
+		// Claim the rules in the TTSR manager so subsequent deltas in this same
+		// turn (e.g. a sibling tool call's argument stream) don't re-match them.
+		// Persistence still happens in #ttsrAfterToolCall when the tool actually
+		// produces a result we can fold the reminder into.
+		if (newlyAdded.length > 0) {
+			this.#ttsrManager?.markInjectedByNames(newlyAdded);
+		}
+	}
+
+	/** `afterToolCall` hook: fold any per-tool TTSR reminders into the result. */
+	#ttsrAfterToolCall(ctx: AfterToolCallContext): AfterToolCallResult | undefined {
+		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
+		if (!rules || rules.length === 0) return undefined;
+		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
+		const reminder = rules
+			.map(r => prompt.render(ttsrToolReminderTemplate, { name: r.name, path: r.path, content: r.content }))
+			.join("\n\n");
+		// The TTSR manager was already claimed at bucket time; only persistence remains.
+		const ruleNames = rules.map(r => r.name.trim()).filter(n => n.length > 0);
+		if (ruleNames.length > 0) {
+			this.sessionManager.appendTtsrInjection(ruleNames);
+		}
+		return {
+			content: [{ type: "text", text: reminder }, ...ctx.result.content],
+		};
+	}
+
 	#extractTtsrRuleNames(details: unknown): string[] {
 		if (!details || typeof details !== "object" || Array.isArray(details)) {
 			return [];
@@ -1776,6 +2094,11 @@ export class AgentSession {
 	}
 
 	#queueDeferredTtsrInjectionIfNeeded(assistantMsg: AssistantMessage): void {
+		if (assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error") {
+			// Tools that hadn't started by abort/error will never produce results to
+			// fold injections into — drop their stale per-tool entries.
+			this.#perToolTtsrInjections.clear();
+		}
 		if (this.#ttsrAbortPending || this.#pendingTtsrInjections.length === 0) {
 			return;
 		}
@@ -2324,6 +2647,12 @@ export class AgentSession {
 				attempt: event.attempt,
 				maxAttempts: event.maxAttempts,
 			});
+		} else if (event.type === "goal_updated") {
+			await this.#extensionRunner.emit({
+				type: "goal_updated",
+				goal: event.goal,
+				state: event.state,
+			});
 		}
 	}
 
@@ -2496,6 +2825,23 @@ export class AgentSession {
 	async waitForIdle(): Promise<void> {
 		await this.agent.waitForIdle();
 		await this.#waitForPostPromptRecovery();
+	}
+
+	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
+		const manager = AsyncJobManager.instance();
+		if (!manager) return false;
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		const before = manager.getDeliveryState(ownerFilter);
+		if (before.queued === 0 && !before.delivering) return false;
+		const previousAllowAcpAgentInitiatedTurns = this.#allowAcpAgentInitiatedTurns;
+		this.#allowAcpAgentInitiatedTurns = true;
+		try {
+			const drained = await manager.drainDeliveries({ timeoutMs: options?.timeoutMs, filter: ownerFilter });
+			const after = manager.getDeliveryState(ownerFilter);
+			return drained && (before.queued !== after.queued || before.delivering !== after.delivering);
+		} finally {
+			this.#allowAcpAgentInitiatedTurns = previousAllowAcpAgentInitiatedTurns;
+		}
 	}
 
 	/** Most recent assistant message in agent state. */
@@ -2797,8 +3143,8 @@ export class AgentSession {
 		if (!bridge?.capabilities.requestPermission || !bridge.requestPermission) return tool;
 		if (!PERMISSION_REQUIRED_TOOLS.has(tool.name)) return tool;
 		return new Proxy(tool, {
-			get: (target, prop, receiver) => {
-				if (prop !== "execute") return Reflect.get(target, prop, receiver);
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
 				return async (
 					toolCallId: string,
 					args: unknown,
@@ -2806,8 +3152,12 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
+					const permissionIntent = getPermissionIntent(target.name, args);
+					if (!permissionIntent) {
+						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+					}
 					// Short-circuit on persisted decisions.
-					const persisted = this.#acpPermissionDecisions.get(target.name);
+					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
@@ -2829,9 +3179,14 @@ export class AgentSession {
 							{
 								toolCallId,
 								toolName: target.name,
-								title: derivePermissionTitle(target.name, args),
+								title: permissionIntent.title,
+								status: "pending",
 								rawInput: args,
-								locations: extractPermissionLocations(args, this.sessionManager.getCwd()),
+								locations: extractPermissionLocations(
+									args,
+									this.sessionManager.getCwd(),
+									permissionIntent.paths,
+								),
 							},
 							PERMISSION_OPTIONS,
 							signal,
@@ -2852,9 +3207,9 @@ export class AgentSession {
 						throw new ToolError(`Tool permission response used unknown option ID: ${outcome.optionId}`);
 					}
 					if (selectedOption.kind === "allow_always") {
-						this.#acpPermissionDecisions.set(target.name, "allow_always");
+						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "allow_always");
 					} else if (selectedOption.kind === "reject_always") {
-						this.#acpPermissionDecisions.set(target.name, "reject_always");
+						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "reject_always");
 					}
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (${target.name})`);
@@ -2924,6 +3279,45 @@ export class AgentSession {
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(previousSelectedMCPToolNames);
 		}
+	}
+
+	/**
+	 * Reload the SSH tool from disk-backed capability discovery and make the
+	 * refreshed definition visible to the next model call without restarting.
+	 */
+	async refreshSshTool(options?: { activateIfAvailable?: boolean }): Promise<void> {
+		resetCapabilities();
+		if (!this.#reloadSshTool) return;
+		const previousSshTool = this.#toolRegistry.get("ssh");
+		const previousActiveToolNames = this.getActiveToolNames();
+		const hadSshTool = previousSshTool !== undefined;
+		const wasActive = previousActiveToolNames.includes("ssh");
+		const previousHostNames =
+			previousSshTool && "hostNames" in previousSshTool && Array.isArray(previousSshTool.hostNames)
+				? [...previousSshTool.hostNames]
+				: [];
+		const candidateHostNames = new Set(previousHostNames);
+		const capability = await loadCapability<{ name: string }>("ssh", { cwd: this.sessionManager.getCwd() });
+		for (const host of capability.items) {
+			if (typeof host?.name === "string") {
+				candidateHostNames.add(host.name);
+			}
+		}
+		await invalidateHostMetadata(candidateHostNames);
+		const sshAllowed = this.#requestedToolNames === undefined || this.#requestedToolNames.has("ssh");
+		const refreshedTool = await this.#reloadSshTool();
+		if (refreshedTool) {
+			this.#toolRegistry.set(refreshedTool.name, refreshedTool);
+		} else {
+			this.#toolRegistry.delete("ssh");
+			this.#selectedDiscoveredToolNames.delete("ssh");
+		}
+
+		const nextActive = previousActiveToolNames.filter(name => name !== "ssh" && this.#toolRegistry.has(name));
+		if (refreshedTool && sshAllowed && (wasActive || (options?.activateIfAvailable && !hadSshTool))) {
+			nextActive.push(refreshedTool.name);
+		}
+		await this.#applyActiveToolsByName(nextActive);
 	}
 
 	/**
@@ -3284,6 +3678,18 @@ export class AgentSession {
 		}
 	}
 
+	getGoalModeState(): GoalModeState | undefined {
+		return this.#goalModeState;
+	}
+
+	setGoalModeState(state: GoalModeState | undefined): void {
+		this.#goalModeState = state;
+	}
+
+	get goalRuntime(): GoalRuntime {
+		return this.#goalRuntime;
+	}
+
 	markPlanReferenceSent(): void {
 		this.#planReferenceSent = true;
 	}
@@ -3330,6 +3736,21 @@ export class AgentSession {
 				content: message.content,
 				display: message.display,
 				details: message.details,
+			},
+			options ? { deliverAs: options.deliverAs } : undefined,
+		);
+	}
+
+	async sendGoalModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void> {
+		const message = this.#buildGoalModeMessage();
+		if (!message) return;
+		await this.sendCustomMessage(
+			{
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+				attribution: message.attribution,
 			},
 			options ? { deliverAs: options.deliverAs } : undefined,
 		);
@@ -3437,6 +3858,19 @@ export class AgentSession {
 		return {
 			role: "custom",
 			customType: "plan-mode-context",
+			content,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+	}
+
+	#buildGoalModeMessage(): CustomMessage | null {
+		const content = this.#goalRuntime.buildActivePrompt();
+		if (!content) return null;
+		return {
+			role: "custom",
+			customType: "goal-mode-context",
 			content,
 			display: false,
 			attribution: "agent",
@@ -3618,6 +4052,10 @@ export class AgentSession {
 			const planModeMessage = await this.#buildPlanModeMessage();
 			if (planModeMessage) {
 				messages.push(planModeMessage);
+			}
+			const goalModeMessage = this.#buildGoalModeMessage();
+			if (goalModeMessage) {
+				messages.push(goalModeMessage);
 			}
 			if (options?.prependMessages) {
 				messages.push(...options.prependMessages);
@@ -4014,7 +4452,7 @@ export class AgentSession {
 	 *
 	 * Handles three cases:
 	 * - Streaming: queue as steer/follow-up or store for next turn
-	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
+	 * - Not streaming + triggerTurn: appends to state/session, starts new turn unless the client cannot own it
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 */
 	async sendCustomMessage<T = unknown>(
@@ -4046,6 +4484,10 @@ export class AgentSession {
 
 		if (options?.deliverAs === "nextTurn") {
 			if (options?.triggerTurn) {
+				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+					this.#queueHiddenNextTurnMessage(appMessage, false);
+					return;
+				}
 				await this.agent.prompt(appMessage);
 				return;
 			}
@@ -4061,6 +4503,10 @@ export class AgentSession {
 		}
 
 		if (options?.triggerTurn) {
+			if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+				this.#queueHiddenNextTurnMessage(appMessage, false);
+				return;
+			}
 			await this.agent.prompt(appMessage);
 			return;
 		}
@@ -4274,7 +4720,7 @@ export class AgentSession {
 	/**
 	 * Abort current operation and wait for agent to become idle.
 	 */
-	async abort(): Promise<void> {
+	async abort(options?: { goalReason?: "interrupted" | "internal" }): Promise<void> {
 		this.abortRetry();
 		this.#promptGeneration++;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -4287,6 +4733,7 @@ export class AgentSession {
 		this.agent.abort();
 		await postPromptDrain;
 		await this.agent.waitForIdle();
+		await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
 		// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 		// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
 		// a subsequent prompt() can incorrectly observe the session as busy after an abort.
@@ -4891,6 +5338,7 @@ export class AgentSession {
 							promptOverride: compactionPrep.hookPrompt,
 							extraContext: compactionPrep.hookContext,
 							remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+							convertToLlm,
 						},
 					);
 					summary = result.summary;
@@ -5027,16 +5475,13 @@ export class AgentSession {
 	}
 
 	/**
-	 * Generate a handoff document by asking the agent, then start a new session with it.
-	 *
-	 * This prompts the current agent to write a comprehensive handoff document,
-	 * waits for completion, then starts a fresh session with the handoff as context.
+	 * Generate a handoff document with a oneshot LLM call, then start a new session with it.
 	 *
 	 * @param customInstructions Optional focus for the handoff document
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	async handoff(customInstructions?: string, options?: HandoffOptions): Promise<HandoffResult | undefined> {
+	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
 		const entries = this.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -5050,10 +5495,6 @@ export class AgentSession {
 		const handoffAbortController = this.#handoffAbortController;
 		const handoffSignal = handoffAbortController.signal;
 		const sourceSignal = options?.signal;
-		const onHandoffAbort = () => {
-			this.agent.abort();
-		};
-		handoffSignal.addEventListener("abort", onHandoffAbort, { once: true });
 		const onSourceAbort = () => {
 			if (!handoffSignal.aborted) {
 				handoffAbortController.abort();
@@ -5066,71 +5507,37 @@ export class AgentSession {
 			}
 		}
 
-		// Build the handoff prompt
-		const handoffPrompt = prompt.render(handoffDocumentPrompt, {
-			additionalFocus: customInstructions,
-		});
-
-		// Create a promise that resolves when the agent completes
-		let handoffText: string | undefined;
-		const { promise: completionPromise, resolve: resolveCompletion } = Promise.withResolvers<void>();
-		let handoffCancelled = false;
-		let unsubscribe: (() => void) | undefined;
-		const onCompletionAbort = () => {
-			unsubscribe?.();
-			handoffCancelled = true;
-			resolveCompletion();
-		};
-		if (handoffSignal.aborted) {
-			onCompletionAbort();
-		} else {
-			handoffSignal.addEventListener("abort", onCompletionAbort, { once: true });
-		}
-		unsubscribe = this.subscribe(event => {
-			if (event.type === "agent_end") {
-				unsubscribe?.();
-				handoffSignal.removeEventListener("abort", onCompletionAbort);
-				// Extract text from the last assistant message
-				const messages = this.agent.state.messages;
-				for (let i = messages.length - 1; i >= 0; i--) {
-					const msg = messages[i];
-					if (msg.role === "assistant") {
-						const content = (msg as AssistantMessage).content;
-						const textParts = content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
-							.map(c => c.text);
-						if (textParts.length > 0) {
-							handoffText = textParts.join("\n");
-							break;
-						}
-					}
-				}
-				resolveCompletion();
-			}
-		});
-
 		try {
-			// Send the prompt and wait for completion
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
 			}
-			this.#beginInFlight();
-			try {
-				this.agent.setSystemPrompt(this.#baseSystemPrompt);
-				await this.#promptAgentWithIdleRetry([
-					{
-						role: "developer",
-						content: [{ type: "text", text: handoffPrompt }],
-						attribution: "agent",
-						timestamp: Date.now(),
-					},
-				]);
-			} finally {
-				this.#endInFlight();
-			}
-			await completionPromise;
 
-			if (handoffCancelled || handoffSignal.aborted) {
+			const model = this.model;
+			if (!model) {
+				throw new Error("No model selected for handoff");
+			}
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			if (!apiKey) {
+				throw new Error(`No API key for ${model.provider}`);
+			}
+
+			const handoffText = await generateHandoff(
+				this.agent.state.messages,
+				model,
+				apiKey,
+				{
+					systemPrompt: this.#baseSystemPrompt,
+					tools: this.agent.state.tools,
+					customInstructions,
+					convertToLlm,
+					initiatorOverride: "agent",
+					metadata: this.agent.metadataForProvider(model.provider),
+					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
+				},
+				handoffSignal,
+			);
+
+			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
 			}
 			if (!handoffText) {
@@ -5153,15 +5560,14 @@ export class AgentSession {
 			this.#todoReminderCount = 0;
 
 			// Inject the handoff document as a custom message
-			const handoffContent = `<handoff-context>\n${handoffText}\n</handoff-context>\n\nThe above is a handoff document from a previous session. Use this context to continue the work seamlessly.`;
+			const handoffContent = createHandoffContext(handoffText);
 			this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
 			await this.sessionManager.ensureOnDisk();
 			let savedPath: string | undefined;
 			if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
 				const artifactsDir = this.sessionManager.getArtifactsDir();
 				if (artifactsDir) {
-					const fileTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
-					const handoffFilePath = path.join(artifactsDir, `handoff-${fileTimestamp}.md`);
+					const handoffFilePath = path.join(artifactsDir, createHandoffFileName());
 					try {
 						await Bun.write(handoffFilePath, `${handoffText}\n`);
 						savedPath = handoffFilePath;
@@ -5182,10 +5588,12 @@ export class AgentSession {
 			this.#syncTodoPhasesFromBranch();
 
 			return { document: handoffText, savedPath };
+		} catch (error) {
+			if (handoffSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
+				throw new Error("Handoff cancelled");
+			}
+			throw error;
 		} finally {
-			unsubscribe?.();
-			handoffSignal.removeEventListener("abort", onCompletionAbort);
-			handoffSignal.removeEventListener("abort", onHandoffAbort);
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
 		}
@@ -5837,6 +6245,7 @@ export class AgentSession {
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 
 		for (const candidate of candidates) {
 			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
@@ -5846,6 +6255,8 @@ export class AgentSession {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
 					metadata: this.agent.metadataForProvider(candidate.provider),
+					convertToLlm,
+					telemetry,
 				});
 			} catch (error) {
 				if (!this.#isCompactionAuthFailure(error)) {
@@ -6082,6 +6493,7 @@ export class AgentSession {
 			} else {
 				const candidates = this.#getCompactionModelCandidates(availableModels);
 				const retrySettings = this.settings.getGroup("retry");
+				const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 				let compactResult: CompactionResult | undefined;
 				let lastError: unknown;
 
@@ -6098,6 +6510,8 @@ export class AgentSession {
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
 								metadata: this.agent.metadataForProvider(candidate.provider),
 								initiatorOverride: "agent",
+								convertToLlm,
+								telemetry,
 							});
 							break;
 						} catch (error) {
@@ -7731,6 +8145,8 @@ export class AgentSession {
 				customInstructions: options.customInstructions,
 				reserveTokens: branchSummarySettings.reserveTokens,
 				metadata: this.agent.metadataForProvider(model.provider),
+				convertToLlm,
+				telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
 			});
 			this.#branchSummaryAbortController = undefined;
 			if (result.aborted) {
@@ -7966,11 +8382,12 @@ export class AgentSession {
 		};
 	}
 
-	async fetchUsageReports(): Promise<UsageReport[] | null> {
+	async fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null> {
 		const authStorage = this.#modelRegistry.authStorage;
 		if (!authStorage.fetchUsageReports) return null;
 		return authStorage.fetchUsageReports({
 			baseUrlResolver: provider => this.#modelRegistry.getProviderBaseUrl?.(provider),
+			signal,
 		});
 	}
 

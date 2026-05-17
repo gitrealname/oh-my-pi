@@ -1,7 +1,6 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { StringEnum } from "@oh-my-pi/pi-ai";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
@@ -18,62 +17,41 @@ export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 
 const DEFAULT_TAB_NAME = "main";
 
-const appSchema = Type.Object({
-	path: Type.Optional(
-		Type.String({
-			description: "absolute path to a binary to spawn (single-instance reuse)",
-			examples: ["/Applications/Cursor.app/Contents/MacOS/Cursor"],
-		}),
-	),
-	cdp_url: Type.Optional(
-		Type.String({
-			description: "existing CDP endpoint to connect to (e.g. http://127.0.0.1:9222)",
-		}),
-	),
-	args: Type.Optional(Type.Array(Type.String(), { description: "extra CLI args when spawning" })),
-	target: Type.Optional(Type.String({ description: "substring matched against url+title to pick a BrowserWindow" })),
+const appSchema = z.object({
+	path: z.string().describe("binary path to spawn").optional(),
+	cdp_url: z.string().describe("existing cdp endpoint").optional(),
+	args: z.array(z.string()).describe("extra cli args").optional(),
+	target: z.string().describe("substring to pick a window").optional(),
 });
 
-const browserSchema = Type.Object({
-	action: StringEnum(["open", "close", "run"], { description: "tab/browser operation" }),
-	name: Type.Optional(
-		Type.String({
-			description: "tab id; default 'main'. Multiple tabs can coexist; reusable across run() calls and subagents.",
-			examples: ["main", "docs", "gh"],
-		}),
-	),
-	url: Type.Optional(Type.String({ description: "open: navigate after acquiring tab" })),
-	app: Type.Optional(appSchema),
-	viewport: Type.Optional(
-		Type.Object({
-			width: Type.Number(),
-			height: Type.Number(),
-			scale: Type.Optional(Type.Number()),
-		}),
-	),
-	wait_until: Type.Optional(
-		StringEnum(["load", "domcontentloaded", "networkidle0", "networkidle2"], {
-			description: "navigation wait condition for url",
-		}),
-	),
-	dialogs: Type.Optional(
-		StringEnum(["accept", "dismiss"], {
-			description: "open: auto-handle alert/confirm/beforeunload dialogs (default: leave for caller to handle)",
-		}),
-	),
-	code: Type.Optional(
-		Type.String({
-			description:
-				"run: JS body executed with `page`, `browser`, `tab`, `display`, `assert`, `wait` in scope. Treated as the body of an async function. Use `display(value)` to attach text/JSON/images; the function's return value is JSON-serialized as a final block.",
-		}),
-	),
-	timeout: Type.Optional(Type.Number({ description: "timeout in seconds", default: 30 })),
-	all: Type.Optional(Type.Boolean({ description: "close: close every tab" })),
-	kill: Type.Optional(Type.Boolean({ description: "close: also kill spawned-app browsers (default: leave running)" })),
+const browserSchema = z.object({
+	action: z.enum(["open", "close", "run"] as const).describe("operation"),
+	name: z.string().describe("tab id (default 'main')").optional(),
+	url: z.string().describe("url to open").optional(),
+	app: appSchema.optional(),
+	viewport: z
+		.object({
+			width: z.number(),
+			height: z.number(),
+			scale: z.number().optional(),
+		})
+		.optional(),
+	wait_until: z
+		.enum(["load", "domcontentloaded", "networkidle0", "networkidle2"] as const)
+		.describe("navigation wait condition")
+		.optional(),
+	dialogs: z
+		.enum(["accept", "dismiss"] as const)
+		.describe("auto-handle dialogs")
+		.optional(),
+	code: z.string().describe("js body to run in tab").optional(),
+	timeout: z.number().default(30).describe("timeout in seconds").optional(),
+	all: z.boolean().describe("close every tab").optional(),
+	kill: z.boolean().describe("also kill spawned-app browsers").optional(),
 });
 
 /** Input schema for the browser tool. */
-export type BrowserParams = Static<typeof browserSchema>;
+export type BrowserParams = z.infer<typeof browserSchema>;
 
 /** Details describing a browser tool execution result (for renderers + transcript). */
 export interface BrowserToolDetails {

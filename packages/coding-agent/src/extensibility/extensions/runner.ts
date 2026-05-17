@@ -199,7 +199,6 @@ export class ExtensionRunner {
 	getTaskDepth(): number {
 		return this.#taskDepth;
 	}
-
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}

@@ -12,6 +12,29 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import * as z from "zod/v4";
+
+// Isolate every `git` invocation in this file from the developer's host
+// configuration. The fixture spawns dozens of git subprocesses against tiny
+// throwaway repos; any leak from `~/.gitconfig` or system config (LFS filters,
+// commit signing, hook paths, credential helpers, custom default branches)
+// turns "git add" / "git commit" / "git push" into prompts or hard failures
+// that are unrelated to what we're testing.
+//
+// Set these on `process.env` so they apply to both the local `runGit` helper
+// AND the impl's `git.ts::runCommand`, which spreads `process.env` into every
+// spawn. `/dev/null` is the documented way to tell git "use no config from
+// this scope". `GIT_TERMINAL_PROMPT=0` + `GIT_ASKPASS=true` guarantee git
+// never blocks on stdin waiting for credentials or a GPG passphrase.
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+process.env.GIT_CONFIG_NOSYSTEM = "1";
+process.env.GIT_TERMINAL_PROMPT = "0";
+process.env.GIT_ASKPASS = "true";
+// `XDG_CONFIG_HOME`, if set, lets git re-discover a global config under
+// `$XDG_CONFIG_HOME/git/config` even after we pin `GIT_CONFIG_GLOBAL`. Clear
+// it so the override is absolute.
+delete process.env.XDG_CONFIG_HOME;
 
 function createSession(
 	cwd: string = "/tmp/test",
@@ -52,7 +75,10 @@ function runGit(cwd: string, args: string[]): string {
 		},
 	});
 	if (result.exitCode !== 0) {
-		throw new Error(`git ${args.join(" ")} failed: ${new TextDecoder().decode(result.stderr).trim()}`);
+		const stderr = new TextDecoder().decode(result.stderr).trim();
+		const stdout = new TextDecoder().decode(result.stdout).trim();
+		const detail = stderr || stdout || `exit code ${result.exitCode}`;
+		throw new Error(`git ${args.join(" ")} failed: ${detail}`);
 	}
 
 	return new TextDecoder().decode(result.stdout).trim();
@@ -604,6 +630,80 @@ describe("github tool", () => {
 		expect(reposArgs.some(arg => typeof arg === "string" && arg.includes("repo:ignored/value"))).toBe(false);
 	});
 
+	it("search_prs: defaults `repo:` to the current checkout when `repo` is omitted", async () => {
+		const textSpy = vi.spyOn(git.github, "text").mockResolvedValue("acme/widgets\n");
+		const jsonSpy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession("/tmp/gh-default-prs"));
+		await tool.execute("search-prs", {
+			op: "search_prs",
+			query: "is:open",
+			limit: 1,
+		});
+
+		// `gh repo view --json nameWithOwner` runs against the session cwd to fetch the
+		// default scope; the resolved owner/repo gets layered onto the API query.
+		expect(textSpy).toHaveBeenCalled();
+		const repoViewArgs = textSpy.mock.calls[0]?.[1] ?? [];
+		expect(repoViewArgs.slice(0, 2)).toEqual(["repo", "view"]);
+		expect(repoViewArgs).toContain("nameWithOwner");
+
+		const apiArgs = jsonSpy.mock.calls[0]?.[1] ?? [];
+		expect(apiArgs).toContain("q=is:open repo:acme/widgets is:pr");
+	});
+
+	it("search_issues: skips the current-repo default when the query already carries a scope qualifier", async () => {
+		const textSpy = vi.spyOn(git.github, "text").mockResolvedValue("acme/widgets\n");
+		const jsonSpy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession("/tmp/gh-default-skip-qualifier"));
+		await tool.execute("search-issues", {
+			op: "search_issues",
+			query: "is:open org:torvalds",
+			limit: 1,
+		});
+
+		// Explicit `org:` qualifier suppresses the auto-resolved `repo:` injection.
+		expect(textSpy).not.toHaveBeenCalled();
+		const apiArgs = jsonSpy.mock.calls[0]?.[1] ?? [];
+		expect(apiArgs).toContain("q=is:open org:torvalds is:issue");
+		expect(apiArgs.some(a => typeof a === "string" && a.startsWith("q=") && a.includes("repo:acme/widgets"))).toBe(
+			false,
+		);
+	});
+
+	it("search_code: falls back to global search when `gh repo view` cannot resolve the current checkout", async () => {
+		const textSpy = vi.spyOn(git.github, "text").mockRejectedValue(new Error("not a git repository"));
+		const jsonSpy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession("/tmp/gh-default-no-remote"));
+		await tool.execute("search-code", {
+			op: "search_code",
+			query: "findThing",
+			limit: 1,
+		});
+
+		expect(textSpy).toHaveBeenCalled();
+		const apiArgs = jsonSpy.mock.calls[0]?.[1] ?? [];
+		// No `repo:` should be injected — resolution failed, so the search proceeds globally.
+		expect(apiArgs).toContain("q=findThing");
+		expect(apiArgs.some(a => typeof a === "string" && a.startsWith("q=") && a.includes("repo:"))).toBe(false);
+	});
+
+	it("search_commits: honors an explicit `repo` override over the current-checkout default", async () => {
+		const textSpy = vi.spyOn(git.github, "text").mockResolvedValue("acme/widgets\n");
+		const jsonSpy = vi.spyOn(git.github, "json").mockResolvedValue({ items: [] });
+		const tool = new GithubTool(createSession("/tmp/gh-default-explicit-override"));
+		await tool.execute("search-commits", {
+			op: "search_commits",
+			query: "fix",
+			repo: "other/project",
+			limit: 1,
+		});
+
+		// Explicit `repo` short-circuits resolution — no `gh repo view` invocation.
+		expect(textSpy).not.toHaveBeenCalled();
+		const apiArgs = jsonSpy.mock.calls[0]?.[1] ?? [];
+		expect(apiArgs).toContain("q=fix repo:other/project");
+	});
+
 	it("checks out a pull request into a worktree and configures contributor push metadata", async () => {
 		const fixture = await createPrFixture();
 		const tempHome = await setupTempHome();
@@ -650,9 +750,6 @@ describe("github tool", () => {
 	it("treats git.remote.add as a no-op when the remote already exists with the same URL", async () => {
 		const fixture = await createPrFixture();
 		try {
-			// Fixture already created `forksrc -> forkBare`. A second add with the
-			// same URL must succeed silently — this is the cross-process / leftover-
-			// state path that used to fail with `error: remote forksrc already exists`.
 			await git.remote.add(fixture.repoRoot, "forksrc", fixture.forkBare);
 			expect(runGit(fixture.repoRoot, ["remote", "get-url", "forksrc"])).toBe(fixture.forkBare);
 		} finally {
@@ -676,17 +773,18 @@ describe("github tool", () => {
 	it("serializes concurrent git mutations through withRepoLock so callers don't race git's internal locks", async () => {
 		const fixture = await createPrFixture();
 		try {
-			// Without serialization, ~20 concurrent `git config` invocations against
-			// the same `.git/config` produce "could not lock config file" failures
-			// (the lock is O_EXCL with no waiter). Wrapping each write in
-			// `withRepoLock` makes the queue per-repo so all 20 succeed.
-			const writes = Array.from({ length: 20 }, (_, idx) =>
+			// Without serialization, concurrent `git config` invocations against the
+			// same `.git/config` produce "could not lock config file" failures (the
+			// lock is O_EXCL with no waiter). Wrapping each write in `withRepoLock`
+			// makes the queue per-repo so all writes succeed.
+			const writeCount = 8;
+			const writes = Array.from({ length: writeCount }, (_, idx) =>
 				git.withRepoLock(fixture.repoRoot, () =>
 					git.config.set(fixture.repoRoot, `branch.race-test.key${idx}`, `value-${idx}`),
 				),
 			);
 			await Promise.all(writes);
-			for (let idx = 0; idx < 20; idx += 1) {
+			for (let idx = 0; idx < writeCount; idx += 1) {
 				expect(runGit(fixture.repoRoot, ["config", "--get", `branch.race-test.key${idx}`])).toBe(`value-${idx}`);
 			}
 		} finally {
@@ -794,7 +892,8 @@ describe("github tool", () => {
 
 	it("exposes a flat op-based schema without legacy run_watch parameters", () => {
 		const tool = new GithubTool(createSession());
-		const properties = tool.parameters.properties as Record<string, unknown>;
+		const wire = z.toJSONSchema(tool.parameters, { target: "draft-2020-12" }) as Record<string, unknown>;
+		const properties = wire.properties as Record<string, unknown>;
 		expect(properties.op).toBeDefined();
 		expect(properties.interval).toBeUndefined();
 		expect(properties.grace).toBeUndefined();

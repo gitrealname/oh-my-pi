@@ -8,7 +8,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, AgentBusyError, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, getBundledModel, type Message, type ToolCall } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -18,11 +20,10 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
-import { Type } from "@sinclair/typebox";
+import * as z from "zod/v4";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
-class MockAssistantStream extends AssistantMessageEventStream {}
 
 describe("AgentSession concurrent prompt guard", () => {
 	let session: AgentSession;
@@ -45,6 +46,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			fs.rmSync(tempDir, { recursive: true });
 		}
 		vi.restoreAllMocks();
+		AsyncJobManager.resetForTests();
 	});
 
 	async function createSession() {
@@ -61,17 +63,18 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			streamFn: (_model, _context, options) => {
 				abortSignal = options?.signal;
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
-					const checkAbort = () => {
-						if (abortSignal?.aborted) {
-							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
-						} else {
-							setTimeout(checkAbort, 5);
-						}
-					};
-					checkAbort();
+					if (abortSignal) {
+						abortSignal.addEventListener(
+							"abort",
+							() => {
+								stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+							},
+							{ once: true },
+						);
+					}
 				});
 				return stream;
 			},
@@ -110,11 +113,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Start first prompt (don't await, it will block until abort)
 		const firstPrompt = session.prompt("First message");
 
-		// Wait a tick for isStreaming to be set
-		await Bun.sleep(10);
-
-		// Verify we're streaming
-		expect(session.isStreaming).toBe(true);
+		await waitFor(() => session.isStreaming);
 
 		// Second prompt should reject
 		await expect(session.prompt("Second message")).rejects.toBeInstanceOf(AgentBusyError);
@@ -129,7 +128,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt
 		const firstPrompt = session.prompt("First message");
-		await Bun.sleep(10);
+		await waitFor(() => session.isStreaming);
 
 		// steer should work while streaming
 		expect(() => session.steer("Steering message")).not.toThrow();
@@ -145,7 +144,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt
 		const firstPrompt = session.prompt("First message");
-		await Bun.sleep(10);
+		await waitFor(() => session.isStreaming);
 
 		// followUp should work while streaming
 		expect(() => session.followUp("Follow-up message")).not.toThrow();
@@ -158,7 +157,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		let firstStream: MockAssistantStream | undefined;
+		let firstStream: AssistantMessageEventStream | undefined;
 		const callMessages: Message[][] = [];
 
 		const agent = new Agent({
@@ -171,7 +170,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			convertToLlm,
 			streamFn: (_model, context) => {
 				callMessages.push([...context.messages]);
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
 					if (callMessages.length > 1) {
@@ -235,6 +234,7 @@ describe("AgentSession concurrent prompt guard", () => {
 	it("should allow prompt() after previous completes", async () => {
 		// Create session with a stream that completes immediately
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: {
@@ -242,14 +242,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				systemPrompt: ["Test"],
 				tools: [],
 			},
-			streamFn: () => {
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					stream.push({ type: "start", partial: createAssistantMessage("") });
-					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
-				});
-				return stream;
-			},
+			streamFn: mock.stream,
 		});
 
 		const sessionManager = SessionManager.inMemory();
@@ -275,6 +268,278 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Second prompt should work
 		await expect(session.prompt("Second message")).resolves.toBeUndefined();
 	});
+
+	// Regression: a subscriber that fires the next prompt synchronously from the
+	// agent_end listener (the shape every wire transport ends up in — rpc-mode
+	// stdout subscriber, ACP bridge, Cursor exec) must not collide with the
+	// outgoing turn's still-unwinding in-flight bookkeeping. Before the wire-level
+	// agent_end was deferred until #promptInFlightCount drops to 0, the
+	// subscriber observed agent_end while Session.isStreaming was still true (the
+	// agent's own `isStreaming` had flipped, but #promptWithMessage's finally had
+	// not yet decremented the prompt-in-flight counter), and the next prompt
+	// threw AgentBusyError. Surfaced as `RpcCommandError: prompt: Agent is
+	// already processing` from omp-rpc clients (robomp triage reminder path).
+	it("subscriber may prompt() synchronously from agent_end without AgentBusyError", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+
+		const observedIsStreamingAtAgentEnd: boolean[] = [];
+		const reentrantPromptResults: Array<"resolved" | { error: string }> = [];
+		let reentrantPrompted = false;
+
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			observedIsStreamingAtAgentEnd.push(session.isStreaming);
+			if (reentrantPrompted) return;
+			reentrantPrompted = true;
+			void session
+				.prompt("Second message")
+				.then(() => reentrantPromptResults.push("resolved"))
+				.catch((err: Error) => reentrantPromptResults.push({ error: err.message }));
+		});
+
+		await session.prompt("First message");
+		await waitFor(() => reentrantPromptResults.length > 0, 2000);
+		await session.waitForIdle();
+
+		expect(observedIsStreamingAtAgentEnd).not.toContain(true);
+		expect(reentrantPromptResults).toEqual(["resolved"]);
+	});
+
+	it("queues idle ACP client-triggered custom messages instead of starting an ownerless turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-acp-idle.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-acp-idle.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+		});
+		session.setClientBridge({
+			capabilities: {},
+			deferAgentInitiatedTurns: true,
+		});
+
+		await session.prompt("First message");
+		expect(session.isStreaming).toBe(false);
+		const callsAfterFirstPrompt = mock.calls.length;
+
+		await session.sendCustomMessage(
+			{
+				customType: "async-result",
+				content: "Background result",
+				display: true,
+				attribution: "agent",
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+
+		expect(mock.calls).toHaveLength(callsAfterFirstPrompt);
+		expect(session.isStreaming).toBe(false);
+
+		await session.prompt("Next user prompt");
+		await session.dispose();
+		session = undefined as unknown as AgentSession;
+		expect(mock.calls).toHaveLength(callsAfterFirstPrompt + 1);
+		expect(
+			mock.calls.at(-1)?.context.messages.some(message => {
+				if (typeof message.content === "string") {
+					return message.content.includes("Background result");
+				}
+
+				return message.content.some(
+					content => content.type === "text" && content.text.includes("Background result"),
+				);
+			}),
+		).toBe(true);
+	});
+
+	it("runs drained ACP async completions as owned follow-up turns despite deferred client turns", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-acp-async.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-acp-async.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		const ownerId = "acp-session-a";
+		const deliveryGate = Promise.withResolvers<void>();
+		let deliveryStarted = false;
+		const asyncJobManager = new AsyncJobManager({
+			maxRunningJobs: 2,
+			retentionMs: 1_000,
+			onJobComplete: async () => {
+				deliveryStarted = true;
+				await deliveryGate.promise;
+				await session.sendCustomMessage(
+					{
+						customType: "async-result",
+						content: "Background result",
+						display: true,
+						attribution: "agent",
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+			},
+		});
+		AsyncJobManager.setInstance(asyncJobManager);
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			agentId: ownerId,
+			ownedAsyncJobManager: asyncJobManager,
+		});
+		session.setClientBridge({
+			capabilities: {},
+			deferAgentInitiatedTurns: true,
+		});
+
+		await session.prompt("First message");
+		expect(session.isStreaming).toBe(false);
+		const callsAfterFirstPrompt = mock.calls.length;
+
+		try {
+			asyncJobManager.register("bash", "owned job", async () => "Background result", {
+				id: "owned-job",
+				ownerId,
+			});
+			await waitFor(() => deliveryStarted);
+
+			const drainedPromise = session.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 });
+			await waitFor(() => asyncJobManager.getDeliveryState({ ownerId }).delivering);
+			deliveryGate.resolve();
+
+			await expect(drainedPromise).resolves.toBe(true);
+			await session.waitForIdle();
+
+			expect(mock.calls).toHaveLength(callsAfterFirstPrompt + 1);
+			expect(
+				mock.calls.at(-1)?.context.messages.some(message => {
+					if (typeof message.content === "string") {
+						return message.content.includes("Background result");
+					}
+
+					return message.content.some(
+						content => content.type === "text" && content.text.includes("Background result"),
+					);
+				}),
+			).toBe(true);
+		} finally {
+			deliveryGate.resolve();
+		}
+	});
+
+	it("scopes ACP async job snapshots and drains to the owning session id", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-acp-scope.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-acp-scope.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const settings = Settings.isolated();
+		const deliveryGate = Promise.withResolvers<void>();
+		const delivered: string[] = [];
+		const started = new Set<string>();
+		const asyncJobManager = new AsyncJobManager({
+			maxRunningJobs: 3,
+			retentionMs: 1_000,
+			onJobComplete: async jobId => {
+				started.add(jobId);
+				if (jobId === "job-a") {
+					await deliveryGate.promise;
+				}
+				delivered.push(jobId);
+			},
+		});
+		AsyncJobManager.setInstance(asyncJobManager);
+
+		const agentA = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+		});
+		const agentB = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+		});
+		const sessionB = new AgentSession({
+			agent: agentB,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			agentId: "acp-session-b",
+		});
+		session = new AgentSession({
+			agent: agentA,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			agentId: "acp-session-a",
+			ownedAsyncJobManager: asyncJobManager,
+		});
+
+		try {
+			asyncJobManager.register("bash", "A", async () => "A", { id: "job-a", ownerId: "acp-session-a" });
+			await waitFor(() => started.has("job-a"));
+			asyncJobManager.register("bash", "B", async () => "B", { id: "job-b", ownerId: "acp-session-b" });
+			await waitFor(() => asyncJobManager.getDeliveryState({ ownerId: "acp-session-b" }).queued > 0);
+
+			expect(sessionB.getAsyncJobSnapshot()?.delivery.pendingJobIds).not.toContain("job-a");
+			await expect(sessionB.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 })).resolves.toBe(true);
+			expect(delivered).toEqual(["job-b"]);
+		} finally {
+			deliveryGate.resolve();
+			await sessionB.dispose();
+		}
+	});
 });
 
 describe("AgentSession TTSR resume gate", () => {
@@ -299,6 +564,15 @@ describe("AgentSession TTSR resume gate", () => {
 		}
 	});
 
+	async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (predicate()) return;
+			await Bun.sleep(10);
+		}
+
+		throw new Error("Timed out waiting for condition");
+	}
 	const testRule: Rule = {
 		name: "no-unwrap",
 		path: "/tmp/no-unwrap.md",
@@ -327,22 +601,20 @@ describe("AgentSession TTSR resume gate", () => {
 		};
 	}
 
-	function pushContinuationStream(stream: MockAssistantStream, onComplete: () => void): void {
-		setTimeout(() => {
+	function pushContinuationStream(stream: AssistantMessageEventStream, onComplete: () => void): void {
+		queueMicrotask(() => {
 			const partial = makeMsg("");
 			stream.push({ type: "start", partial });
-			setTimeout(() => {
-				onComplete();
-				stream.push({
-					type: "done",
-					reason: "stop",
-					message: makeMsg('Fixed: let val = result.expect("msg")'),
-				});
-			}, 80);
-		}, 10);
+			onComplete();
+			stream.push({
+				type: "done",
+				reason: "stop",
+				message: makeMsg('Fixed: let val = result.expect("msg")'),
+			});
+		});
 	}
 
-	function pushAbortableTtsrStream(stream: MockAssistantStream, signal: AbortSignal | undefined): void {
+	function pushAbortableTtsrStream(stream: AssistantMessageEventStream, signal: AbortSignal | undefined): void {
 		queueMicrotask(() => {
 			const partial = makeMsg("");
 			stream.push({ type: "start", partial });
@@ -352,19 +624,19 @@ describe("AgentSession TTSR resume gate", () => {
 				delta: "let val = result.unwrap(",
 				partial: makeMsg("let val = result.unwrap("),
 			});
-			// TTSR abort should fire synchronously; poll for it
-			const checkAbort = () => {
-				if (signal?.aborted) {
-					stream.push({
-						type: "error",
-						reason: "aborted",
-						error: makeMsg("let val = result.unwrap(", "aborted"),
-					});
-				} else {
-					setTimeout(checkAbort, 2);
-				}
-			};
-			checkAbort();
+			if (signal) {
+				signal.addEventListener(
+					"abort",
+					() => {
+						stream.push({
+							type: "error",
+							reason: "aborted",
+							error: makeMsg("let val = result.unwrap(", "aborted"),
+						});
+					},
+					{ once: true },
+				);
+			}
 		});
 	}
 
@@ -387,7 +659,7 @@ describe("AgentSession TTSR resume gate", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
 			streamFn: (_model, _context, options) => {
 				streamCallCount++;
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 				const signal = options?.signal;
 
 				if (streamCallCount === 1) {
@@ -448,7 +720,7 @@ describe("AgentSession TTSR resume gate", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
 			streamFn: (_model, _context, _options) => {
 				streamCallCount++;
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 
 				if (streamCallCount === 1) {
 					// First stream: emit matching text and complete normally
@@ -519,7 +791,7 @@ describe("AgentSession TTSR resume gate", () => {
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
 			streamFn: (_model, _context, options) => {
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 				const signal = options?.signal;
 
 				queueMicrotask(() => {
@@ -531,18 +803,19 @@ describe("AgentSession TTSR resume gate", () => {
 						delta: "result.unwrap(",
 						partial: makeMsg("result.unwrap("),
 					});
-					const checkAbort = () => {
-						if (signal?.aborted) {
-							stream.push({
-								type: "error",
-								reason: "aborted",
-								error: makeMsg("result.unwrap(", "aborted"),
-							});
-						} else {
-							setTimeout(checkAbort, 2);
-						}
-					};
-					checkAbort();
+					if (signal) {
+						signal.addEventListener(
+							"abort",
+							() => {
+								stream.push({
+									type: "error",
+									reason: "aborted",
+									error: makeMsg("result.unwrap(", "aborted"),
+								});
+							},
+							{ once: true },
+						);
+					}
 				});
 
 				return stream;
@@ -566,9 +839,7 @@ describe("AgentSession TTSR resume gate", () => {
 
 		// Start prompt (will trigger TTSR and create resume gate)
 		const promptPromise = session.prompt("Write some Rust code");
-
-		// Wait for TTSR abort to be pending
-		await Bun.sleep(20);
+		await waitFor(() => session.isStreaming);
 
 		// Abort session — prompt() should unblock
 		await session.abort();
@@ -596,9 +867,8 @@ describe("AgentSession TTSR resume gate", () => {
 			name: "mock_edit",
 			label: "Mock Edit",
 			description: "A mock edit tool",
-			parameters: Type.Object({}),
+			parameters: z.object({}),
 			execute: async () => {
-				await Bun.sleep(100);
 				toolExecutionFinished = true;
 				return { content: [{ type: "text" as const, text: "edit applied" }] };
 			},
@@ -636,7 +906,7 @@ describe("AgentSession TTSR resume gate", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
 			streamFn: (_model, _context, options) => {
 				streamCallCount++;
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 				const signal = options?.signal;
 
 				if (streamCallCount === 1) {
@@ -644,19 +914,19 @@ describe("AgentSession TTSR resume gate", () => {
 					pushAbortableTtsrStream(stream, signal);
 				} else if (streamCallCount === 2) {
 					// Continuation: return assistant message with a tool call
-					setTimeout(() => {
+					queueMicrotask(() => {
 						const msg = makeToolCallMsg();
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "done", reason: "toolUse", message: msg });
-					}, 10);
+					});
 				} else {
 					// After tool execution: return final response
-					setTimeout(() => {
+					queueMicrotask(() => {
 						allTurnsCompleted = true;
 						const msg = makeMsg('Fixed: let val = result.expect("msg")');
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "done", reason: "stop", message: msg });
-					}, 10);
+					});
 				}
 
 				return stream;
@@ -689,6 +959,255 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(streamCallCount).toBeGreaterThanOrEqual(3);
 		expect(session.isStreaming).toBe(false);
 	});
+	it("interruptMode never folds tool-match reminder into the toolResult instead of driving an extra turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		let toolExecuted = false;
+
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string().optional() }),
+			execute: async () => {
+				toolExecuted = true;
+				return { content: [{ type: "text" as const, text: "edit applied" }] };
+			},
+		};
+
+		const toolCallContent: ToolCall = {
+			type: "toolCall",
+			id: "call_never_001",
+			name: "mock_edit",
+			arguments: { snippet: "let val = result.unwrap()" },
+		};
+
+		const makeToolCallMsg = (): AssistantMessage => ({
+			role: "assistant",
+			content: [toolCallContent],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) {
+					// Emit a tool call whose argument delta matches the TTSR rule.
+					queueMicrotask(() => {
+						const partial = makeToolCallMsg();
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: 0,
+							delta: 'let val = result.unwrap("oops")',
+							partial,
+						});
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: toolCallContent, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					});
+				} else {
+					// Continuation after tool result; finish cleanly.
+					queueMicrotask(() => {
+						const done = makeMsg("ok");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					});
+				}
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-never-tool.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			ttsrManager,
+		});
+
+		await session.prompt("Write some Rust code");
+
+		// Tool ran (no interrupt) and the loop didn't spawn an extra follow-up turn for injection.
+		expect(toolExecuted).toBe(true);
+		expect(streamCallCount).toBe(2);
+
+		// The matched tool's result must carry the in-band reminder.
+		const toolResult = agent.state.messages.find(
+			(m): m is Extract<typeof m, { role: "toolResult" }> =>
+				m.role === "toolResult" && m.toolCallId === toolCallContent.id,
+		);
+		expect(toolResult).toBeDefined();
+		const text = Array.isArray(toolResult?.content)
+			? toolResult.content
+					.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					.map(c => c.text)
+					.join("\n")
+			: "";
+		expect(text).toContain("<system-reminder");
+		expect(text).toContain('rule="no-unwrap"');
+		expect(text).toContain("Do not use .unwrap()");
+		expect(text.indexOf("<system-reminder")).toBeLessThan(text.indexOf("edit applied"));
+	});
+
+	it("interruptMode never deduplicates the reminder across sibling tool calls in one batch", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		let executedCount = 0;
+
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string().optional() }),
+			execute: async () => {
+				executedCount++;
+				return { content: [{ type: "text" as const, text: "edit applied" }] };
+			},
+		};
+
+		const toolCallA: ToolCall = {
+			type: "toolCall",
+			id: "call_dup_A",
+			name: "mock_edit",
+			arguments: { snippet: "a.unwrap()" },
+		};
+		const toolCallB: ToolCall = {
+			type: "toolCall",
+			id: "call_dup_B",
+			name: "mock_edit",
+			arguments: { snippet: "b.unwrap()" },
+		};
+		const toolCallC: ToolCall = {
+			type: "toolCall",
+			id: "call_dup_C",
+			name: "mock_edit",
+			arguments: { snippet: "c.unwrap()" },
+		};
+
+		const makeBatchMsg = (): AssistantMessage => ({
+			role: "assistant",
+			content: [toolCallA, toolCallB, toolCallC],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) {
+					queueMicrotask(() => {
+						const partial = makeBatchMsg();
+						stream.push({ type: "start", partial });
+						const calls: ToolCall[] = [toolCallA, toolCallB, toolCallC];
+						for (let i = 0; i < calls.length; i++) {
+							const call = calls[i]!;
+							stream.push({ type: "toolcall_start", contentIndex: i, partial });
+							stream.push({
+								type: "toolcall_delta",
+								contentIndex: i,
+								delta: `let val = result.unwrap("oops-${call.id}")`,
+								partial,
+							});
+							stream.push({ type: "toolcall_end", contentIndex: i, toolCall: call, partial });
+						}
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					});
+				} else {
+					queueMicrotask(() => {
+						const done = makeMsg("ok");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					});
+				}
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-dup.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			ttsrManager,
+		});
+
+		await session.prompt("Write some Rust code");
+
+		expect(executedCount).toBe(3);
+		const toolResults = agent.state.messages.filter(
+			(m): m is Extract<typeof m, { role: "toolResult" }> => m.role === "toolResult",
+		);
+		expect(toolResults).toHaveLength(3);
+		const withReminder = toolResults.filter(r =>
+			Array.isArray(r.content)
+				? r.content.some(c => c.type === "text" && c.text.includes("<system-reminder"))
+				: false,
+		);
+		expect(withReminder).toHaveLength(1);
+	});
+
 	it("prompt() waits for context-promotion continuation to finish", async () => {
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-promo.db"));
 		authStorages.push(authStorage);
@@ -746,7 +1265,7 @@ describe("AgentSession TTSR resume gate", () => {
 			initialState: { model: sparkModel, systemPrompt: ["Test"], tools: [] },
 			streamFn: () => {
 				streamCallCount++;
-				const stream = new MockAssistantStream();
+				const stream = new AssistantMessageEventStream();
 				if (streamCallCount === 1) {
 					queueMicrotask(() => {
 						const message = makeOverflowMessage();
@@ -754,12 +1273,12 @@ describe("AgentSession TTSR resume gate", () => {
 						stream.push({ type: "error", reason: "error", error: message });
 					});
 				} else {
-					setTimeout(() => {
+					queueMicrotask(() => {
 						continuationCompleted = true;
 						const message = makeSuccessMessage();
 						stream.push({ type: "start", partial: message });
 						stream.push({ type: "done", reason: "stop", message });
-					}, 80);
+					});
 				}
 				return stream;
 			},

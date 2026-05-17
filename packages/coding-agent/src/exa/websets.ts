@@ -3,7 +3,8 @@
  *
  * CRUD operations for websets, items, searches, enrichments, and monitoring.
  */
-import { type TObject, type TProperties, Type } from "@sinclair/typebox";
+import type { TSchema } from "@oh-my-pi/pi-ai";
+import * as z from "zod/v4";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { callWebsetsTool, findApiKey } from "./mcp-client";
 import type { ExaRenderDetails } from "./types";
@@ -13,9 +14,9 @@ function createWebsetTool(
 	name: string,
 	label: string,
 	description: string,
-	parameters: TObject<TProperties>,
+	parameters: TSchema,
 	mcpToolName: string,
-): CustomTool<any, ExaRenderDetails> {
+): CustomTool<TSchema, ExaRenderDetails> {
 	return {
 		name,
 		label,
@@ -51,9 +52,9 @@ const websetCreateTool = createWebsetTool(
 	"webset_create",
 	"Create Webset",
 	"Create a new webset collection for organizing web content.",
-	Type.Object({
-		name: Type.String({ description: "Name of the webset" }),
-		description: Type.Optional(Type.String({ description: "Optional description" })),
+	z.object({
+		name: z.string().describe("webset name"),
+		description: z.string().describe("description").optional(),
 	}),
 	"create_webset",
 );
@@ -62,7 +63,7 @@ const websetListTool = createWebsetTool(
 	"webset_list",
 	"List Websets",
 	"List all websets in your account.",
-	Type.Object({}),
+	z.object({}),
 	"list_websets",
 );
 
@@ -70,8 +71,8 @@ const websetGetTool = createWebsetTool(
 	"webset_get",
 	"Get Webset",
 	"Get details of a specific webset by ID.",
-	Type.Object({
-		id: Type.String({ description: "Webset ID" }),
+	z.object({
+		id: z.string().describe("webset id"),
 	}),
 	"get_webset",
 );
@@ -80,10 +81,10 @@ const websetUpdateTool = createWebsetTool(
 	"webset_update",
 	"Update Webset",
 	"Update a webset's name or description.",
-	Type.Object({
-		id: Type.String({ description: "Webset ID" }),
-		name: Type.Optional(Type.String({ description: "New name" })),
-		description: Type.Optional(Type.String({ description: "New description" })),
+	z.object({
+		id: z.string().describe("webset id"),
+		name: z.string().describe("new name").optional(),
+		description: z.string().describe("new description").optional(),
 	}),
 	"update_webset",
 );
@@ -92,8 +93,8 @@ const websetDeleteTool = createWebsetTool(
 	"webset_delete",
 	"Delete Webset",
 	"Delete a webset and all its contents.",
-	Type.Object({
-		id: Type.String({ description: "Webset ID" }),
+	z.object({
+		id: z.string().describe("webset id"),
 	}),
 	"delete_webset",
 );
@@ -103,10 +104,10 @@ const websetItemsListTool = createWebsetTool(
 	"webset_items_list",
 	"List Webset Items",
 	"List items in a webset with optional pagination.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		limit: Type.Optional(Type.Number({ description: "Number of items to return" })),
-		offset: Type.Optional(Type.Number({ description: "Pagination offset" })),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		limit: z.number().describe("max items").optional(),
+		offset: z.number().describe("offset").optional(),
 	}),
 	"list_webset_items",
 );
@@ -115,9 +116,9 @@ const websetItemGetTool = createWebsetTool(
 	"webset_item_get",
 	"Get Webset Item",
 	"Get a specific item from a webset.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		item_id: Type.String({ description: "Item ID" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		item_id: z.string().describe("item id"),
 	}),
 	"get_item",
 );
@@ -127,9 +128,9 @@ const websetSearchCreateTool = createWebsetTool(
 	"webset_search_create",
 	"Create Webset Search",
 	"Create a new search within a webset.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		query: Type.String({ description: "Search query" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		query: z.string().describe("search query"),
 	}),
 	"create_search",
 );
@@ -138,9 +139,9 @@ const websetSearchGetTool = createWebsetTool(
 	"webset_search_get",
 	"Get Webset Search",
 	"Get the status and results of a webset search.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		search_id: Type.String({ description: "Search ID" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		search_id: z.string().describe("search id"),
 	}),
 	"get_search",
 );
@@ -149,9 +150,9 @@ const websetSearchCancelTool = createWebsetTool(
 	"webset_search_cancel",
 	"Cancel Webset Search",
 	"Cancel a running webset search.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		search_id: Type.String({ description: "Search ID" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		search_id: z.string().describe("search id"),
 	}),
 	"cancel_search",
 );
@@ -161,10 +162,10 @@ const websetEnrichmentCreateTool = createWebsetTool(
 	"webset_enrichment_create",
 	"Create Enrichment",
 	"Create a new enrichment task for a webset.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		name: Type.String({ description: "Enrichment name" }),
-		prompt: Type.String({ description: "Enrichment prompt" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		name: z.string().describe("enrichment name"),
+		prompt: z.string().describe("enrichment prompt"),
 	}),
 	"create_enrichment",
 );
@@ -173,9 +174,9 @@ const websetEnrichmentGetTool = createWebsetTool(
 	"webset_enrichment_get",
 	"Get Enrichment",
 	"Get the status and results of an enrichment task.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		enrichment_id: Type.String({ description: "Enrichment ID" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		enrichment_id: z.string().describe("enrichment id"),
 	}),
 	"get_enrichment",
 );
@@ -184,11 +185,11 @@ const websetEnrichmentUpdateTool = createWebsetTool(
 	"webset_enrichment_update",
 	"Update Enrichment",
 	"Update an enrichment's name or prompt.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		enrichment_id: Type.String({ description: "Enrichment ID" }),
-		name: Type.Optional(Type.String({ description: "New name" })),
-		prompt: Type.Optional(Type.String({ description: "New prompt" })),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		enrichment_id: z.string().describe("enrichment id"),
+		name: z.string().describe("new name").optional(),
+		prompt: z.string().describe("new prompt").optional(),
 	}),
 	"update_enrichment",
 );
@@ -197,9 +198,9 @@ const websetEnrichmentDeleteTool = createWebsetTool(
 	"webset_enrichment_delete",
 	"Delete Enrichment",
 	"Delete an enrichment task.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		enrichment_id: Type.String({ description: "Enrichment ID" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		enrichment_id: z.string().describe("enrichment id"),
 	}),
 	"delete_enrichment",
 );
@@ -208,9 +209,9 @@ const websetEnrichmentCancelTool = createWebsetTool(
 	"webset_enrichment_cancel",
 	"Cancel Enrichment",
 	"Cancel a running enrichment task.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		enrichment_id: Type.String({ description: "Enrichment ID" }),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		enrichment_id: z.string().describe("enrichment id"),
 	}),
 	"cancel_enrichment",
 );
@@ -220,14 +221,14 @@ const websetMonitorCreateTool = createWebsetTool(
 	"webset_monitor_create",
 	"Create Monitor",
 	"Create a monitoring task for a webset with optional webhook notifications.",
-	Type.Object({
-		webset_id: Type.String({ description: "Webset ID" }),
-		webhook_url: Type.Optional(Type.String({ description: "Webhook URL for notifications" })),
+	z.object({
+		webset_id: z.string().describe("webset id"),
+		webhook_url: z.string().describe("webhook url").optional(),
 	}),
 	"create_monitor",
 );
 
-export const websetsTools: CustomTool<any, ExaRenderDetails>[] = [
+export const websetsTools: CustomTool<TSchema, ExaRenderDetails>[] = [
 	websetCreateTool,
 	websetListTool,
 	websetGetTool,

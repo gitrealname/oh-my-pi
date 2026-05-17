@@ -50,6 +50,7 @@ import {
 } from "../extensibility/plugins/marketplace";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { InteractiveModeContext } from "../modes/types";
+import type { ExtensionContext } from "../extensibility/extensions/types";
 import { getChangelogPath, parseChangelog } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
@@ -117,7 +118,7 @@ async function callLLMForMemory(
 		.join("");
 }
 
-const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<string | undefined> => {
+const mmemoryHandler = async (command: ParsedSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<SlashCommandResult> => {
 	const args = command.args.trim();
 	const [subcommand, ...rest] = args.split(/\s+/);
 	const restStr = rest.join(" ");
@@ -167,7 +168,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 		}
 		case "retain": {
 			runtime.ctx.showStatus("mmemory: retaining session...");
-			const result = await executeManualRetain(runtime.ctx);
+			const result = await executeManualRetain(runtime.ctx as unknown as ExtensionContext);
 			if (result.written) {
 				runtime.ctx.showStatus("mmemory: session retained.");
 			} else {
@@ -178,7 +179,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 		case "view": {
 			// Use the session-start snapshot — same content the agent was injected with.
 			// Falls back to fresh query only if recall hasn't fired yet (server still starting).
-			const snapshot = getMmemorySessionSnippet(runtime.ctx);
+			const snapshot = getMmemorySessionSnippet(runtime.ctx as unknown as ExtensionContext);
 			const snippet = snapshot
 				?? formatRecallForSystemPrompt(
 						await executeMemoryRecall("recent context", undefined, config, runtime.ctx.session.modelRegistry, settings, "session"),
@@ -377,7 +378,7 @@ const mmemoryHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 	}
 };
 
-const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<void> => {
+const mpruneHandler = async (command: ParsedSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<SlashCommandResult> => {
 	const args = command.args.trim();
 	runtime.ctx.editor.setText("");
 
@@ -488,7 +489,7 @@ const mpruneHandler = async (command: ParsedBuiltinSlashCommand, runtime: Builti
 			runtime.ctx.showStatus("Usage: /mprune [flush|stats|status]");
 	}
 };
-const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<void> => {
+const mreviewHandler = async (command: ParsedSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<SlashCommandResult> => {
 	const args = command.args.trim().replace(/^@/, ""); // strip leading @ from @file mentions
 	if (!args) {
 		runtime.ctx.showStatus(`Usage: /${command.name} <file.md>`);
@@ -563,7 +564,6 @@ const mreviewHandler = async (command: ParsedBuiltinSlashCommand, runtime: Built
 		await runtime.ctx.session.agent.prompt(result.feedback.trim());
 	}
 };
-
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "settings",
@@ -580,6 +580,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			await runtime.ctx.handlePlanModeCommand(command.args || undefined);
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "goal",
+		description: "Toggle goal mode (persistent autonomous objective for this session)",
+		subcommands: [
+			{ name: "set", description: "Set or replace the goal", usage: "<objective>" },
+			{ name: "show", description: "Show current goal details" },
+			{ name: "pause", description: "Pause the current goal" },
+			{ name: "resume", description: "Resume a paused goal" },
+			{ name: "drop", description: "Drop the current goal" },
+			{ name: "budget", description: "Adjust the token budget", usage: "<N|off>" },
+		],
+		inlineHint: "[objective]",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -1111,7 +1129,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "mtree",
 		description: "Session tree with Ctrl+↓ peek preview",
-		handle: (_command, runtime) => {
+		handleTui: (_command, runtime) => {
 			(runtime.ctx as unknown as { showMTreeSelector(): void }).showMTreeSelector();
 			runtime.ctx.editor.setText("");
 		},
@@ -2003,6 +2021,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const projectPath = await resolveActiveProjectRegistryPath(runtime.ctx.sessionManager.getCwd());
 			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 			await runtime.ctx.refreshSlashCommandState();
+			await runtime.ctx.session.refreshSshTool({ activateIfAvailable: true });
 			runtime.ctx.showStatus("Plugins reloaded.");
 			runtime.ctx.editor.setText("");
 		},
@@ -2117,7 +2136,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// asyncSubmit: deferred via setImmediate so the session loop has time to
 			// re-register onInputCallback before the wake fires.
 			// Called for master-only results (list, stop) and slave counter=0.
-			(text) => { setImmediate(() => runtime.ctx.scheduleInput(text)); return Promise.resolve(); },
+			(text) => {
+				setImmediate(() => {
+					void runtime.ctx.session.waitForIdle().then(() => {
+						runtime.ctx.editor.onSubmit?.(text);
+					});
+				});
+				return Promise.resolve();
+			},
 			// asyncDisplay: showStatus → "!" panel (user sees it); appendCustomResult →
 			// agent.#state.messages with display:false (LLM sees it when woken, no render).
 			(text) => { runtime.ctx.showStatus(text); appendCustomResult(runtime.ctx.session, "mtuicontrol", text); },
@@ -2128,7 +2154,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			logger.debug("[mtuicontrol] builtin-registry result", { result: (result ?? "").slice(0, 120), len: (result ?? "").length });
 			// Schedule the sync result as input — same path as user hitting Enter.
 			// With reply() paths, result="" and asyncSubmit already fired via setImmediate.
-			runtime.ctx.scheduleInput(result!);
+			setImmediate(() => {
+				void runtime.ctx.session.waitForIdle().then(() => {
+					runtime.ctx.editor.onSubmit?.(result!);
+				});
+			});
 		},
 	},
 
@@ -2138,7 +2168,6 @@ function isCommandEnabled(name: string): boolean {
 	const disabled = settings.get("disabledCommands" as SettingPath) as string[] | undefined;
 	return !disabled?.includes(name);
 }
-
 const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();
 for (const command of BUILTIN_SLASH_COMMAND_REGISTRY) {
 	BUILTIN_SLASH_COMMAND_LOOKUP.set(command.name, command);
@@ -2222,6 +2251,7 @@ export async function executeBuiltinSlashCommand(
 				const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
 				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 				await ctx.refreshSlashCommandState();
+				await ctx.session.refreshSshTool({ activateIfAvailable: true });
 			},
 		};
 		const result = await command.handle(parsed, adapted);

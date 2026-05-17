@@ -44,6 +44,56 @@
 
 ## [14.9.5] - 2026-05-12
 
+## [15.1.0] - 2026-05-15
+
+### Fixed
+
+- Fixed incremental `parseSessionFile(path, fromOffset)` losing the active service tier when resuming past a `service_tier_change` entry, so priority OpenAI replies appended after the offset are now credited with `premiumRequests: 1` (regression introduced by 13f59162e which stopped folding priority-tier into per-message premium counts)
+
+## [15.0.1] - 2026-05-14
+### Breaking Changes
+
+- Raised the minimum required Bun version to >=1.3.14 in package metadata
+
+### Changed
+
+- Changed the "Premium Reqs" dashboard card to also include OpenAI priority service-tier requests (`serviceTier: "priority"`), counting each as 1 premium request alongside GitHub Copilot premium calls. Pre-existing sessions are backfilled on the next `omp stats` run: a one-shot `premium_requests_priority_v1` sentinel wipes `file_offsets` so every session re-parses, and `insertMessageStats` now `UPSERT`s `premium_requests` (other columns untouched) using the `service_tier_change` entries already in the session log to retroactively credit priority traffic.
+
+## [14.9.9] - 2026-05-12
+
+### Added
+
+- Added separate input-token and output-token totals to the overview dashboard cards.
+
+### Fixed
+
+- Fixed `omp stats` in compiled binaries by using the serial sync path instead of spawning a raw file-asset worker that cannot import bundled parser code.
+- Fixed behavior backfills after failed compiled-binary sync attempts by marking the backfill sentinel only after a successful full sync.
+
+## [14.9.7] - 2026-05-12
+### Breaking Changes
+
+- Broke backward compatibility of behavior stats fields by replacing `yellingSentences`/`dramaRuns` with `yelling`/`anguish` and adding `negation`, `repetition`, `blame` in query result types and persisted `user_messages` schema
+
+### Added
+
+- Added `SyncOptions` to `syncAllSessions` with `onProgress` and `workers` to optionally show per-file sync progress and tune parser concurrency
+- Added new frustration behavior metrics (`negation`, `repetition`, `blame`) plus a `frustration` aggregate in behavior charts, model tables, and summary cards
+
+### Changed
+
+- Changed sync ingestion to parse session files through a worker pool while applying parsed results and database writes on the main thread
+- Changed behavior analysis to strip code blocks, XML/URLs, quoted lines, and placeholders before scoring and to suppress signals on long structured messages
+- Changed dashboard metrics labels and totals to the new signal names, including replacing the old three-signal totals with `yelling`, `profanity`, `anguish`, and `frustration`
+- Changed sync output to print a live terminal progress indicator while processing session files
+
+### Fixed
+
+- Fixed user-message attribution so assistant model/provider links are backfilled during incremental sync instead of being left unknown
+- Fixed word-boundary regex handling in profanity detection so matching now works as intended in normal prose
+
+## [14.9.5] - 2026-05-12
+
 ### Added
 
 - Added time range selection options (1h, 24h, 7d, 30d, 90d, All) to the dashboard header and bound them to reloading statistics for the selected window

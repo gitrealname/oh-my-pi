@@ -13,6 +13,7 @@ import {
 	modelsAreEqual,
 } from "@oh-my-pi/pi-ai";
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
+import { logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import { parseThinkingLevel, resolveThinkingLevelForModel } from "../thinking";
@@ -116,12 +117,16 @@ function cloneModelWithRequestedId(model: Model<Api>, requestedId: string): Mode
 	};
 }
 
-const providerModelIndexCache = new WeakMap<readonly Model<Api>[], Map<string, Model<Api> | null>>();
+const kProviderModelIndex = Symbol("model-resolver.providerIndex");
+type ModelsWithProviderIndex = readonly Model<Api>[] & {
+	[kProviderModelIndex]?: Map<string, Model<Api> | null>;
+};
 
 function getProviderModelIndex(availableModels: readonly Model<Api>[]): Map<string, Model<Api> | null> {
-	let index = providerModelIndexCache.get(availableModels);
-	if (index) return index;
-	index = new Map<string, Model<Api> | null>();
+	const tagged = availableModels as ModelsWithProviderIndex;
+	const cached = tagged[kProviderModelIndex];
+	if (cached) return cached;
+	const index = new Map<string, Model<Api> | null>();
 	for (const m of availableModels) {
 		const key = `${m.provider.toLowerCase()}\u0000${m.id.toLowerCase()}`;
 		if (index.has(key)) {
@@ -130,7 +135,7 @@ function getProviderModelIndex(availableModels: readonly Model<Api>[]): Map<stri
 			index.set(key, m);
 		}
 	}
-	providerModelIndexCache.set(availableModels, index);
+	tagged[kProviderModelIndex] = index;
 	return index;
 }
 
@@ -887,7 +892,7 @@ export async function resolveModelScope(
 			});
 
 			if (matchingModels.length === 0) {
-				console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
+				logger.warn(`No models match pattern "${pattern}"`);
 				continue;
 			}
 
@@ -930,11 +935,11 @@ export async function resolveModelScope(
 		);
 
 		if (warning) {
-			console.warn(chalk.yellow(`Warning: ${warning}`));
+			logger.warn(warning);
 		}
 
 		if (!model) {
-			console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
+			logger.warn(`No models match pattern "${pattern}"`);
 			continue;
 		}
 

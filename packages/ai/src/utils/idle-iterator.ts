@@ -214,8 +214,13 @@ export async function* iterateWithIdleTimeout<T>(
 				return;
 			}
 			const item = outcome.result.value;
-			markFirstItemReceived();
+			// Non-progress items (e.g. provider keepalives, synthetic `start` events that
+			// arrive before the model has produced any tokens) MUST NOT flip us out of
+			// `awaitingFirstItem`. Otherwise the next iteration switches from the (longer)
+			// first-item watchdog to the (shorter) idle watchdog while we're still waiting
+			// on the model's first real output.
 			if (isProgressItem(item)) {
+				markFirstItemReceived();
 				lastProgressAt = Date.now();
 			}
 			yield item;

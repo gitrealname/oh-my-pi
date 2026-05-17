@@ -5,9 +5,11 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+import * as z from "zod/v4";
 import { stripHashlinePrefixes } from "../edit";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { InternalUrlRouter } from "../internal-urls";
+import { parseInternalUrl } from "../internal-urls/parse";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
@@ -56,12 +58,12 @@ async function loadFflate(): Promise<typeof import("fflate")> {
 	return fflateModulePromise;
 }
 
-const writeSchema = Type.Object({
-	path: Type.String({ description: "file path", examples: ["src/new.ts"] }),
-	content: Type.String({ description: "file content" }),
+const writeSchema = z.object({
+	path: z.string().describe("file path"),
+	content: z.string().describe("file content"),
 });
 
-export type WriteToolInput = Static<typeof writeSchema>;
+export type WriteToolInput = z.infer<typeof writeSchema>;
 
 /** Details returned by the write tool for TUI rendering */
 export interface WriteToolDetails {
@@ -190,7 +192,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly concurrency = "exclusive";
 	readonly loadMode = "discoverable";
 	readonly summary = "Write content to a file (creates or overwrites)";
-	readonly intent = (args: Partial<WriteToolInput>) => (args.path ? `writing ${args.path}` : "writing");
 
 	readonly #writethrough: WritethroughCallback;
 
@@ -659,6 +660,24 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		return untilAborted(signal, async () => {
 			// Strip hashline display prefixes (LINE+ID|) if the model copied them from read output
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
+			const internalRouter = InternalUrlRouter.instance();
+			if (internalRouter.canHandle(path)) {
+				const parsed = parseInternalUrl(path);
+				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+				const handler = internalRouter.getHandler(scheme);
+				if (handler?.write) {
+					await handler.write(parsed, cleanContent, { cwd: this.session.cwd, signal });
+					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
+					if (stripped) {
+						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
+					}
+					return { content: [{ type: "text", text: resultText }], details: {} };
+				}
+				// Schemes without a `write` hook fall through to existing logic
+				// (local:// resolves to a backing file via plan-mode-guard) or are
+				// rejected downstream when no backing file exists.
+			}
+
 			const conflictUri = parseConflictUri(path);
 			if (conflictUri) {
 				if (conflictUri.scope) {

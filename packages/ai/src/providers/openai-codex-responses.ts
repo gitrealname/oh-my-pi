@@ -1,6 +1,15 @@
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
-import { $env, $flag, asRecord, fetchWithRetry, logger, readSseJson, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	asRecord,
+	extractHttpStatusFromError,
+	fetchWithRetry,
+	logger,
+	readSseJson,
+	structuredCloneJSON,
+} from "@oh-my-pi/pi-utils";
 import type OpenAI from "openai";
 import type {
 	ResponseCustomToolCall,
@@ -17,6 +26,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	type Context,
+	type FetchImpl,
 	type Model,
 	type ProviderSessionState,
 	type ServiceTier,
@@ -39,7 +49,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { getOpenAIStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 import { parseStreamingJson } from "../utils/json-parse";
-import { adaptSchemaForStrict, NO_STRICT } from "../utils/schema";
+import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { compactGrammarDefinition } from "./grammar";
 import { CODEX_BASE_URL, getCodexAccountId, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "./openai-codex/constants";
 import {
@@ -347,7 +357,7 @@ function updateCodexSessionMetadataFromHeaders(
 	}
 }
 
-function extractCodexWebSocketHandshakeHeaders(socket: WebSocket, openEvent?: Event): Headers | undefined {
+function extractCodexWebSocketHandshakeHeaders(socket: Bun.WebSocket, openEvent?: Event): Headers | undefined {
 	const eventRecord = openEvent as Record<string, unknown> | undefined;
 	const eventResponse = eventRecord?.response as Record<string, unknown> | undefined;
 	const socketRecord = socket as unknown as Record<string, unknown>;
@@ -445,9 +455,6 @@ function applyCodexServiceTierPricing(
 	reqTier: unknown,
 ): void {
 	const resolvedTier = resolveCodexCostServiceTier(resTier, reqTier);
-	if (resolvedTier === "priority") {
-		usage.premiumRequests = (usage.premiumRequests ?? 0) + 1;
-	}
 	const multiplier = getCodexServiceTierCostMultiplier(model, resolvedTier);
 	if (multiplier === 1) return;
 	usage.cost.input *= multiplier;
@@ -735,6 +742,7 @@ async function openCodexSseTransport(
 			state,
 			requestSetup.requestSignal,
 			event => options?.onSseEvent?.(event, model),
+			options?.fetch,
 		),
 	);
 	return { eventStream, requestBodyForState: structuredCloneJSON(body), transport: "sse" };
@@ -1506,6 +1514,7 @@ async function handleCodexStreamFailure(
 		resetCodexSessionMetadata(context.requestContext.websocketState);
 	}
 	output.stopReason = context.options?.signal?.aborted ? "aborted" : "error";
+	output.errorStatus = extractHttpStatusFromError(error);
 	output.errorMessage = await finalizeErrorMessage(error, context.requestContext.rawRequestDump);
 	output.duration = Date.now() - context.startTime;
 	if (context.firstTokenTime) {
@@ -1890,7 +1899,7 @@ class CodexWebSocketConnection {
 	#idleTimeoutMs: number;
 	#firstEventTimeoutMs: number;
 	#onHandshakeHeaders?: (headers: Headers) => void;
-	#socket: WebSocket | null = null;
+	#socket: Bun.WebSocket | null = null;
 	#queue: Array<Record<string, unknown> | Error | null> = [];
 	#waiters: Array<() => void> = [];
 	#connectPromise?: Promise<void>;
@@ -1931,7 +1940,10 @@ class CodexWebSocketConnection {
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#connectPromise = promise;
-		const socket = new WebSocket(this.#url, { headers: this.#headers });
+		const socket = new (WebSocket as unknown as new (url: string, opts: Bun.WebSocketOptions) => Bun.WebSocket)(
+			this.#url,
+			{ headers: this.#headers },
+		);
 		socket.binaryType = "nodebuffer";
 		this.#socket = socket;
 		let settled = false;
@@ -2093,7 +2105,7 @@ class CodexWebSocketConnection {
 		}
 	}
 
-	#captureHandshakeHeaders(socket: WebSocket, openEvent?: Event): void {
+	#captureHandshakeHeaders(socket: Bun.WebSocket, openEvent?: Event): void {
 		if (!this.#onHandshakeHeaders) return;
 		const headers = extractCodexWebSocketHandshakeHeaders(socket, openEvent);
 		if (!headers) return;
@@ -2173,6 +2185,7 @@ async function openCodexSseEventStream(
 	state: CodexWebSocketSessionState | undefined,
 	signal?: AbortSignal,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
+	fetchOverride?: FetchImpl,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state);
 	logCodexDebug("codex request", {
@@ -2190,6 +2203,7 @@ async function openCodexSseEventStream(
 		maxAttempts: CODEX_MAX_RETRIES + 1,
 		defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 		maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
+		fetch: fetchOverride,
 	});
 	logCodexDebug("codex response", {
 		url: response.url,
@@ -2481,7 +2495,7 @@ export function convertOpenAICodexResponsesTools(
 			};
 		}
 		const strict = !!(!NO_STRICT && tool.strict);
-		const baseParameters = tool.parameters as unknown as Record<string, unknown>;
+		const baseParameters = sanitizeSchemaForOpenAIResponses(toolWireSchema(tool));
 		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(baseParameters, strict);
 		return {
 			type: "function",

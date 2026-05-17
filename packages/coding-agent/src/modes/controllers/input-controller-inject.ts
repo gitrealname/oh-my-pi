@@ -31,7 +31,7 @@ export function injectKey(key: string, ctx: InteractiveModeContext): void {
 		if (k === "\x1b" || k === "escape" || k === "esc") {
 			ctx.editor.onEscape?.();
 		} else if (k === "\n" || k === "\r" || k === "enter" || k === "return") {
-			ctx.editor.onEnter?.();
+			void ctx.editor.onSubmit?.(ctx.editor.getText());
 		}
 		// Other keys are no-ops without simulateInput
 	}

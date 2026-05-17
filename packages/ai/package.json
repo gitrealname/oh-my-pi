@@ -1,9 +1,9 @@
 {
 	"type": "module",
 	"name": "@oh-my-pi/pi-ai",
-	"version": "15.0.0",
+	"version": "15.1.3",
 	"description": "Unified LLM API with automatic model discovery and provider configuration",
-	"homepage": "https://github.com/can1357/oh-my-pi",
+	"homepage": "https://omp.sh",
 	"author": "Can Boluk",
 	"contributors": [
 		"Mario Zechner"
@@ -42,19 +42,12 @@
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "catalog:",
-		"@aws-sdk/client-bedrock-runtime": "catalog:",
-		"@aws-sdk/credential-provider-node": "catalog:",
+		"@aws-sdk/credential-provider-sso": "catalog:",
 		"@bufbuild/protobuf": "catalog:",
-		"@google/genai": "catalog:",
-		"@oh-my-pi/pi-natives": "catalog:",
 		"@oh-my-pi/pi-utils": "catalog:",
-		"@sinclair/typebox": "catalog:",
-		"@smithy/node-http-handler": "catalog:",
-		"ajv": "catalog:",
-		"ajv-formats": "catalog:",
+		"@smithy/shared-ini-file-loader": "catalog:",
 		"openai": "catalog:",
 		"partial-json": "catalog:",
-		"proxy-agent": "catalog:",
 		"zod": "catalog:"
 	},
 	"devDependencies": {
@@ -76,6 +69,22 @@
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"
+		},
+		"./auth-broker": {
+			"types": "./src/auth-broker/index.ts",
+			"import": "./src/auth-broker/index.ts"
+		},
+		"./auth-broker/*": {
+			"types": "./src/auth-broker/*.ts",
+			"import": "./src/auth-broker/*.ts"
+		},
+		"./auth-gateway": {
+			"types": "./src/auth-gateway/index.ts",
+			"import": "./src/auth-gateway/index.ts"
+		},
+		"./auth-gateway/*": {
+			"types": "./src/auth-gateway/*.ts",
+			"import": "./src/auth-gateway/*.ts"
 		},
 		"./models.json": {
 			"types": "./src/models.json.d.ts",

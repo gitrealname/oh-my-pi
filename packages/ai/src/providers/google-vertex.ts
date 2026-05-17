@@ -1,8 +1,13 @@
-import { GoogleGenAI } from "@google/genai";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { Context, Model, StreamFunction } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { buildGoogleGenerateContentParams, type GoogleSharedStreamOptions, streamGoogleGenAI } from "./google-shared";
+import { getVertexAccessToken } from "./google-auth";
+import {
+	buildGoogleGenerateContentParams,
+	type GoogleGenAIRequestPlan,
+	type GoogleSharedStreamOptions,
+	streamGoogleGenAI,
+} from "./google-shared";
 
 export interface GoogleVertexOptions extends GoogleSharedStreamOptions {
 	project?: string;
@@ -21,44 +26,36 @@ export const streamGoogleVertex: StreamFunction<"google-vertex"> = (
 		options,
 		api: "google-vertex",
 		retainTextSignature: true,
-		prepare: () => {
+		prepare: async (): Promise<GoogleGenAIRequestPlan> => {
 			const apiKey = resolveApiKey(options);
-			const project = apiKey ? undefined : resolveProject(options);
-			const location = apiKey ? undefined : resolveLocation(options);
-			const client = apiKey ? createClientWithApiKey(model, apiKey) : createClient(model, project!, location!);
 			const params = buildGoogleGenerateContentParams(model, context, options ?? {});
-			const url = apiKey
-				? `https://aiplatform.googleapis.com/${API_VERSION}/publishers/google/models/${model.id}:streamGenerateContent`
-				: `https://${location}-aiplatform.googleapis.com/${API_VERSION}/projects/${project}/locations/${location}/publishers/google/models/${model.id}:streamGenerateContent`;
-			return { client, params, url };
+			const baseHeaders: Record<string, string> = {
+				...(model.headers ?? {}),
+				...(options?.headers ?? {}),
+			};
+
+			if (apiKey) {
+				const url = `https://aiplatform.googleapis.com/${API_VERSION}/publishers/google/models/${model.id}:streamGenerateContent?alt=sse`;
+				return {
+					params,
+					url,
+					headers: { ...baseHeaders, "x-goog-api-key": apiKey },
+					fetch: options?.fetch,
+				};
+			}
+
+			const project = resolveProject(options);
+			const location = resolveLocation(options);
+			const accessToken = await getVertexAccessToken({ signal: options?.signal, fetch: options?.fetch });
+			const url = `https://${location}-aiplatform.googleapis.com/${API_VERSION}/projects/${project}/locations/${location}/publishers/google/models/${model.id}:streamGenerateContent?alt=sse`;
+			return {
+				params,
+				url,
+				headers: { ...baseHeaders, Authorization: `Bearer ${accessToken}` },
+				fetch: options?.fetch,
+			};
 		},
 	});
-
-function buildHttpOptions(model: Model<"google-vertex">): { headers?: Record<string, string> } | undefined {
-	if (!model.headers) {
-		return undefined;
-	}
-	return { headers: { ...model.headers } };
-}
-
-function createClient(model: Model<"google-vertex">, project: string, location: string): GoogleGenAI {
-	return new GoogleGenAI({
-		vertexai: true,
-		project,
-		location,
-		apiVersion: API_VERSION,
-		httpOptions: buildHttpOptions(model),
-	});
-}
-
-function createClientWithApiKey(model: Model<"google-vertex">, apiKey: string): GoogleGenAI {
-	return new GoogleGenAI({
-		vertexai: true,
-		apiKey,
-		apiVersion: API_VERSION,
-		httpOptions: buildHttpOptions(model),
-	});
-}
 
 function resolveApiKey(options?: GoogleVertexOptions): string | undefined {
 	// options.apiKey may contain sentinel values like "<authenticated>" or "N/A"
