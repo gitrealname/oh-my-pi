@@ -8295,7 +8295,7 @@ export class AgentSession {
 				totalCacheRead += assistantMsg.usage.cacheRead;
 				totalCacheWrite += assistantMsg.usage.cacheWrite;
 				totalPremiumRequests += assistantMsg.usage.premiumRequests ?? 0;
-				totalCost += assistantMsg.usage.cost.total;
+				totalCost += assistantMsg.usage.cost?.total ?? 0;
 			}
 
 			if (message.role === "toolResult" && message.toolName === "task") {
@@ -8306,7 +8306,7 @@ export class AgentSession {
 					totalCacheRead += usage.cacheRead;
 					totalCacheWrite += usage.cacheWrite;
 					totalPremiumRequests += usage.premiumRequests ?? 0;
-					totalCost += usage.cost.total;
+					totalCost += usage.cost?.total ?? 0;
 				}
 			}
 		}

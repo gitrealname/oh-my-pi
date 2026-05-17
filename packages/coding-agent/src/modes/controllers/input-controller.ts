@@ -39,6 +39,7 @@ export class InputController {
 					this.ctx.session.isGeneratingHandoff ||
 					this.ctx.session.isBashRunning ||
 					this.ctx.session.isEvalRunning ||
+					this.ctx.session.isTaskRunning ||
 					this.ctx.autoCompactionLoader ||
 					this.ctx.retryLoader ||
 					this.ctx.autoCompactionEscapeHandler ||
@@ -64,12 +65,17 @@ export class InputController {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.ctx.session.isBashRunning) {
 				this.ctx.session.abortBash();
+				this.ctx.loadingAnimation?.setMessage("cancelling...");
 			} else if (this.ctx.isBashMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isBashMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isEvalRunning) {
 				this.ctx.session.abortEval();
+				this.ctx.loadingAnimation?.setMessage("cancelling...");
+			} else if (this.ctx.session.isTaskRunning) {
+				this.ctx.session.abortTask();
+				this.ctx.loadingAnimation?.setMessage("cancelling...");
 			} else if (this.ctx.isPythonMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isPythonMode = false;
