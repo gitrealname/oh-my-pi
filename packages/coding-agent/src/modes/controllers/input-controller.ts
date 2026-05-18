@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
-import { $env, sanitizeText } from "@oh-my-pi/pi-utils";
+import { $env, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -17,6 +17,8 @@ import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 // AWS-CORP: custom — merge with care
 import { injectKey as _injectKey, injectText as _injectText, injectCommand as _injectCommand } from "./input-controller-inject";
+// AWS-CORP: custom — merge with care
+import { runScriptSlot } from "./input-controller-m-scripts";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -25,6 +27,16 @@ interface Expandable {
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
+
+// AWS-CORP: custom — merge with care
+// Dispatch map for doubleEscapeAction — add new actions here, no logic changes needed.
+type DoubleEscapeAction = "branch" | "tree" | "mtree" | "none";
+const DOUBLE_ESCAPE_HANDLERS: Record<DoubleEscapeAction, (ctx: InteractiveModeContext) => void> = {
+	tree:   ctx => ctx.showTreeSelector(),
+	branch: ctx => ctx.showUserMessageSelector(),
+	mtree:  ctx => (ctx as unknown as { showMTreeSelector(): void }).showMTreeSelector(),
+	none:   () => {},
+};
 
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
@@ -89,16 +101,13 @@ export class InputController {
 			} else if (this.ctx.session.isStreaming) {
 				void this.ctx.session.abort();
 			} else if (!this.ctx.editor.getText().trim()) {
-				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
-				const action = settings.get("doubleEscapeAction");
+				// Double-escape with empty editor — action driven by doubleEscapeAction setting.
+				const action = settings.get("doubleEscapeAction") as DoubleEscapeAction;
+				const handler = DOUBLE_ESCAPE_HANDLERS[action] ?? DOUBLE_ESCAPE_HANDLERS.none;
 				if (action !== "none") {
 					const now = Date.now();
 					if (now - this.ctx.lastEscapeTime < 500) {
-						if (action === "tree") {
-							this.ctx.showTreeSelector();
-						} else {
-							this.ctx.showUserMessageSelector();
-						}
+						handler(this.ctx);
 						this.ctx.lastEscapeTime = 0;
 					} else {
 						this.ctx.lastEscapeTime = now;
@@ -183,6 +192,21 @@ export class InputController {
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.observe")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionObserver());
+		}
+		// AWS-CORP: custom — merge with care
+		// Wire script slot keybindings (app.script.1 … app.script.10)
+		for (let slot = 1; slot <= 10; slot++) {
+			const keys = this.ctx.keybindings.getKeys(`app.script.${slot}` as "app.script.1");
+			if (keys.length > 0) {
+				logger.debug("[script] registering slot", { slot, keys });
+			}
+			for (const key of keys) {
+				const capturedSlot = slot;
+				this.ctx.editor.setCustomKeyHandler(key, () => {
+					logger.debug("[script] key fired", { slot: capturedSlot, key });
+					void this.handleScript(capturedSlot);
+				});
+			}
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
@@ -873,5 +897,11 @@ export class InputController {
 
 	injectCommand(text: string): void {
 		_injectCommand(text, this.ctx);
+	}
+
+	// AWS-CORP: custom — merge with care
+	/** Thin wrapper — all logic lives in input-controller-m-scripts.ts */
+	async handleScript(slot: number): Promise<void> {
+		return runScriptSlot(slot, this.ctx);
 	}
 }
