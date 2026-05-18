@@ -1015,18 +1015,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 			};
 
+			// AWS-CORP: custom — merge with care
 			const taskAbortController = new AbortController();
 			const effectiveSignal = signal
 				? AbortSignal.any([signal, taskAbortController.signal])
 				: taskAbortController.signal;
 
 			// Execute in parallel with concurrency limit
+			// AWS-CORP: custom — merge with care
 			const parallelExecution = mapWithConcurrencyLimit(
 				tasksWithUniqueIds,
 				maxConcurrency,
 				runTask,
+				// AWS-CORP: custom — merge with care
 				effectiveSignal,
 			);
+			// AWS-CORP: custom — merge with care
 			const { results: partialResults, aborted } = await (this.session.trackTaskExecution
 				? this.session.trackTaskExecution(parallelExecution, taskAbortController)
 				: parallelExecution);

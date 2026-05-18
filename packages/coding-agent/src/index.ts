@@ -5,6 +5,7 @@ import { HookEditorComponent, HookInputComponent, HookSelectorComponent } from "
 // Re-export TUI components for custom tool rendering
 export { Container, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 // Logging
+// AWS-CORP: custom — merge with care
 export { getAgentDir, logger, parseFrontmatter, VERSION } from "@oh-my-pi/pi-utils";
 export * from "./config/keybindings";
 export * from "./config/model-registry";

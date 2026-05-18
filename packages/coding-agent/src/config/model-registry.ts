@@ -31,6 +31,8 @@ import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/utils/oauth/types";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 
+// AWS-CORP: custom — merge with care
+
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
@@ -129,6 +131,8 @@ export function getRoleInfo(role: string, settings: Settings): RoleInfo {
 }
 
 
+// AWS-CORP: custom — merge with care
+
 type ProviderValidationMode = "models-config" | "runtime-register";
 
 interface ProviderValidationModel {
@@ -178,7 +182,8 @@ function validateProviderConfiguration(
 			}
 		}
 	} else {
-		if (!config.baseUrl) {
+		// AWS-CORP: custom — merge with care
+		if (!config.baseUrl && (config.auth ?? "apiKey") !== "none") {
 			throw new Error(`Provider ${providerName}: "baseUrl" is required when defining custom models.`);
 		}
 		const requiresAuth =
@@ -1019,6 +1024,7 @@ export class ModelRegistry {
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
+		// AWS-CORP: custom — merge with care
 		const disabled = getDisabledProviderIdsFromSettings();
 		if (!configuredProviders.has("ollama") && !disabled.has("ollama")) {
 			this.#discoverableProviders.push({
@@ -1030,6 +1036,7 @@ export class ModelRegistry {
 			});
 			this.#keylessProviders.add("ollama");
 		}
+		// AWS-CORP: custom — merge with care
 		if (!configuredProviders.has("llama.cpp") && !disabled.has("llama.cpp")) {
 			this.#discoverableProviders.push({
 				provider: "llama.cpp",
@@ -1043,6 +1050,7 @@ export class ModelRegistry {
 				this.#keylessProviders.add("llama.cpp");
 			}
 		}
+		// AWS-CORP: custom — merge with care
 		if (!configuredProviders.has("lm-studio") && !disabled.has("lm-studio")) {
 			this.#discoverableProviders.push({
 				provider: "lm-studio",

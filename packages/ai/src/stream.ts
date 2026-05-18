@@ -10,6 +10,7 @@ import {
 	requireSupportedEffort,
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+// AWS-CORP: custom — merge with care
 import { streamAwsCorp } from "./providers/aws-corp";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
@@ -145,6 +146,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
+	// AWS-CORP: custom — merge with care
 	"aws-corp": () => {
 		if ($env.AWS_CORP_PROFILE || $env.AWS_CORP_SSO_SESSION) {
 			return "<authenticated>";
@@ -220,6 +222,7 @@ export function stream<TApi extends Api>(
 		return streamGoogleVertex(model as Model<"google-vertex">, context, options as GoogleVertexOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
+		// AWS-CORP: custom — merge with care
 		if (model.provider === "aws-corp") {
 			return streamAwsCorp(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
 		}

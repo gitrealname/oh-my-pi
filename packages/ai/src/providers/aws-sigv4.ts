@@ -123,9 +123,10 @@ export function formatAmzDate(d: Date): { longDate: string; shortDate: string } 
 
 /**
  * Canonicalize a request path per RFC 3986: each segment is %-encoded but `/`
- * stays literal. Matches the smithy default (`uriEscapePath: true`, then revert
- * the double-encoding of `/`). Bedrock paths use no reserved characters in
- * practice, but model IDs can include `:` and `.`.
+ // AWS-CORP: custom — merge with care
+ * stays literal. Matches AWS Bedrock's SigV4 verification behavior: the service
+ * decodes the URL path then re-encodes each segment for canonical form.
+ * i.e. URL path `%3A` → decoded `:` → re-encoded `%3A` in canonical string.
  */
 function canonicalPath(path: string): string {
 	const segments = path.split("/");

@@ -212,6 +212,7 @@ export interface ParsedAgentFields {
 	output?: unknown;
 	thinkingLevel?: ThinkingLevel;
 	blocking?: boolean;
+	// AWS-CORP: custom — merge with care
 	memory?: "none" | "inherit";
 }
 
@@ -265,6 +266,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const thinkingLevel = parseThinkingLevel(rawThinkingLevel);
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
+	// AWS-CORP: custom — merge with care
 	const memory = frontmatter.memory === "none" ? "none" as const :
 		frontmatter.memory === "inherit" ? "inherit" as const : undefined;
 	return { name, description, tools, spawns, model, output, thinkingLevel, blocking, memory };

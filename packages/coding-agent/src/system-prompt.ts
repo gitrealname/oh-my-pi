@@ -8,6 +8,7 @@ import { $env, getGpuCachePath, getProjectDir, hasFsCode, isEnoent, logger, prom
 import { $ } from "bun";
 import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
+// AWS-CORP: custom — merge with care
 import { Settings, type SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { loadSkills, type Skill } from "./extensibility/skills";
@@ -194,6 +195,7 @@ async function getEnvironmentInfo(): Promise<Array<{ label: string; value: strin
 	} catch {
 		cpuModel = undefined;
 	}
+	// AWS-CORP: custom — merge with care
 	// Shell label — only emitted on Windows, where "OS: win32" would otherwise
 	// cause the model to generate Windows-style paths.
 	//
@@ -236,6 +238,7 @@ async function getEnvironmentInfo(): Promise<Array<{ label: string; value: strin
 		{ label: "CPU", value: cpuModel },
 		{ label: "GPU", value: gpu },
 		{ label: "Terminal", value: getTerminalName() },
+		// AWS-CORP: custom — merge with care
 		{ label: "Shell", value: shellLabel },
 	];
 	return entries.filter((e): e is { label: string; value: string } => !!e.value);

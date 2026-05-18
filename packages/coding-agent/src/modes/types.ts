@@ -150,6 +150,7 @@ export interface InteractiveModeContext {
 	showWarning(message: string): void;
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
+	// AWS-CORP: custom — merge with care
 	/** Schedule text as input — same path as the user hitting Enter. Fires after waitForIdle. */
 	scheduleInput(text: string): void;
 	updatePendingMessagesDisplay(): void;

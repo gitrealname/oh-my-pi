@@ -800,7 +800,8 @@ function renderAgentResult(result: SingleResult, isLast: boolean, expanded: bool
 			tokens: result.tokens,
 			contextTokens: result.contextTokens,
 			contextWindow: result.contextWindow,
-			cost: result.usage?.cost.total ?? 0,
+			// AWS-CORP: custom — merge with care
+			cost: result.usage?.cost?.total ?? 0,
 		},
 		theme,
 	);

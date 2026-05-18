@@ -407,6 +407,7 @@ class TreeList implements Component {
 		return this.#searchQuery;
 	}
 
+	// AWS-CORP: custom — merge with care
 	get toolCallMap(): Map<string, ToolCallInfo> {
 		return this.#toolCallMap;
 	}

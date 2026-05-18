@@ -5,6 +5,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+// AWS-CORP: custom — merge with care
 import { executePython } from "../../eval/py/executor";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Theme, theme } from "../../modes/theme/theme";
@@ -181,6 +182,7 @@ export class ExtensionRunner {
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
+	// AWS-CORP: custom — merge with care
 	#executePythonFn: NonNullable<ExtensionContextActions["executePython"]> = (code, options) =>
 		executePython(code, { ...options, cwd: options?.cwd ?? this.cwd });
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -190,6 +192,7 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	// AWS-CORP: custom — merge with care
 	#taskDepth = 0;
 
 	setTaskDepth(n: number): void {
@@ -246,6 +249,7 @@ export class ExtensionRunner {
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		// AWS-CORP: custom — merge with care
 		this.#executePythonFn = contextActions.executePython ?? ((code, options) =>
 			executePython(code, { ...options, cwd: options?.cwd ?? this.cwd }));
 
@@ -477,6 +481,7 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
+			// AWS-CORP: custom — merge with care
 			executePython: (code, options) => this.#executePythonFn(code, options),
 			taskDepth: this.#taskDepth,
 		};
@@ -490,6 +495,7 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		// AWS-CORP: custom — merge with care
 		const ac = new AbortController();
 		return {
 			...this.createContext(),
@@ -501,6 +507,7 @@ export class ExtensionRunner {
 			switchSession: sessionPath => this.#switchSessionHandler(sessionPath),
 			reload: () => this.#reloadHandler(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
+			// AWS-CORP: custom — merge with care
 			signal: ac.signal,
 		};
 	}

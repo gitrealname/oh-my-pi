@@ -545,6 +545,7 @@ export class ExtensionUiController {
 							// Signal shutdown request
 						},
 						getSystemPrompt: () => this.ctx.session.systemPrompt,
+						// AWS-CORP: custom — merge with care
 						taskDepth: this.ctx.session.extensionRunner?.getTaskDepth() ?? 0,
 					});
 				} catch (err) {

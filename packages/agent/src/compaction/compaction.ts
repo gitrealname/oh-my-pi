@@ -269,6 +269,7 @@ export function estimateTokens(message: AgentMessage): number {
 				for (const block of content) {
 					if (block.type === "text" && block.text) {
 						fragments.push(block.text);
+					// AWS-CORP: custom — merge with care
 					} else if (block.type === "image") {
 						extra += IMAGE_TOKEN_ESTIMATE;
 					}

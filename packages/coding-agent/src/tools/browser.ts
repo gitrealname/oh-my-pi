@@ -101,6 +101,8 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	}
 
 
+// AWS-CORP: custom — merge with care
+
 	/**
 	 * Restart the browser to apply changes like headless mode.
 	 */

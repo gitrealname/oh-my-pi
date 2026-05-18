@@ -15,6 +15,7 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+// AWS-CORP: custom — merge with care
 import { injectKey as _injectKey, injectText as _injectText, injectCommand as _injectCommand } from "./input-controller-inject";
 
 interface Expandable {
@@ -39,6 +40,7 @@ export class InputController {
 					this.ctx.session.isGeneratingHandoff ||
 					this.ctx.session.isBashRunning ||
 					this.ctx.session.isEvalRunning ||
+					// AWS-CORP: custom — merge with care
 					this.ctx.session.isTaskRunning ||
 					this.ctx.autoCompactionLoader ||
 					this.ctx.retryLoader ||
@@ -58,6 +60,8 @@ export class InputController {
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				return;
 			}
+			// AWS-CORP: custom — merge with care
+			const setCancelling = () => this.ctx.loadingAnimation?.setMessage("cancelling...");
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
 					return;
@@ -65,17 +69,19 @@ export class InputController {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.ctx.session.isBashRunning) {
 				this.ctx.session.abortBash();
-				this.ctx.loadingAnimation?.setMessage("cancelling...");
+				// AWS-CORP: custom — merge with care
+				setCancelling();
 			} else if (this.ctx.isBashMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isBashMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isEvalRunning) {
 				this.ctx.session.abortEval();
-				this.ctx.loadingAnimation?.setMessage("cancelling...");
+				// AWS-CORP: custom — merge with care
+				setCancelling();
 			} else if (this.ctx.session.isTaskRunning) {
 				this.ctx.session.abortTask();
-				this.ctx.loadingAnimation?.setMessage("cancelling...");
+				setCancelling();
 			} else if (this.ctx.isPythonMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isPythonMode = false;
@@ -854,6 +860,8 @@ export class InputController {
 			});
 		}
 	}
+
+// AWS-CORP: custom — merge with care
 
 	injectKey(key: string): void {
 		_injectKey(key, this.ctx);

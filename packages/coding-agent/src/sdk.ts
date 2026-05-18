@@ -33,6 +33,7 @@ import {
 import chalk from "chalk";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "./async";
 import { createAutoresearchExtension } from "./autoresearch";
+// AWS-CORP: custom — merge with care
 import { populateCorpSkillRoles, registerCorpExtensions, applyCorpExtensionRunner } from "./corp-sdk-extensions";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
@@ -251,6 +252,7 @@ export interface CreateAgentSessionOptions {
 	/** Settings instance. Default: Settings.init({ cwd, agentDir }) */
 	settings?: Settings;
 
+	// AWS-CORP: custom — merge with care
 	/** Memory injection mode for subagents. "none" skips injection; "inherit" is the default. */
 	memory?: "none" | "inherit";
 	/** Whether UI is available (enables interactive tools like ask). Default: false */
@@ -1154,6 +1156,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
 		};
+		// AWS-CORP: custom — merge with care
 		populateCorpSkillRoles(skills, toolSession);
 
 		// Wire process-wide internal URL singletons owned by their real classes.
@@ -1255,6 +1258,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const inlineExtensions: ExtensionFactory[] = options.extensions ? [...options.extensions] : [];
 		inlineExtensions.push(createAutoresearchExtension);
+		// AWS-CORP: custom — merge with care
 		registerCorpExtensions(inlineExtensions, settings);
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
@@ -1317,6 +1321,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionsResult.runtime.pendingProviderRegistrations = [];
 		}
 
+
+// AWS-CORP: custom — merge with care
 
 		// Resolve deferred --model pattern now that extension models are registered.
 		if (!model && options.modelPattern) {
@@ -1381,6 +1387,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				modelRegistry,
 			);
 		}
+		// AWS-CORP: custom — merge with care
 		applyCorpExtensionRunner(extensionRunner, taskDepth);
 
 		if (extensionRunner) {
@@ -2020,6 +2027,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					agentDir,
 					taskDepth,
 					parentHindsightSessionState: options.parentHindsightSessionState,
+					// AWS-CORP: custom — merge with care
 					memory: options.memory,
 				}),
 			),

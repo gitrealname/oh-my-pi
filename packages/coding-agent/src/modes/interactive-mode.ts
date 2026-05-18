@@ -37,6 +37,7 @@ import type {
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
+// AWS-CORP: custom — merge with care
 import { BUILTIN_SLASH_COMMANDS, getBuiltinSlashCommands, loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
@@ -63,7 +64,8 @@ import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
 import { ToolError } from "../tools/tool-errors";
-import { type EventBus, PIPE_TUI_OUTPUT_CHANNEL, type TuiOutputPayload } from "../utils/event-bus";
+// AWS-CORP: custom — merge with care
+import { type EventBus, PIPE_TUI_OUTPUT_CHANNEL, SCHEDULE_SLASH_CHANNEL, type TuiOutputPayload } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
@@ -83,6 +85,7 @@ import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
 import { ExtensionUiController } from "./controllers/extension-ui-controller";
 import { InputController } from "./controllers/input-controller";
+// AWS-CORP: custom — merge with care
 import { registerInputController } from "./rpc/rpc-inject-handler";
 import { MCPCommandController } from "./controllers/mcp-command-controller";
 import { SelectorController } from "./controllers/selector-controller";
@@ -302,7 +305,16 @@ export class InteractiveMode implements InteractiveModeContext {
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
 					this.#handleLspStartupEvent(data as LspStartupEvent);
 				}),
-			);
+				// AWS-CORP: custom — merge with care
+				eventBus.on(SCHEDULE_SLASH_CHANNEL, data => {
+					const command = typeof data === "string" ? data : null;
+					logger.debug("[interactive] SCHEDULE_SLASH_CHANNEL", { command, hasOnSubmit: !!this.editor.onSubmit });
+					if (command) void this.session.waitForIdle().then(() => {
+						logger.debug("[interactive] SCHEDULE_SLASH executing", { command });
+						this.editor.onSubmit?.(command);
+					});
+			}),
+		);
 		}
 
 		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
@@ -343,6 +355,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
+		// AWS-CORP: custom — merge with care
 		const builtinCommands = getBuiltinSlashCommands();
 		const builtinCommandNames = new Set(builtinCommands.map(c => c.name));
 		const hookCommands: SlashCommand[] = (
@@ -370,6 +383,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		// Store pending commands for init() where file commands are loaded async
+		// AWS-CORP: custom — merge with care
 		this.#pendingSlashCommands = [...builtinCommands, ...hookCommands, ...customCommands, ...skillCommandList];
 
 		this.#uiHelpers = new UiHelpers(this);
@@ -472,12 +486,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setFocus(this.editor);
 
+		// AWS-CORP: custom — merge with care
 		// Initialize hooks BEFORE enabling input to prevent race condition
 		// where user could type a command before it's registered
 		await this.initHooksAndCustomTools();
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
+		// AWS-CORP: custom — merge with care
 		// Register with RPC inject handler so --rpc-pipe sessions can inject keys
 		registerInputController(this.#inputController);
 
@@ -1840,6 +1856,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			"Plan mode - next step",
 			["Approve and execute", "Approve and compact context", "Approve and keep context", "Refine plan"],
 			{
+				// AWS-CORP: custom — merge with care
 				initialIndex: 2,
 				helpText: this.#getPlanReviewHelpText(),
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
@@ -1949,6 +1966,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#eventBusUnsubscribers = [];
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
+		// AWS-CORP: custom — merge with care
 		registerInputController(null);
 		this.statusLine.dispose();
 		if (this.#resizeHandler) {
@@ -2080,6 +2098,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	// UI helpers
 	showStatus(message: string, options?: { dim?: boolean }): void {
 		this.#uiHelpers.showStatus(message, options);
+		// AWS-CORP: custom — merge with care
 		this.#eventBus?.emit(PIPE_TUI_OUTPUT_CHANNEL, { level: "status", text: message } satisfies TuiOutputPayload);
 	}
 
@@ -2095,11 +2114,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.statusContainer.clear();
 		}
 		this.#uiHelpers.showError(message);
+		// AWS-CORP: custom — merge with care
 		this.#eventBus?.emit(PIPE_TUI_OUTPUT_CHANNEL, { level: "error", text: message } satisfies TuiOutputPayload);
 	}
 
 	showWarning(message: string): void {
 		this.#uiHelpers.showWarning(message);
+		// AWS-CORP: custom — merge with care
 		this.#eventBus?.emit(PIPE_TUI_OUTPUT_CHANNEL, { level: "warning", text: message } satisfies TuiOutputPayload);
 	}
 
@@ -2196,6 +2217,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.clearEditor();
 	}
 
+	// AWS-CORP: custom — merge with care
 	scheduleInput(text: string): void {
 		void this.session.waitForIdle().then(() => {
 			if (this.onInputCallback) {
@@ -2501,6 +2523,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	showTreeSelector(): void {
 		this.#selectorController.showTreeSelector();
 	}
+	// AWS-CORP: custom — merge with care
 	showMTreeSelector(): void {
 		(this.#selectorController as unknown as { showMTreeSelector(): void }).showMTreeSelector();
 	}

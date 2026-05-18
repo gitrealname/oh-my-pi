@@ -52,6 +52,8 @@ interface MpruneSessionState {
 	stats: MpruneSessionStats;
 	/** Pending session stats not yet flushed to disk (accumulated across flushes). */
 	unpersisted: MpruneSessionStats;
+	/** True while a detached flush IIFE is in flight. Only one flush runs at a time. */
+	flushInFlight: boolean;
 }
 
 const sessionMap = new WeakMap<ReadonlySessionManager, MpruneSessionState>();
@@ -65,6 +67,7 @@ function getOrCreateState(ctx: ExtensionContext): MpruneSessionState | null {
 			pendingBatches: [],
 			stats: createSessionStats(),
 			unpersisted: createSessionStats(),
+			flushInFlight: false,
 		};
 		sessionMap.set(ctx.sessionManager, state);
 	}
@@ -100,6 +103,7 @@ function flushStatsToDisk(state: MpruneSessionState): void {
 async function summarizeBatches(
 	batches: PruneBatch[],
 	ctx: ExtensionContext,
+	signal?: AbortSignal,
 ): Promise<string | null> {
 	const registry = ctx.modelRegistry;
 	const model = resolveRoleModel(undefined, registry, settings, ["prune"]);
@@ -116,6 +120,7 @@ async function summarizeBatches(
 			systemPrompt: [buildSummarizerPrompt()],
 			messages: [{ role: "user", content: [{ type: "text", text: serialized }], timestamp: Date.now() }],
 		},
+		{ signal },
 	);
 
 	if (response.stopReason === "error" || !response.content) return null;
@@ -192,12 +197,20 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 	});
 
 	// ── turn_end: flush on agent-message (text-only) turn ─────────────────────
-	api.on("turn_end", async (event, ctx) => {
+	// NOTE: This handler returns immediately after passing work to a detached promise.
+	// The actual LLM summarizer call + rewriteEntries() run asynchronously so they
+	// don't block inside the 30s extension handler timeout (EXTENSION_HANDLER_TIMEOUT_MS).
+	api.on("turn_end", (event, ctx) => {
 		if (event.toolResults.length > 0) return;
 
 		const state = getOrCreateState(ctx);
 		if (!state || state.pendingBatches.length === 0) return;
-
+		// Only one flush runs at a time — if a prior turn's summarizer is still in
+		// flight, skip rather than pile up concurrent LLM calls.
+		if (state.flushInFlight) {
+			logger.debug("[mprune] flush already in flight — skipping this turn");
+			return;
+		}
 		// Guard: if any assistant tool_use block in the session has no matching tool_result,
 		// the session is in an inconsistent state (e.g. task interrupted mid-execution).
 		// Injecting a steer message here would land at the slot the API expects a tool_result,
@@ -236,56 +249,71 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 			rawChars,
 		});
 
-		let summary: string | null = null;
-		try {
-			summary = await summarizeBatches(batchesToFlush, ctx);
-		} catch (err) {
-			logger.warn("[mprune] summarizer error", { error: String(err) });
-			return;
-		}
-		if (!summary) {
-			logger.debug("[mprune] summarizer returned no content — skipping flush", {
-				batches: batchesToFlush.length,
-				rawChars,
-			});
-			return;
-		}
+		// Detach the LLM call + rewrite from the event handler to avoid the 30s
+		// EXTENSION_HANDLER_TIMEOUT_MS. The handler returns synchronously; the
+		// summarizer runs in the background and re-enters the session via steer().
+		state.flushInFlight = true;
+		// 90s hard ceiling: generous for any summarizer call, but not infinite.
+		// AbortSignal.timeout() fires DOMException "TimeoutError" on expiry.
+		const flushSignal = AbortSignal.timeout(90_000);
+		void (async () => {
+			let summary: string | null = null;
+			try {
+				summary = await summarizeBatches(batchesToFlush, ctx, flushSignal);
+			} catch (err) {
+				if (err instanceof Error && err.name === "TimeoutError") {
+					logger.warn("[mprune] summarizer timed out after 90s — skipping flush", { batches: batchesToFlush.length });
+				} else {
+					logger.warn("[mprune] summarizer error", { error: String(err) });
+				}
+				return;
+			} finally {
+				state.flushInFlight = false;
+			}
+			if (!summary) {
+				logger.debug("[mprune] summarizer returned no content — skipping flush", {
+					batches: batchesToFlush.length,
+					rawChars,
+				});
+				return;
+			}
 
-		api.sendMessage(
-			{ customType: "mprune_summary", content: summary, display: false },
-			{ deliverAs: "steer" },
-		);
+			api.sendMessage(
+				{ customType: "mprune_summary", content: summary, display: false },
+				{ deliverAs: "steer" },
+			);
 
-		// Replace content of summarized tool results with a placeholder and mark prunedAt.
-		// Without this, the original verbose content remains in the session and still costs
-		// tokens on every subsequent API call — defeating the purpose of summarization.
-		// This mirrors what OMP's pruneToolOutputs() does (pruning.ts:85) but for mprune-handled entries.
-		const entries = sessionEntries;
-		const prunedAt = Date.now();
-		const prunedIds = new Set(
-		batchesToFlush.flatMap(b => b.toolResults.map((r: ToolResultEntry) => r.toolCallId)),
-		);
-		for (const entry of entries) {
-			if (entry.type !== "message") continue;
-			const msg = entry.message as { role: string; toolCallId?: string; prunedAt?: number; content?: unknown };
-			if (msg.role !== "toolResult") continue;
-			if (!prunedIds.has(msg.toolCallId ?? "")) continue;
-			msg.content = [{ type: "text", text: "[summarized by mprune — see context above]" }];
-			msg.prunedAt = prunedAt;
-		}
+			// Replace content of summarized tool results with a placeholder and mark prunedAt.
+			// Without this, the original verbose content remains in the session and still costs
+			// tokens on every subsequent API call — defeating the purpose of summarization.
+			// This mirrors what OMP's pruneToolOutputs() does (pruning.ts:85) but for mprune-handled entries.
+			const entries = ctx.sessionManager.getBranch();
+			const prunedAt = Date.now();
+			const prunedIds = new Set(
+				batchesToFlush.flatMap(b => b.toolResults.map((r: ToolResultEntry) => r.toolCallId)),
+			);
+			for (const entry of entries) {
+				if (entry.type !== "message") continue;
+				const msg = entry.message as { role: string; toolCallId?: string; prunedAt?: number; content?: unknown };
+				if (msg.role !== "toolResult") continue;
+				if (!prunedIds.has(msg.toolCallId ?? "")) continue;
+				msg.content = [{ type: "text", text: "[summarized by mprune — see context above]" }];
+				msg.prunedAt = prunedAt;
+			}
 
-		// as any: rewriteEntries() not on ReadonlySessionManager by design. See file header.
-		await (ctx.sessionManager as any as SessionManager).rewriteEntries();
+			// as any: rewriteEntries() not on ReadonlySessionManager by design. See file header.
+			await (ctx.sessionManager as any as SessionManager).rewriteEntries();
 
-		// Record savings.
-		const saved = estimateBatchSavings(rawChars, summary.length);
-		state.stats.tokensSavedBatch += saved;
-		state.stats.batchFlushes++;
-		state.unpersisted.tokensSavedBatch += saved;
-		state.unpersisted.batchFlushes++;
+			// Record savings.
+			const saved = estimateBatchSavings(rawChars, summary.length);
+			state.stats.tokensSavedBatch += saved;
+			state.stats.batchFlushes++;
+			state.unpersisted.tokensSavedBatch += saved;
+			state.unpersisted.batchFlushes++;
 
-		flushStatsToDisk(state);
-		logger.debug("[mprune] flush complete", { tokensSaved: saved });
+			flushStatsToDisk(state);
+			logger.debug("[mprune] flush complete", { tokensSaved: saved });
+		})();
 	});
 
 	// ── turn_end: image aging ──────────────────────────────────────────────────

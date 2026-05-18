@@ -43,6 +43,7 @@ import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TreeSelectorComponent } from "../components/tree-selector";
+// AWS-CORP: custom — merge with care
 import { TreePeekComponent } from "../components/tree-peek";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { SessionObserverRegistry } from "../session-observer-registry";
@@ -569,6 +570,8 @@ export class SelectorController {
 	}
 
 
+// AWS-CORP: custom — merge with care
+
 	showTreeSelector(): void {
 		const tree = this.ctx.sessionManager.getTree();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
@@ -579,6 +582,7 @@ export class SelectorController {
 		}
 
 		this.showSelector(done => {
+			// AWS-CORP: custom — merge with care
 			const onNavigate = async (entryId: string) => {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === realLeafId) {
@@ -677,6 +681,7 @@ export class SelectorController {
 						}
 						this.ctx.editor.onEscape = originalOnEscape;
 					}
+				// AWS-CORP: custom — merge with care
 				};
 			const onClose = () => { done(); this.ctx.ui.requestRender(); };
 			const onLabel = (entryId: string, label: string) => {
@@ -700,6 +705,7 @@ export class SelectorController {
 			const onNavigate = async (entryId: string) => {
 				if (entryId === realLeafId) {
 					done();
+					// AWS-CORP: custom — merge with care
 					this.ctx.showStatus("Already at this point");
 					return;
 				}

@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 
+// AWS-CORP: custom — merge with care
 import type { AppScriptKeybindings } from "./keybindings-m-scripts";
 import { SCRIPT_KEYBINDING_CONFIGS } from "./keybindings-m-scripts";
 
@@ -18,6 +19,7 @@ import { SCRIPT_KEYBINDING_CONFIGS } from "./keybindings-m-scripts";
  * Application-level keybindings (coding agent specific).
  * Values are always `true` — used for declaration merging.
  */
+// AWS-CORP: custom — merge with care
 interface AppKeybindings extends AppScriptKeybindings {
 	"app.interrupt": true;
 	"app.clear": true;
@@ -192,6 +194,7 @@ export const KEYBINDINGS = {
 		defaultKeys: "alt+h",
 		description: "Toggle speech-to-text",
 	},
+	// AWS-CORP: custom — merge with care
 	...SCRIPT_KEYBINDING_CONFIGS,
 } as const satisfies KeybindingDefinitions;
 

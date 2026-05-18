@@ -11,7 +11,11 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
-import { $env, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
+// AWS-CORP: custom — merge with care
+import { connectToPipe } from "./pipe-transport";
+import { handleRpcExecCommand, registerExecOutputFn } from "./rpc-inject-handler";
+import { type EventBus, PIPE_TUI_OUTPUT_CHANNEL } from "../../utils/event-bus";
+import { $env, readJsonl, Snowflake, VERSION } from "@oh-my-pi/pi-utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -166,19 +170,40 @@ export function requestRpcEditor(
  */
 export async function runRpcMode(
 	session: AgentSession,
+	// AWS-CORP: custom — merge with care
+	eventBus?: EventBus,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 ): Promise<never> {
-	// Signal to RPC clients that the server is ready to accept commands
+	// AWS-CORP: custom — merge with care
+	// Detect --rpc-pipe: use named pipe side-channel instead of stdin/stdout.
+	// Arg value is either a Unix socket path or a TCP port number (Windows).
+	const rpcPipeArg = process.argv.indexOf("--rpc-pipe");
+	const pipeArg = rpcPipeArg !== -1 ? process.argv[rpcPipeArg + 1] : undefined;
+
+	let pipeSocket: Awaited<ReturnType<typeof connectToPipe>> | null = null;
+	if (pipeArg) {
+		pipeSocket = await connectToPipe(pipeArg);
+	}
+
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
 	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
-	process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
+	// AWS-CORP: custom — merge with care
+	// Signal ready: to pipe client if connected, otherwise to stdout
+	if (pipeSocket) pipeSocket.writeFrame({ type: "ready", pid: process.pid });
+	else process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
+
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(`${JSON.stringify(obj)}\n`);
+		// AWS-CORP: custom — merge with care
+		if (pipeSocket) pipeSocket.writeFrame(obj);
+		else process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
+	// AWS-CORP: custom — merge with care
+	// Register pipe write fn with exec queue — slave uses it to send exec_step_result frames.
+	registerExecOutputFn(output);
 	const emitRpcTitles = shouldEmitRpcTitles();
 
 	const success = <T extends RpcCommand["type"]>(
@@ -784,8 +809,11 @@ export async function runRpcMode(
 			}
 
 			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+			// AWS-CORP: custom — merge with care
+			const exec = await handleRpcExecCommand(command, session, success as never, error as never);
+			if (exec) return exec as RpcResponse;
+			const unknownCommand = command as { type: string };
+			return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};
@@ -804,8 +832,35 @@ export async function runRpcMode(
 		process.exit(0);
 	}
 
-	// Listen for JSON input using Bun's stdin
-	for await (const parsed of readJsonl(Bun.stdin.stream())) {
+	// AWS-CORP: custom — merge with care
+	// Forward TUI output (showStatus/showError/showWarning) through the pipe.
+	// Only fires in headed+pipe mode (InteractiveMode emits when #eventBus is set).
+	if (eventBus) {
+		eventBus.on(PIPE_TUI_OUTPUT_CHANNEL, (data) => {
+			output({ type: "tui_output", ...(data as import("../../utils/event-bus").TuiOutputPayload) });
+		});
+	}
+
+	// Signal slave is fully ready — master counter=1 at spawn drops to 0 on this frame.
+	// Triggers LLM turn so agent knows the slave is live without polling or separate check.
+	if (pipeSocket) {
+		output({
+			type: "exec_step_result",
+			stepIndex: 0,
+			stepType: "startup",
+			remaining: 0,   // counter drops to 0 on master → scheduleInput("slave(s) responded")
+			sections: {
+				system: `pid=${process.pid} version=${VERSION}`,  // pid and version in system label
+			},
+		});
+	}
+
+	// Listen for JSON input from pipe (headed mode) or stdin (headless mode)
+	const inputStream = pipeSocket
+		? pipeSocket.readLines()
+		: readJsonl(Bun.stdin.stream());
+
+	for await (const parsed of inputStream) {
 		try {
 			// Handle extension UI responses
 			if ((parsed as RpcExtensionUIResponse).type === "extension_ui_response") {
@@ -844,7 +899,9 @@ export async function runRpcMode(
 		}
 	}
 
-	// stdin closed — RPC client is gone, exit cleanly
+	// AWS-CORP: custom — merge with care
+	// Connection closed — RPC client is gone, exit cleanly (pipe or stdin)
+	if (pipeSocket) pipeSocket.destroy();
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	process.exit(0);

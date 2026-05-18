@@ -1,3 +1,4 @@
+// AWS-CORP: custom — merge with care
 import { MMEMORY_SCHEMA_ENTRIES, type MmemorySettings } from "./settings-schema-m-extensions";
 import { PRUNE_SCHEMA_ENTRIES } from "./settings-schema-m-prune";
 import { SCRIPT_SCHEMA_ENTRIES } from "./settings-schema-m-scripts";
@@ -317,6 +318,7 @@ export const SETTINGS_SCHEMA = {
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
+	// AWS-CORP: custom — merge with care
 	disabledCommands: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
@@ -883,6 +885,7 @@ export const SETTINGS_SCHEMA = {
 	// Input and startup
 	doubleEscapeAction: {
 		type: "enum",
+		// AWS-CORP: custom — merge with care
 		values: ["branch", "tree", "mtree", "none"] as const,
 		default: "tree",
 		ui: {
@@ -1246,6 +1249,7 @@ export const SETTINGS_SCHEMA = {
 	// the local backend; see config/settings.ts migration for details.
 	"memory.backend": {
 		type: "enum",
+		// AWS-CORP: custom — merge with care
 		values: ["off", "local", "hindsight", "mmemory"] as const,
 		default: "off",
 		ui: {
@@ -1253,6 +1257,7 @@ export const SETTINGS_SCHEMA = {
 			label: "Memory Backend",
 			description: "Off, local memory pipeline, or Hindsight remote memory",
 			options: [
+				// AWS-CORP: custom — merge with care
 				{ value: "off",      label: "Off",       description: "No memory subsystem runs" },
 				{ value: "local",    label: "Local",     description: "Local rollout summarisation pipeline (memory_summary.md)" },
 				{ value: "hindsight",label: "Hindsight", description: "Vectorize Hindsight remote memory service" },
@@ -1994,6 +1999,7 @@ export const SETTINGS_SCHEMA = {
 			description: "Launch browser in headless mode (disable to show browser UI)",
 		},
 	},
+	// AWS-CORP: custom — merge with care
 	"browser.connectUrl": {
 		type: "string",
 		default: undefined,
@@ -2015,6 +2021,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// AWS-CORP: custom — merge with care
 	"mbrowser.enabled": {
 		type: "boolean",
 		default: true,
@@ -2792,6 +2799,7 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
+	// AWS-CORP: custom — merge with care
 	...SCRIPT_SCHEMA_ENTRIES,
 	...PRUNE_SCHEMA_ENTRIES,
 } as const;
@@ -2939,6 +2947,7 @@ export interface SkillsSettings {
 	ignoredSkills?: string[];
 	includeSkills?: string[];
 	disabledExtensions?: string[];
+	// AWS-CORP: custom — merge with care
 	disabledCommands?: string[];
 }
 
@@ -3025,6 +3034,7 @@ export interface GroupTypeMap {
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;
+	// AWS-CORP: custom — merge with care
 	mmemory: MmemorySettings;
 
 }

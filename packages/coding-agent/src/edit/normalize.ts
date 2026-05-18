@@ -12,8 +12,10 @@ import { padding } from "@oh-my-pi/pi-tui";
 
 export type LineEnding = "\r\n" | "\n";
 
+// AWS-CORP: custom — merge with care
 /** Detect the predominant line ending in content (count-based, handles mixed endings) */
 export function detectLineEnding(content: string): LineEnding {
+	// AWS-CORP: custom — merge with care
 	let crlf = 0;
 	let lf = 0;
 	for (let i = 0; i < content.length; i++) {

@@ -2,6 +2,7 @@ import type { AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
 import type { PromptTemplate } from "../config/prompt-templates";
+// AWS-CORP: custom — merge with care
 import type { Settings, SettingPath } from "../config/settings";
 import { SETTINGS_SCHEMA } from "../config/settings-schema";
 import { EditTool } from "../edit";
@@ -28,6 +29,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
+// AWS-CORP: custom — merge with care
 import { MBrowserTool } from "./mbrowser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
@@ -41,6 +43,7 @@ import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
+// AWS-CORP: custom — merge with care
 import { MCommandTool } from "./mcommand";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
@@ -152,6 +155,7 @@ export interface ToolSession {
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get session ID */
+	// AWS-CORP: custom — merge with care
 	/** Track tool-owned task work so ESC can abort it independently of the full agent loop. */
 	trackTaskExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	getSessionId?: () => string | null;
@@ -255,6 +259,7 @@ export interface ToolSession {
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
+	// AWS-CORP: custom — merge with care
 	/** Active skill role bindings: maps tool name → model role.
 	 *  Populated from skills that have both `role` and `tools` frontmatter fields.
 	 *  Tools can check this to prefer a skill-specified role over config defaults. */
@@ -307,6 +312,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
+	// AWS-CORP: custom — merge with care
 	mbrowser: s => new MBrowserTool(s),
 	mcommand: MCommandTool.createIf,
 	checkpoint: CheckpointTool.createIf,
@@ -489,6 +495,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			const currentDepth = session.taskDepth ?? 0;
 			return maxDepth < 0 || currentDepth < maxDepth;
 		}
+		// AWS-CORP: custom — merge with care
 		if (name === "mbrowser") return session.settings.get("mbrowser.enabled");
 		if (name === "mreview") return session.settings.get("mreview.enabled");
 		if (name.startsWith("mmemory")) {

@@ -183,6 +183,8 @@ import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
 
+// AWS-CORP: custom — merge with care
+
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -669,6 +671,7 @@ function extractPermissionLocations(
 	return out;
 }
 
+// AWS-CORP: custom — merge with care
 // ============================================================================
 // ACP Permission Gate
 // ============================================================================
@@ -817,6 +820,7 @@ export class AgentSession {
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
+	// AWS-CORP: custom — merge with care
 	// Task execution state
 	#taskAbortControllers = new Set<AbortController>();
 
@@ -931,6 +935,7 @@ export class AgentSession {
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
+	// AWS-CORP: custom — merge with care
 	/** Opaque state slot for the mmemory MemoryBackend. Avoids circular import. */
 	#mmemoryBackendState: unknown = undefined;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
@@ -1200,6 +1205,7 @@ export class AgentSession {
 		return previous;
 	}
 
+	// AWS-CORP: custom — merge with care
 	getMmemoryBackendState(): unknown {
 		return this.#mmemoryBackendState;
 	}
@@ -1294,6 +1300,8 @@ export class AgentSession {
 		AsyncJobManager.instance()?.cancelAll({ ownerId: this.#agentId });
 	}
 
+
+// AWS-CORP: custom — merge with care
 
 	// =========================================================================
 	// Event Subscription
@@ -4170,6 +4178,7 @@ export class AgentSession {
 			return this.#extensionRunner.createCommandContext();
 		}
 
+		// AWS-CORP: custom — merge with care
 		const ac = new AbortController();
 		return {
 			ui: noOpUIContext,
@@ -4222,6 +4231,7 @@ export class AgentSession {
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
+			// AWS-CORP: custom — merge with care
 			taskDepth: 0,
 			signal: ac.signal,
 		};
@@ -4728,6 +4738,7 @@ export class AgentSession {
 		this.abortHandoff();
 		this.abortBash();
 		this.abortEval();
+		// AWS-CORP: custom — merge with care
 		this.abortTask();
 		const postPromptDrain = this.#cancelPostPromptTasks();
 		this.agent.abort();
@@ -7466,6 +7477,7 @@ export class AgentSession {
 		return this.#evalAbortControllers.size > 0;
 	}
 
+	// AWS-CORP: custom — merge with care
 	/**
 	 * Track task execution started by the task tool so ESC can abort it independently.
 	 */
@@ -8290,12 +8302,15 @@ export class AgentSession {
 			if (message.role === "assistant") {
 				const assistantMsg = message as AssistantMessage;
 				toolCalls += assistantMsg.content.filter(c => c.type === "toolCall").length;
-				totalInput += assistantMsg.usage.input;
-				totalOutput += assistantMsg.usage.output;
-				totalCacheRead += assistantMsg.usage.cacheRead;
-				totalCacheWrite += assistantMsg.usage.cacheWrite;
-				totalPremiumRequests += assistantMsg.usage.premiumRequests ?? 0;
-				totalCost += assistantMsg.usage.cost?.total ?? 0;
+				// AWS-CORP: custom — merge with care
+				if (assistantMsg.usage) {
+					totalInput += assistantMsg.usage.input;
+					totalOutput += assistantMsg.usage.output;
+					totalCacheRead += assistantMsg.usage.cacheRead;
+					totalCacheWrite += assistantMsg.usage.cacheWrite;
+					totalPremiumRequests += assistantMsg.usage.premiumRequests ?? 0;
+					totalCost += assistantMsg.usage.cost?.total ?? 0;
+				}
 			}
 
 			if (message.role === "toolResult" && message.toolName === "task") {
@@ -8306,6 +8321,7 @@ export class AgentSession {
 					totalCacheRead += usage.cacheRead;
 					totalCacheWrite += usage.cacheWrite;
 					totalPremiumRequests += usage.premiumRequests ?? 0;
+					// AWS-CORP: custom — merge with care
 					totalCost += usage.cost?.total ?? 0;
 				}
 			}

@@ -47,6 +47,7 @@ export interface BedrockOptions extends StreamOptions {
 	thinkingBudgets?: ThinkingBudgets;
 	/* Only supported by Claude 4.x models, see https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html#claude-messages-extended-thinking-tool-use-interleaved */
 	interleavedThinking?: boolean;
+	// AWS-CORP: custom — merge with care
 	/** Pre-resolved credentials. When set, skips resolveAwsCredentials. */
 	credentials?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
 	/** Override the model ID / inference profile ARN (required for corp inference profiles). */
@@ -189,22 +190,43 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
 			}
 
+			// AWS-CORP: custom — merge with care
+			const messages = convertMessages(context, model, cacheRetention);
+			// Bedrock requires toolConfig whenever any message in the history contains a
+			// toolUse or toolResult block — even if this specific call defines no tools.
+			// Without it Bedrock returns HTTP 400: "toolConfig field must be defined".
+			const hasToolBlocks = messages.some(m =>
+				m.content.some((c: unknown) => typeof c === "object" && c !== null && ("toolUse" in c || "toolResult" in c)),
+			);
+			const effectiveToolConfig = toolConfig ?? (hasToolBlocks ? {
+				// Bedrock requires at least one tool when toolConfig is present.
+				// Use a placeholder so the request validates without enabling actual tool use.
+				tools: [{ toolSpec: { name: "noop", description: "noop", inputSchema: { json: { type: "object", properties: {} } } } }],
+				toolChoice: { auto: {} } as WireToolChoice,
+			} : undefined);
+
 			const commandInput: ConverseStreamRequest = {
-				messages: convertMessages(context, model, cacheRetention),
+				// AWS-CORP: custom — merge with care
+				messages,
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
 					temperature: options.temperature,
 					topP: options.topP,
 				},
-				toolConfig,
+				// AWS-CORP: custom — merge with care
+				toolConfig: effectiveToolConfig,
 				additionalModelRequestFields,
 			};
 			options?.onPayload?.(commandInput);
 
 			const host = `bedrock-runtime.${region}.amazonaws.com`;
+			// AWS-CORP: custom — merge with care
 			const effectiveModelId = options.modelIdOverride ?? model.id;
 			const url = `https://${host}/model/${encodeURIComponent(effectiveModelId)}/converse-stream`;
+			// For SigV4, pass the pre-encoded path — canonicalPath will encode it once more.
+			// AWS Bedrock verifier applies the same single-encode pass to the received URL path,
+			// so both sides produce the same canonical string (e.g. %3A → %253A).
 			const urlPath = `/model/${encodeURIComponent(effectiveModelId)}/converse-stream`;
 			rawRequestDump = {
 				provider: model.provider,
@@ -216,11 +238,18 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			};
 
 			let credentials: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
-			if ($flag("AWS_BEDROCK_SKIP_AUTH")) {
+			// AWS-CORP: custom — merge with care
+			if (options.credentials) {
+				// Injected credentials (e.g. from aws-corp) always take priority.
+				credentials = options.credentials;
+			} else if ($flag("AWS_BEDROCK_SKIP_AUTH")) {
 				credentials = { accessKeyId: "dummy-access-key", secretAccessKey: "dummy-secret-key" };
 			} else {
-				credentials = options.credentials
-					?? await resolveAwsCredentials({ profile: options.profile, region, signal: options.signal });
+				// AWS-CORP: custom — merge with care
+				credentials = await resolveAwsCredentials({ profile: options.profile, region, signal: options.signal });
+			}
+			if ($flag("AWS_BEDROCK_DEBUG")) {
+				console.error(`[bedrock] url=${url} accessKeyId=${credentials.accessKeyId.slice(0,8)} sessionToken=${credentials.sessionToken ? "present(" + credentials.sessionToken.slice(0,8) + "...)" : "MISSING"} source=${options.credentials ? "injected" : "resolved"}`);
 			}
 
 			const bodyText = JSON.stringify(commandInput);

@@ -22,7 +22,7 @@ import type { ExtensionAPI, ExtensionContext } from "./extensibility/extensions"
 import type { ReadonlySessionManager } from "./session/session-manager";
 import { completeSimple, validateToolCall } from "@oh-my-pi/pi-ai";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
-import { Type } from "@sinclair/typebox";
+import { Type } from "./extensibility/typebox";
 import { resolveRoleModel } from "./utils/m-utils";
 import {
 	STRIP_TAGS_REGEX,
@@ -430,8 +430,13 @@ async function drainPendingConsolidation(state: MmemorySessionState, ctx: Extens
 			logger.debug(`[mmemory] before_agent_start: mental models len=${state.mentalModelsSnippet?.length ?? 0}`, { source: "mmemory" });
 		}
 
-		// First turn: recall and cache snippet for subsequent turns
-		if (!state.hasRecalledForFirstTurn) {
+		// First turn: recall and cache snippet for subsequent turns.
+		// Skip on --resume: the session already has message history, so this is
+		// not actually the first turn — recall already ran in the original session.
+		const isResumedSession = ctx.sessionManager.getEntries().some(e => e.type === "message");
+		if (isResumedSession) {
+			state.hasRecalledForFirstTurn = true; // suppress retry logic on resume
+		} else if (!state.hasRecalledForFirstTurn) {
 			state.hasRecalledForFirstTurn = true;
 			const messages = (event as { messages?: { role: string; content: unknown }[] }).messages ?? [];
 			const rawQuery = composeRecallQuery(event.prompt, messages, state.config.retainContextTurns);

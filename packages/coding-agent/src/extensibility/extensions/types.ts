@@ -26,15 +26,20 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/util
 import type * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 
+// AWS-CORP: custom — merge with care
+
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
+// AWS-CORP: custom — merge with care
 import type { PythonExecutorOptions } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
+
+// AWS-CORP: custom — merge with care
 
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -288,6 +293,7 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
+	// AWS-CORP: custom — merge with care
 	/** Execute Python code via the shared kernel (session-scoped or per-call). */
 	executePython?(
 		code: string,
@@ -326,6 +332,8 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Navigate to a different point in the session tree. */
 	navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 
+
+// AWS-CORP: custom — merge with care
 
 	/** AbortSignal for the current command invocation. */
 	signal: AbortSignal;
@@ -384,6 +392,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	// AWS-CORP: custom — merge with care
 	/** Short snippet included in the tool prompt section to guide LLM tool selection. */
 	promptSnippet?: string;
 	/** Execute the tool. */
@@ -1224,6 +1233,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	// AWS-CORP: custom — merge with care
 	executePython?: ExtensionContext["executePython"];
 }
 

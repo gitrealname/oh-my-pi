@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+// AWS-CORP: custom — merge with care
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { hasMReviewHtml, openMReviewSession } from "../tools/mreview/index";
@@ -31,6 +32,7 @@ import { Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
+// AWS-CORP: custom — merge with care
 import { serializeBatchForSummarizer } from "../session/compaction/mprune-batch";
 import { buildSummarizerPrompt } from "../session/compaction/mprune-prompt";
 import { buildStatsLines, loadPersistentStats } from "../session/compaction/mprune-stats";
@@ -50,6 +52,7 @@ import {
 } from "../extensibility/plugins/marketplace";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { InteractiveModeContext } from "../modes/types";
+// AWS-CORP: custom — merge with care
 import type { ExtensionContext } from "../extensibility/extensions/types";
 import { getChangelogPath, parseChangelog } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
@@ -61,6 +64,7 @@ import { handleSshAcp } from "./helpers/ssh";
 import { handleTodoAcp } from "./helpers/todo";
 import { buildUsageReportText } from "./helpers/usage-report";
 import { parseMarketplaceInstallArgs, parsePluginScopeArgs } from "./marketplace-install-parser";
+// AWS-CORP: custom — merge with care
 import type { SessionMessageEntry } from "../session/session-manager";
 import type {
 	BuiltinSlashCommand,
@@ -88,6 +92,8 @@ const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashComma
 	return commandConsumed();
 };
 
+
+// AWS-CORP: custom — merge with care
 
 
 async function callLLMForMemory(
@@ -1126,6 +1132,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			runtime.ctx.editor.setText("");
 		},
 	},
+	// AWS-CORP: custom — merge with care
 	{
 		name: "mtree",
 		description: "Session tree with Ctrl+↓ peek preview",
@@ -2076,6 +2083,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Quit the application",
 		handleTui: shutdownHandlerTui,
 	},
+	// AWS-CORP: custom — merge with care
 	{
 		name: "mreview",
 		description: "Open a markdown file in the browser review UI with AI chat",
@@ -2133,17 +2141,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			try {
 			result = await handleMtuicontrol(
 				command.args ?? "",
-			// asyncSubmit: deferred via setImmediate so the session loop has time to
-			// re-register onInputCallback before the wake fires.
-			// Called for master-only results (list, stop) and slave counter=0.
-			(text) => {
-				setImmediate(() => {
-					void runtime.ctx.session.waitForIdle().then(() => {
-						runtime.ctx.editor.onSubmit?.(text);
-					});
-				});
-				return Promise.resolve();
-			},
+			// asyncSubmit: replaces scheduleInput() which was removed upstream.
+			// Exact equivalent: waitForIdle so session loop re-registers onInputCallback,
+			// then fire editor.onSubmit which routes through executeBuiltinSlashCommand.
+			// setImmediate defers until current microtask queue drains (same as old impl).
+			(text) => { setImmediate(() => runtime.ctx.session.waitForIdle().then(() => runtime.ctx.editor.onSubmit?.(text))); return Promise.resolve(); },
 			// asyncDisplay: showStatus → "!" panel (user sees it); appendCustomResult →
 			// agent.#state.messages with display:false (LLM sees it when woken, no render).
 			(text) => { runtime.ctx.showStatus(text); appendCustomResult(runtime.ctx.session, "mtuicontrol", text); },
@@ -2152,18 +2154,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				result = `[mtuicontrol] unhandled error: ${e instanceof Error ? e.message : String(e)}`;
 			}
 			logger.debug("[mtuicontrol] builtin-registry result", { result: (result ?? "").slice(0, 120), len: (result ?? "").length });
-			// Schedule the sync result as input — same path as user hitting Enter.
-			// With reply() paths, result="" and asyncSubmit already fired via setImmediate.
-			setImmediate(() => {
-				void runtime.ctx.session.waitForIdle().then(() => {
-					runtime.ctx.editor.onSubmit?.(result!);
-				});
-			});
+			// Sync result delivery — same path. result="" on async (reply) paths.
+			if (result) setImmediate(() => runtime.ctx.session.waitForIdle().then(() => runtime.ctx.editor.onSubmit?.(result)));
 		},
 	},
 
 ];
 
+// AWS-CORP: custom — merge with care
 function isCommandEnabled(name: string): boolean {
 	const disabled = settings.get("disabledCommands" as SettingPath) as string[] | undefined;
 	return !disabled?.includes(name);
@@ -2177,6 +2175,7 @@ for (const command of BUILTIN_SLASH_COMMAND_REGISTRY) {
 }
 
 /** Builtin command metadata used for slash-command autocomplete and help text. */
+// AWS-CORP: custom — merge with care
 export function getBuiltinSlashCommandDefs(): ReadonlyArray<BuiltinSlashCommand> {
 	return BUILTIN_SLASH_COMMAND_REGISTRY
 		.filter(c => isCommandEnabled(c.name))
@@ -2221,6 +2220,7 @@ export async function executeBuiltinSlashCommand(
 
 	const command = BUILTIN_SLASH_COMMAND_LOOKUP.get(parsed.name);
 	if (!command) return false;
+	// AWS-CORP: custom — merge with care
 	if (!isCommandEnabled(command.name)) return false;
 	if (parsed.args.length > 0 && !command.allowArgs) {
 		return false;

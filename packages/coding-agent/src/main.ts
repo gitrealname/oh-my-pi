@@ -644,6 +644,7 @@ async function buildSessionOptions(
 		options.enableLsp = false;
 	}
 
+	// AWS-CORP: custom — merge with care
 	if (parsed.noMemory) {
 		activeSettings.override("mmemory.enabled", false);
 	}
@@ -965,8 +966,18 @@ export async function runRootCommand(
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined);
+			// AWS-CORP: custom — merge with care
+			await runRpcMode(session, eventBus, mode === "rpc-ui" ? setToolUIContext : undefined);
 		} else if (isInteractive) {
+			// AWS-CORP: custom — merge with care
+			// If --rpc-pipe is present, start the RPC command handler as a parallel
+			// background task alongside the TUI. runRpcMode() detects --rpc-pipe
+			// internally and connects to the pipe instead of using stdin/stdout.
+			if (process.argv.includes("--rpc-pipe")) {
+				const pipeArg = process.argv[process.argv.indexOf("--rpc-pipe") + 1];
+				logger.debug("[main] headed+pipe mode", { version: VERSION, pipeArg });
+				void runRpcMode(session, eventBus);
+			}
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
 
