@@ -1,4 +1,5 @@
 import { INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
+import { calculatePromptTokens } from "@oh-my-pi/pi-agent-core/compaction/compaction";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import { type Component, Loader, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { settings } from "../../config/settings";
@@ -15,7 +16,6 @@ import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { calculatePromptTokens } from "../../session/compaction/compaction";
 import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
 
@@ -64,6 +64,7 @@ export class EventController {
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
 			thinking_level_changed: async () => {},
+			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 
@@ -718,9 +719,8 @@ export class EventController {
 
 	#scheduleIdleCompaction(): void {
 		this.#cancelIdleCompaction();
-		// Don't schedule while compaction/handoff is already running — the agent_end from a
-		// handoff agent turn still has the old session's bloated token counts, and scheduling
-		// here would fire after the session resets, trying to handoff an empty session.
+		// Don't schedule idle work while context maintenance is already running; the
+		// maintenance flow may reset the session before this timer fires.
 		if (this.ctx.session.isCompacting) return;
 
 		const idleSettings = settings.getGroup("compaction");

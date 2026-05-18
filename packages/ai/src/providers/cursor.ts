@@ -3,8 +3,7 @@ import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import { sanitizeText } from "@oh-my-pi/pi-natives";
-import { $env } from "@oh-my-pi/pi-utils";
+import { $env, extractHttpStatusFromError, sanitizeText } from "@oh-my-pi/pi-utils";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -30,6 +29,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
+import { toolWireSchema } from "../utils/schema/wire";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
@@ -547,6 +547,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorStatus = extractHttpStatusFromError(error);
 			output.errorMessage = formatErrorMessageWithRetryAfter(error);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -2067,7 +2068,7 @@ function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[]
 	}
 
 	return advertisedTools.map(tool => {
-		const jsonSchema = tool.parameters as Record<string, unknown> | undefined;
+		const jsonSchema = toolWireSchema(tool);
 		const schemaValue: JsonValue =
 			jsonSchema && typeof jsonSchema === "object"
 				? (jsonSchema as JsonValue)

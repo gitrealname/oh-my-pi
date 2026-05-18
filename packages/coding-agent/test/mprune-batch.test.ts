@@ -28,6 +28,7 @@ function makeTurnEnd(toolResults: Array<{
 			toolCallId: r.toolCallId,
 			toolName: r.toolName,
 			content: r.content as any,
+			isError: false,
 			prunedAt: r.prunedAt,
 			timestamp: Date.now(),
 		})),

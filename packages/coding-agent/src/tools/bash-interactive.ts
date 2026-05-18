@@ -1,5 +1,5 @@
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import { type PtyRunResult, PtySession, sanitizeText } from "@oh-my-pi/pi-natives";
+import { type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import {
 	type Component,
 	extractPrintableText,
@@ -10,6 +10,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
 import { Settings } from "../config/settings";
@@ -27,7 +28,7 @@ export interface BashInteractiveResult extends OutputSummary {
 }
 
 function normalizeCaptureChunk(chunk: string): string {
-	const normalized = chunk.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n");
+	const normalized = chunk.replace(/\r\n?/gu, "\n");
 	return sanitizeWithOptionalSixelPassthrough(normalized, sanitizeText);
 }
 
@@ -297,6 +298,7 @@ export async function runInteractiveBashPty(
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = await Settings.init();
+	const { shell: resolvedShell } = settings.getShellConfig();
 	const sink = new OutputSink({
 		artifactPath: options.artifactPath,
 		artifactId: options.artifactId,
@@ -363,6 +365,7 @@ export async function runInteractiveBashPty(
 						signal: options.signal,
 						cols,
 						rows,
+						shell: resolvedShell,
 					},
 					(err, chunk) => {
 						if (finished || err || !chunk) return;

@@ -12,6 +12,7 @@ import type { Settings } from "../config/settings";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { AgentSession } from "../session/agent-session";
 
+// AWS-CORP: custom — merge with care
 export type MemoryBackendId = "off" | "local" | "hindsight" | "mmemory";
 
 export interface MemoryBackendStartOptions {
@@ -21,6 +22,7 @@ export interface MemoryBackendStartOptions {
 	agentDir: string;
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
+	// AWS-CORP: custom — merge with care
 	memory?: "none" | "inherit";
 }
 

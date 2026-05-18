@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { type AgentTool, INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
 import { buildSystemPrompt, buildSystemPromptToolMetadata } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { Type } from "@sinclair/typebox";
 import Handlebars from "handlebars";
+import * as z from "zod/v4";
 
 const baseGitContext = {
 	isRepo: true,
@@ -228,7 +228,7 @@ describe("system Handlebars prompt templates", () => {
 			expect(systemPrompt[1]).toContain("<workstation>");
 			expect(systemPrompt[1]).toContain("<workspace-tree>");
 			expect(systemPrompt[1]).toContain("Today is ");
-			expect(systemPrompt[1]).toContain(`current working directory is '${dir.replace(/\\/g, "/")}'.`);
+			expect(systemPrompt[1]).toContain(`current working directory is '${dir}'.`);
 			expect(systemPrompt[1].indexOf("</workspace-tree>")).toBeLessThan(systemPrompt[1].indexOf("Today is "));
 		});
 	});
@@ -320,7 +320,7 @@ describe("system Handlebars prompt templates", () => {
 			name: "edit",
 			label: "Edit",
 			description: "Edits files",
-			parameters: Type.Object({}),
+			parameters: z.object({}),
 			customWireName: "apply_patch",
 			execute: async () => ({ content: [] }),
 		} satisfies AgentTool;

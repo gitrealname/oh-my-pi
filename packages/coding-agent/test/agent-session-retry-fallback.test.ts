@@ -1,40 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { type AssistantMessage, Effort, getBundledModel, type Model } from "@oh-my-pi/pi-ai";
-import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { type AssistantMessage, Effort, getBundledModel, type Model, writeModelCache } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-
-class MockAssistantStream extends AssistantMessageEventStream {}
-
-function createAssistantMessage(
-	model: Model,
-	options: { text?: string; stopReason: "stop" | "error"; errorMessage?: string },
-): AssistantMessage {
-	return {
-		role: "assistant",
-		content: options.text ? [{ type: "text", text: options.text }] : [],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: options.stopReason,
-		errorMessage: options.errorMessage,
-		timestamp: Date.now(),
-	};
-}
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
@@ -65,6 +39,7 @@ function getLastAssistantMessage(session: AgentSession): AssistantMessage {
 }
 
 function createFallbackAgent(primaryModel: Model, requestedModels: string[]): Agent {
+	const mock = createMockModel();
 	let primaryAttempts = 0;
 	return new Agent({
 		getApiKey: provider => `${provider}-test-key`,
@@ -74,28 +49,15 @@ function createFallbackAgent(primaryModel: Model, requestedModels: string[]): Ag
 			tools: [],
 			messages: [],
 		},
-		streamFn: model => {
+		streamFn: (model, context, options) => {
 			requestedModels.push(`${model.provider}/${model.id}`);
-			const stream = new MockAssistantStream();
-			queueMicrotask(() => {
-				if (model.provider === primaryModel.provider && model.id === primaryModel.id && primaryAttempts === 0) {
-					primaryAttempts += 1;
-					const message = createAssistantMessage(model, {
-						stopReason: "error",
-						errorMessage: "rate limit exceeded retry-after-ms=200",
-					});
-					stream.push({ type: "start", partial: message });
-					stream.push({ type: "error", reason: "error", error: message });
-					return;
-				}
-				const message = createAssistantMessage(model, {
-					text: `ok:${model.provider}/${model.id}`,
-					stopReason: "stop",
-				});
-				stream.push({ type: "start", partial: createAssistantMessage(model, { text: "", stopReason: "stop" }) });
-				stream.push({ type: "done", reason: "stop", message });
-			});
-			return stream;
+			if (model.provider === primaryModel.provider && model.id === primaryModel.id && primaryAttempts === 0) {
+				primaryAttempts += 1;
+				mock.push({ throw: "rate limit exceeded retry-after-ms=200" });
+			} else {
+				mock.push({ content: [`ok:${model.provider}/${model.id}`] });
+			}
+			return mock.stream(model, context, options);
 		},
 	});
 }
@@ -121,6 +83,7 @@ describe("AgentSession retry fallback", () => {
 		}
 		authStorage.close();
 		tempDir.removeSync();
+		vi.restoreAllMocks();
 	});
 
 	it("advances through a role-keyed fallback chain across retries", async () => {
@@ -137,6 +100,7 @@ describe("AgentSession retry fallback", () => {
 		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
 		const fallbackSucceededEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_succeeded" }>> = [];
 
+		const mock = createMockModel();
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
@@ -145,43 +109,18 @@ describe("AgentSession retry fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: model => {
+			streamFn: (model, context, options) => {
 				requestedModels.push(`${model.provider}/${model.id}`);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					if (model.provider === primaryModel.provider && model.id === primaryModel.id) {
-						const message = createAssistantMessage(model, {
-							stopReason: "error",
-							errorMessage: "overloaded_error: provider returned error 503",
-						});
-						stream.push({ type: "start", partial: message });
-						stream.push({ type: "error", reason: "error", error: message });
-						return;
-					}
-					if (model.provider === firstFallback.provider && model.id === firstFallback.id) {
-						const message = createAssistantMessage(model, {
-							stopReason: "error",
-							errorMessage: "service unavailable: 503 overloaded",
-						});
-						stream.push({ type: "start", partial: message });
-						stream.push({ type: "error", reason: "error", error: message });
-						return;
-					}
-					if (model.provider === secondFallback.provider && model.id === secondFallback.id) {
-						const message = createAssistantMessage(model, {
-							text: "Recovered on second fallback",
-							stopReason: "stop",
-						});
-						stream.push({
-							type: "start",
-							partial: createAssistantMessage(model, { text: "", stopReason: "stop" }),
-						});
-						stream.push({ type: "done", reason: "stop", message });
-						return;
-					}
+				if (model.provider === primaryModel.provider && model.id === primaryModel.id) {
+					mock.push({ throw: "overloaded_error: provider returned error 503" });
+				} else if (model.provider === firstFallback.provider && model.id === firstFallback.id) {
+					mock.push({ throw: "service unavailable: 503 overloaded" });
+				} else if (model.provider === secondFallback.provider && model.id === secondFallback.id) {
+					mock.push({ content: ["Recovered on second fallback"] });
+				} else {
 					throw new Error(`Unexpected model requested during retry fallback test: ${model.provider}/${model.id}`);
-				});
-				return stream;
+				}
+				return mock.stream(model, context, options);
 			},
 		});
 
@@ -263,8 +202,10 @@ describe("AgentSession retry fallback", () => {
 
 		const timeoutMessage = "OpenAI responses stream timed out while waiting for the first event";
 		const requestedModels: string[] = [];
-		let attemptCount = 0;
 
+		const mock = createMockModel({
+			responses: [{ throw: timeoutMessage }, { content: ["Recovered after OpenAI timeout"] }],
+		});
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
@@ -273,35 +214,9 @@ describe("AgentSession retry fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: requestedModel => {
+			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					attemptCount += 1;
-					if (attemptCount === 1) {
-						const message = createAssistantMessage(requestedModel, {
-							stopReason: "error",
-							errorMessage: timeoutMessage,
-						});
-						stream.push({ type: "start", partial: message });
-						stream.push({ type: "error", reason: "error", error: message });
-						return;
-					}
-					if (attemptCount === 2) {
-						const message = createAssistantMessage(requestedModel, {
-							text: "Recovered after OpenAI timeout",
-							stopReason: "stop",
-						});
-						stream.push({
-							type: "start",
-							partial: createAssistantMessage(requestedModel, { text: "", stopReason: "stop" }),
-						});
-						stream.push({ type: "done", reason: "stop", message });
-						return;
-					}
-					throw new Error(`Unexpected retry attempt in timeout test: ${attemptCount}`);
-				});
-				return stream;
+				return mock.stream(requestedModel, context, options);
 			},
 		});
 
@@ -337,6 +252,64 @@ describe("AgentSession retry fallback", () => {
 		expect(lastAssistant.content).toContainEqual({ type: "text", text: "Recovered after OpenAI timeout" });
 	});
 
+	it("auto-retries stream stall errors", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) {
+			throw new Error("Expected bundled OpenAI test model to exist");
+		}
+
+		const stallMessage = "Provider stream stalled while waiting for the next event";
+		const requestedModels: string[] = [];
+
+		const mock = createMockModel({
+			responses: [{ throw: stallMessage }, { content: ["Recovered after stream stall"] }],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+
+		await session.prompt("Retry stream stall");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({
+			attempt: 1,
+			maxAttempts: 1,
+			errorMessage: stallMessage,
+		});
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+		const lastAssistant = getLastAssistantMessage(session);
+		expect(lastAssistant.stopReason).toBe("stop");
+		expect(lastAssistant.content).toContainEqual({ type: "text", text: "Recovered after stream stall" });
+	});
+
 	it("auto-retries OpenAI processing-request transient errors", async () => {
 		const model = getBundledModel("openai", "gpt-4o-mini");
 		if (!model) {
@@ -346,8 +319,10 @@ describe("AgentSession retry fallback", () => {
 		const processingError =
 			"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 4a4c6b73-a07c-4de0-aaaf-82560f9f626a in your message.";
 		const requestedModels: string[] = [];
-		let attemptCount = 0;
 
+		const mock = createMockModel({
+			responses: [{ throw: processingError }, { content: ["Recovered after OpenAI processing error"] }],
+		});
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
@@ -356,35 +331,9 @@ describe("AgentSession retry fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: requestedModel => {
+			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					attemptCount += 1;
-					if (attemptCount === 1) {
-						const message = createAssistantMessage(requestedModel, {
-							stopReason: "error",
-							errorMessage: processingError,
-						});
-						stream.push({ type: "start", partial: message });
-						stream.push({ type: "error", reason: "error", error: message });
-						return;
-					}
-					if (attemptCount === 2) {
-						const message = createAssistantMessage(requestedModel, {
-							text: "Recovered after OpenAI processing error",
-							stopReason: "stop",
-						});
-						stream.push({
-							type: "start",
-							partial: createAssistantMessage(requestedModel, { text: "", stopReason: "stop" }),
-						});
-						stream.push({ type: "done", reason: "stop", message });
-						return;
-					}
-					throw new Error(`Unexpected retry attempt in processing-error test: ${attemptCount}`);
-				});
-				return stream;
+				return mock.stream(requestedModel, context, options);
 			},
 		});
 
@@ -431,8 +380,10 @@ describe("AgentSession retry fallback", () => {
 
 		const envelopeError = "Anthropic stream envelope error: received content_block_start before message_start";
 		const requestedModels: string[] = [];
-		let attemptCount = 0;
 
+		const mock = createMockModel({
+			responses: [{ throw: envelopeError }, { content: ["Recovered after Anthropic envelope retry"] }],
+		});
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
@@ -441,35 +392,9 @@ describe("AgentSession retry fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: requestedModel => {
+			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					attemptCount += 1;
-					if (attemptCount === 1) {
-						const message = createAssistantMessage(requestedModel, {
-							stopReason: "error",
-							errorMessage: envelopeError,
-						});
-						stream.push({ type: "start", partial: message });
-						stream.push({ type: "error", reason: "error", error: message });
-						return;
-					}
-					if (attemptCount === 2) {
-						const message = createAssistantMessage(requestedModel, {
-							text: "Recovered after Anthropic envelope retry",
-							stopReason: "stop",
-						});
-						stream.push({
-							type: "start",
-							partial: createAssistantMessage(requestedModel, { text: "", stopReason: "stop" }),
-						});
-						stream.push({ type: "done", reason: "stop", message });
-						return;
-					}
-					throw new Error(`Unexpected retry attempt in Anthropic envelope test: ${attemptCount}`);
-				});
-				return stream;
+				return mock.stream(requestedModel, context, options);
 			},
 		});
 
@@ -517,6 +442,7 @@ describe("AgentSession retry fallback", () => {
 		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
 		const fallbackSucceededEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_succeeded" }>> = [];
 
+		const mock = createMockModel({ handler: () => ({ throw: envelopeError }) });
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
@@ -525,18 +451,9 @@ describe("AgentSession retry fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: requestedModel => {
+			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					const message = createAssistantMessage(requestedModel, {
-						stopReason: "error",
-						errorMessage: envelopeError,
-					});
-					stream.push({ type: "start", partial: message });
-					stream.push({ type: "error", reason: "error", error: message });
-				});
-				return stream;
+				return mock.stream(requestedModel, context, options);
 			},
 		});
 
@@ -586,6 +503,7 @@ describe("AgentSession retry fallback", () => {
 		}
 
 		const requestedModels: string[] = [];
+		const mock = createMockModel({ handler: () => ({ throw: "Request was aborted." }) });
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: {
@@ -594,18 +512,9 @@ describe("AgentSession retry fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: requestedModel => {
+			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
-					const message = createAssistantMessage(requestedModel, {
-						stopReason: "error",
-						errorMessage: "Request was aborted.",
-					});
-					stream.push({ type: "start", partial: message });
-					stream.push({ type: "error", reason: "error", error: message });
-				});
-				return stream;
+				return mock.stream(requestedModel, context, options);
 			},
 		});
 
@@ -661,6 +570,8 @@ describe("AgentSession retry fallback", () => {
 			settings,
 			modelRegistry,
 		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
 
 		await session.prompt("First prompt triggers fallback");
 		await session.waitForIdle();
@@ -681,7 +592,7 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.provider).toBe(fallbackModel.provider);
 		expect(session.model?.id).toBe(fallbackModel.id);
 
-		await Bun.sleep(240);
+		now += 240;
 		await session.prompt("Third prompt should lazily revert to primary");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([
@@ -721,6 +632,8 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 			thinkingLevel: Effort.High,
 		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
 
 		await session.prompt("First prompt triggers bare-selector fallback");
 		await session.waitForIdle();
@@ -733,7 +646,7 @@ describe("AgentSession retry fallback", () => {
 		expect(session.thinkingLevel).toBeUndefined();
 
 		session.setThinkingLevel(Effort.Low);
-		await Bun.sleep(240);
+		now += 240;
 		await session.prompt("Second prompt should restore model but preserve user thinking change");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([
@@ -744,6 +657,51 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.provider).toBe(primaryModel.provider);
 		expect(session.model?.id).toBe(primaryModel.id);
 		expect(session.thinkingLevel).toBeUndefined();
+	});
+
+	it("accepts cached Ollama Cloud fallback selectors during startup validation", () => {
+		const primaryModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel) {
+			throw new Error("Expected bundled OpenAI test model to exist");
+		}
+		const cachedModel: Model<"ollama-chat"> = {
+			id: "deepseek-v4-pro",
+			name: "DeepSeek V4 Pro",
+			api: "ollama-chat",
+			provider: "ollama-cloud",
+			baseUrl: "https://ollama.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 384_000,
+		};
+		writeModelCache("ollama-cloud", Date.now(), [cachedModel], true, "", path.join(tempDir.path(), "models.db"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.json"));
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.fallbackChains": { default: ["ollama-cloud/deepseek-v4-pro"] },
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				throw new Error("Not exercised");
+			},
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		expect(session.configWarnings).not.toContain(
+			"Fallback chain for role 'default' references unknown model: ollama-cloud/deepseek-v4-pro",
+		);
 	});
 
 	it("normalizes suppression by base selector and clears it on model refresh", async () => {

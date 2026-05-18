@@ -1,5 +1,5 @@
 /**
- * Internal URL router for internal protocols (agent://, artifact://, memory://, skill://, rule://, mcp://, pi://, local://).
+ * Internal URL router for internal protocols (agent://, artifact://, memory://, skill://, rule://, mcp://, omp://, local://).
  *
  * One process-global router with one handler per scheme. Access via
  * `InternalUrlRouter.instance()`. Handlers are stateless; per-session and
@@ -11,8 +11,8 @@ import { IssueProtocolHandler, PrProtocolHandler } from "./issue-pr-protocol";
 import { LocalProtocolHandler } from "./local-protocol";
 import { McpProtocolHandler } from "./mcp-protocol";
 import { MemoryProtocolHandler } from "./memory-protocol";
+import { OmpProtocolHandler } from "./omp-protocol";
 import { parseInternalUrl } from "./parse";
-import { PiProtocolHandler } from "./pi-protocol";
 import { RuleProtocolHandler } from "./rule-protocol";
 import { SkillProtocolHandler } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
@@ -23,7 +23,7 @@ export class InternalUrlRouter {
 	#handlers = new Map<string, ProtocolHandler>();
 
 	constructor() {
-		this.register(new PiProtocolHandler());
+		this.register(new OmpProtocolHandler());
 		this.register(new AgentProtocolHandler());
 		this.register(new ArtifactProtocolHandler());
 		this.register(new MemoryProtocolHandler());
@@ -48,6 +48,14 @@ export class InternalUrlRouter {
 
 	register(handler: ProtocolHandler): void {
 		this.#handlers.set(handler.scheme.toLowerCase(), handler);
+	}
+
+	unregister(scheme: string): boolean {
+		return this.#handlers.delete(scheme.toLowerCase());
+	}
+
+	getHandler(scheme: string): ProtocolHandler | undefined {
+		return this.#handlers.get(scheme.toLowerCase());
 	}
 
 	canHandle(input: string): boolean {

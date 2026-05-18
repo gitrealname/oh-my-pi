@@ -22,7 +22,7 @@
 		"experimentalDecorators": true,
 		"emitDecoratorMetadata": true,
 		"useDefineForClassFields": false,
-		"types": ["bun", "assets"],
+		"types": ["bun", "assets", "opentelemetry-api"],
 		"typeRoots": ["./types", "./node_modules/@types"],
 		"assumeChangesOnlyAffectDirectDependencies": true
 	}

@@ -11,6 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
+// AWS-CORP: custom — merge with care
 import { connectToPipe } from "./pipe-transport";
 import { handleRpcExecCommand, registerExecOutputFn } from "./rpc-inject-handler";
 import { type EventBus, PIPE_TUI_OUTPUT_CHANNEL } from "../../utils/event-bus";
@@ -24,6 +25,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
+import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -31,6 +33,8 @@ import type {
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
+	RpcHostUriCancelRequest,
+	RpcHostUriRequest,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc-types";
@@ -44,7 +48,14 @@ export type PendingExtensionRequest = {
 };
 
 type RpcOutput = (
-	obj: RpcResponse | RpcExtensionUIRequest | RpcHostToolCallRequest | RpcHostToolCancelRequest | object,
+	obj:
+		| RpcResponse
+		| RpcExtensionUIRequest
+		| RpcHostToolCallRequest
+		| RpcHostToolCancelRequest
+		| RpcHostUriRequest
+		| RpcHostUriCancelRequest
+		| object,
 ) => void;
 
 function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
@@ -159,9 +170,11 @@ export function requestRpcEditor(
  */
 export async function runRpcMode(
 	session: AgentSession,
+	// AWS-CORP: custom — merge with care
 	eventBus?: EventBus,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 ): Promise<never> {
+	// AWS-CORP: custom — merge with care
 	// Detect --rpc-pipe: use named pipe side-channel instead of stdin/stdout.
 	// Arg value is either a Unix socket path or a TCP port number (Windows).
 	const rpcPipeArg = process.argv.indexOf("--rpc-pipe");
@@ -178,14 +191,17 @@ export async function runRpcMode(
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
+	// AWS-CORP: custom — merge with care
 	// Signal ready: to pipe client if connected, otherwise to stdout
 	if (pipeSocket) pipeSocket.writeFrame({ type: "ready", pid: process.pid });
 	else process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+		// AWS-CORP: custom — merge with care
 		if (pipeSocket) pipeSocket.writeFrame(obj);
 		else process.stdout.write(`${JSON.stringify(obj)}\n`);
 	};
+	// AWS-CORP: custom — merge with care
 	// Register pipe write fn with exec queue — slave uses it to send exec_step_result frames.
 	registerExecOutputFn(output);
 	const emitRpcTitles = shouldEmitRpcTitles();
@@ -207,6 +223,7 @@ export async function runRpcMode(
 
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
 	const hostToolBridge = new RpcHostToolBridge(output);
+	const hostUriBridge = new RpcHostUriBridge(output);
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -458,28 +475,6 @@ export async function runRpcMode(
 		output(event);
 	});
 
-	// Forward TUI output (showStatus/showError/showWarning) through the pipe.
-	// Only fires in headed+pipe mode (InteractiveMode emits when #eventBus is set).
-	if (eventBus) {
-		eventBus.on(PIPE_TUI_OUTPUT_CHANNEL, (data) => {
-			output({ type: "tui_output", ...(data as import("../../utils/event-bus").TuiOutputPayload) });
-		});
-	}
-
-	// Signal slave is fully ready — master counter=1 at spawn drops to 0 on this frame.
-	// Triggers LLM turn so agent knows the slave is live without polling or separate check.
-	if (pipeSocket) {
-		output({
-			type: "exec_step_result",
-			stepIndex: 0,
-			stepType: "startup",
-			remaining: 0,   // counter drops to 0 on master → scheduleInput("slave(s) responded")
-			sections: {
-				system: `pid=${process.pid} version=${VERSION}`,  // pid and version in system label
-			},
-		});
-	}
-
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
@@ -572,6 +567,15 @@ export async function runRpcMode(
 				const rpcTools = hostToolBridge.setTools(tools);
 				await session.refreshRpcHostTools(rpcTools);
 				return success(id, "set_host_tools", { toolNames: tools.map(tool => tool.name) });
+			}
+
+			case "set_host_uri_schemes": {
+				try {
+					const schemes = hostUriBridge.setSchemes(command.schemes);
+					return success(id, "set_host_uri_schemes", { schemes });
+				} catch (err) {
+					return error(id, "set_host_uri_schemes", err instanceof Error ? err.message : String(err));
+				}
 			}
 
 			// =================================================================
@@ -805,7 +809,7 @@ export async function runRpcMode(
 			}
 
 			default: {
-
+			// AWS-CORP: custom — merge with care
 			const exec = await handleRpcExecCommand(command, session, success as never, error as never);
 			if (exec) return exec as RpcResponse;
 			const unknownCommand = command as { type: string };
@@ -826,6 +830,29 @@ export async function runRpcMode(
 		}
 
 		process.exit(0);
+	}
+
+	// AWS-CORP: custom — merge with care
+	// Forward TUI output (showStatus/showError/showWarning) through the pipe.
+	// Only fires in headed+pipe mode (InteractiveMode emits when #eventBus is set).
+	if (eventBus) {
+		eventBus.on(PIPE_TUI_OUTPUT_CHANNEL, (data) => {
+			output({ type: "tui_output", ...(data as import("../../utils/event-bus").TuiOutputPayload) });
+		});
+	}
+
+	// Signal slave is fully ready — master counter=1 at spawn drops to 0 on this frame.
+	// Triggers LLM turn so agent knows the slave is live without polling or separate check.
+	if (pipeSocket) {
+		output({
+			type: "exec_step_result",
+			stepIndex: 0,
+			stepType: "startup",
+			remaining: 0,   // counter drops to 0 on master → scheduleInput("slave(s) responded")
+			sections: {
+				system: `pid=${process.pid} version=${VERSION}`,  // pid and version in system label
+			},
+		});
 	}
 
 	// Listen for JSON input from pipe (headed mode) or stdin (headless mode)
@@ -855,6 +882,11 @@ export async function runRpcMode(
 				continue;
 			}
 
+			if (isRpcHostUriResult(parsed)) {
+				hostUriBridge.handleResult(parsed);
+				continue;
+			}
+
 			// Handle regular commands
 			const command = parsed as RpcCommand;
 			const response = await handleCommand(command);
@@ -867,8 +899,10 @@ export async function runRpcMode(
 		}
 	}
 
+	// AWS-CORP: custom — merge with care
 	// Connection closed — RPC client is gone, exit cleanly (pipe or stdin)
 	if (pipeSocket) pipeSocket.destroy();
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
+	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	process.exit(0);
 }

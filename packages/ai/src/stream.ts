@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, $pickenv } from "@oh-my-pi/pi-utils";
+import { $env, $pickenv, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
@@ -10,6 +10,7 @@ import {
 	requireSupportedEffort,
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+// AWS-CORP: custom — merge with care
 import { streamAwsCorp } from "./providers/aws-corp";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
@@ -20,6 +21,7 @@ import type { GoogleVertexOptions } from "./providers/google-vertex";
 import { isKimiModel, streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
+import { streamPiNative } from "./providers/pi-native-client";
 // Heavy provider stream functions are imported lazily via register-builtins,
 // which wraps each provider module in a dynamic import. This keeps the
 // AWS SDK, google-auth-library, @google/genai, @bufbuild/protobuf, and
@@ -45,7 +47,7 @@ import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
 import type {
 	Api,
 	AssistantMessage,
-	AssistantMessageEventStream,
+	AssistantMessageEvent,
 	Context,
 	Model,
 	OptionsForApi,
@@ -54,6 +56,7 @@ import type {
 	ThinkingBudgets,
 	ToolChoice,
 } from "./types";
+import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 
 let cachedVertexAdcCredentialsExists: boolean | null = null;
@@ -143,6 +146,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
+	// AWS-CORP: custom — merge with care
 	"aws-corp": () => {
 		if ($env.AWS_CORP_PROFILE || $env.AWS_CORP_SSO_SESSION) {
 			return "<authenticated>";
@@ -182,6 +186,15 @@ export function getEnvApiKey(provider: string): string | undefined {
 	return resolver?.();
 }
 
+/**
+ * Enumerate every provider that has an env-var fallback for `getEnvApiKey`.
+ * Used by `omp auth-broker migrate --include-env` to discover env-sourced keys
+ * that should be uploaded to the broker.
+ */
+export function listProvidersWithEnvKey(): string[] {
+	return Object.keys(serviceProviderMap);
+}
+
 export function stream<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
@@ -209,6 +222,7 @@ export function stream<TApi extends Api>(
 		return streamGoogleVertex(model as Model<"google-vertex">, context, options as GoogleVertexOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
+		// AWS-CORP: custom — merge with care
 		if (model.provider === "aws-corp") {
 			return streamAwsCorp(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
 		}
@@ -273,12 +287,117 @@ export async function complete<TApi extends Api>(
 	return s.result();
 }
 
+type AuthRetryFailure = {
+	error: unknown;
+	bufferedEvents: AssistantMessageEvent[];
+	terminalEvent?: Extract<AssistantMessageEvent, { type: "error" }>;
+};
+
+function extractStatusFromAssistantError(message: AssistantMessage): number | undefined {
+	if (message.errorStatus !== undefined) return message.errorStatus;
+	if (!message.errorMessage) return undefined;
+	return extractHttpStatusFromError({ message: message.errorMessage });
+}
+
+function createAssistantAuthError(message: AssistantMessage): Error & { status?: number } {
+	const error: Error & { status?: number } = new Error(message.errorMessage ?? "Provider authentication failed");
+	const status = extractStatusFromAssistantError(message);
+	if (status !== undefined) error.status = status;
+	return error;
+}
+
+function emitBufferedEvents(stream: AssistantMessageEventStream, events: AssistantMessageEvent[]): void {
+	for (const event of events) {
+		stream.push(event);
+	}
+}
+
 export function streamSimple<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	// Check custom API registry first (extension-provided APIs)
+	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
+	if (retryApiKey) {
+		const outer = new AssistantMessageEventStream();
+		const onAuthError = options!.onAuthError!;
+		const runAttempt = async (apiKey: string, captureAuthFailure: boolean): Promise<AuthRetryFailure | undefined> => {
+			const bufferedEvents: AssistantMessageEvent[] = [];
+			let emittedReplayUnsafeEvent = false;
+			const flushBuffered = (): void => {
+				emitBufferedEvents(outer, bufferedEvents);
+				bufferedEvents.length = 0;
+			};
+
+			try {
+				const inner = streamSimple(model, context, { ...options, apiKey, onAuthError: undefined });
+				for await (const event of inner) {
+					if (!emittedReplayUnsafeEvent && event.type === "start") {
+						bufferedEvents.push(event);
+						continue;
+					}
+					if (
+						!emittedReplayUnsafeEvent &&
+						captureAuthFailure &&
+						event.type === "error" &&
+						extractStatusFromAssistantError(event.error) === 401
+					) {
+						return { error: createAssistantAuthError(event.error), bufferedEvents, terminalEvent: event };
+					}
+					flushBuffered();
+					emittedReplayUnsafeEvent = true;
+					outer.push(event);
+					if (outer.done) return undefined;
+				}
+				flushBuffered();
+				if (!outer.done) outer.end(await inner.result());
+			} catch (error) {
+				if (!emittedReplayUnsafeEvent && captureAuthFailure && extractHttpStatusFromError(error) === 401) {
+					return { error, bufferedEvents };
+				}
+				flushBuffered();
+				outer.fail(error);
+			}
+			return undefined;
+		};
+		const emitFailure = (failure: AuthRetryFailure): void => {
+			emitBufferedEvents(outer, failure.bufferedEvents);
+			if (failure.terminalEvent) {
+				outer.push(failure.terminalEvent);
+			} else {
+				outer.fail(failure.error);
+			}
+		};
+
+		void (async () => {
+			const failure = await runAttempt(retryApiKey, true);
+			if (!failure) return;
+			let nextKey: string | undefined;
+			try {
+				nextKey = await onAuthError(model.provider, retryApiKey, failure.error);
+			} catch {
+				nextKey = undefined;
+			}
+			if (!nextKey || nextKey === retryApiKey) {
+				emitFailure(failure);
+				return;
+			}
+			await runAttempt(nextKey, false);
+		})();
+		return outer;
+	}
+
+	// Pi-native transport short-circuits the per-provider dispatch entirely:
+	// the gateway resolves provider + credential server-side, so we don't
+	// need an `apiKey` from `getEnvApiKey` here — `options.apiKey` carries
+	// the gateway bearer instead. Comes BEFORE the custom-API check so
+	// extension-registered APIs can't accidentally override a configured
+	// pi-native transport.
+	if (model.transport === "pi-native") {
+		return streamPiNative(model, context, options);
+	}
+
+	// Check custom API registry (extension-provided APIs)
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
 		return customApiProvider.streamSimple(model, context, options);

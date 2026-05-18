@@ -15,6 +15,7 @@ import {
 	isEnoent,
 	isRetryableError,
 	isUnexpectedSocketCloseMessage,
+	logger,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
 import { hasOpus47ApiRestrictions, mapEffortToAnthropicAdaptiveEffort } from "../model-thinking";
@@ -25,6 +26,7 @@ import type {
 	AssistantMessage,
 	CacheRetention,
 	Context,
+	FetchImpl,
 	ImageContent,
 	Message,
 	Model,
@@ -57,7 +59,8 @@ import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
-import { COMBINATOR_KEYS, NO_STRICT } from "../utils/schema";
+import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
+import { spillToDescription } from "../utils/schema/spill";
 import { notifyRawSseEvent, wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
 	buildCopilotDynamicHeaders,
@@ -201,6 +204,9 @@ type AnthropicSamplingParams = MessageCreateParamsStreaming & {
 	top_p?: number;
 	top_k?: number;
 };
+
+const ANTHROPIC_STOP_SEQUENCES_MAX = 4;
+let warnedStopSequencesTrim = false;
 
 /**
  * Adaptive thinking `display` is supported starting with Claude Opus 4.7.
@@ -541,6 +547,7 @@ export type AnthropicClientOptionsArgs = {
 	isOAuth?: boolean;
 	hasTools?: boolean;
 	onSseEvent?: AnthropicOptions["onSseEvent"];
+	fetch?: FetchImpl;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -965,6 +972,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					isOAuth: options?.isOAuth,
 					hasTools: !!context.tools?.length,
 					onSseEvent: options?.onSseEvent,
+					fetch: options?.fetch,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
@@ -1290,7 +1298,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					providerRetryAttempt++;
 					const delayMs = PROVIDER_BASE_DELAY_MS * 2 ** (providerRetryAttempt - 1);
-					await scheduler.wait(delayMs, { signal: options?.signal });
+					if (options?.providerRetryWait) {
+						await options.providerRetryWait(delayMs, options.signal);
+					} else {
+						await scheduler.wait(delayMs, { signal: options?.signal });
+					}
 					output.content.length = 0;
 					output.responseId = undefined;
 					output.errorMessage = strictFallbackErrorMessage;
@@ -1312,6 +1324,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			}
 			const firstEventTimeoutError = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
+			output.errorStatus = extractHttpStatusFromError(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;
@@ -1405,7 +1418,12 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const baseUrl = resolveAnthropicBaseUrl(model, apiKey);
 	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model);
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
-	const debugFetch = onSseEvent ? wrapFetchForSseDebug(fetch, event => onSseEvent(event, model)) : undefined;
+	const baseFetch = args.fetch ?? fetch;
+	const debugFetch = onSseEvent
+		? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model))
+		: args.fetch
+			? baseFetch
+			: undefined;
 	if (model.provider === "github-copilot") {
 		const copilotApiKey = parseGitHubCopilotApiKey(apiKey).accessToken;
 		const betaFeatures = [...extraBetas];
@@ -1772,6 +1790,18 @@ function buildParams(
 	if (options?.topK !== undefined) {
 		params.top_k = options.topK;
 	}
+	if (options?.stopSequences?.length) {
+		const seqs = options.stopSequences;
+		if (seqs.length > ANTHROPIC_STOP_SEQUENCES_MAX && !warnedStopSequencesTrim) {
+			warnedStopSequencesTrim = true;
+			logger.warn("anthropic: stop_sequences exceeds 4; extra entries dropped", {
+				received: seqs.length,
+				kept: ANTHROPIC_STOP_SEQUENCES_MAX,
+			});
+		}
+		params.stop_sequences =
+			seqs.length > ANTHROPIC_STOP_SEQUENCES_MAX ? seqs.slice(0, ANTHROPIC_STOP_SEQUENCES_MAX) : seqs;
+	}
 
 	// Opus 4.7+ rejects non-default sampling parameters with 400 error.
 	if (hasOpus47ApiRestrictions(model.id)) {
@@ -2064,7 +2094,57 @@ export function convertAnthropicMessages(
 	return params;
 }
 
-const ANTHROPIC_UNSUPPORTED_TOOL_SCHEMA_FIELDS = new Set(["maxItems", "patternProperties"]);
+/**
+ * JSON Schema whitelist for Anthropic tool `input_schema` nodes.
+ *
+ * Mirrors the Anthropic Python SDK's `lib/_parse/_transform.py::transform_schema`:
+ * we keep only structural/metadata keywords Anthropic's validator honors, and demote
+ * anything else into the node's `description` as `\n\n{key: value, ...}` so the model
+ * still sees the constraint as a natural-language hint.
+ *
+ * `Set` (not `Record<string, true>`) because membership is probed against arbitrary
+ * user/Zod-derived schema keys: a literal Record would falsely match prototype names
+ * like `"toString"` and silently strip valid properties.
+ */
+const ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP = new Set([
+	"$ref",
+	"$defs",
+	"$schema",
+	"definitions",
+	"type",
+	"anyOf",
+	"oneOf",
+	"allOf",
+	"enum",
+	"const",
+	"description",
+	"title",
+	"default",
+	"nullable",
+]);
+/** Keys preserved on `type: "object"` nodes (in addition to the universal set). */
+const ANTHROPIC_TOOL_SCHEMA_OBJECT_KEEP = new Set(["properties", "required", "additionalProperties"]);
+/** Keys preserved on `type: "array"` nodes; `minItems` only when its value is 0 or 1. */
+const ANTHROPIC_TOOL_SCHEMA_ARRAY_KEEP = new Set(["items", "prefixItems", "minItems"]);
+/** Keys preserved on `type: "string"` nodes; `format` only when its value is in the supported list. */
+const ANTHROPIC_TOOL_SCHEMA_STRING_KEEP = new Set(["format"]);
+/**
+ * String `format` values Anthropic accepts; everything else (including `pattern`-style
+ * format hints) gets demoted into `description`. Matches `SupportedStringFormats` in the
+ * Anthropic SDK's `_transform.py`.
+ */
+const ANTHROPIC_TOOL_SCHEMA_STRING_FORMATS = new Set([
+	"date-time",
+	"time",
+	"date",
+	"duration",
+	"email",
+	"hostname",
+	"uri",
+	"ipv4",
+	"ipv6",
+	"uuid",
+]);
 const ANTHROPIC_STRICT_TOOL_ALLOWLIST = new Set(["bash", "python", "edit", "find"]);
 const MAX_ANTHROPIC_STRICT_TOOLS = 20;
 const MAX_ANTHROPIC_STRICT_OPTIONAL_PARAMETERS = 24;
@@ -2086,68 +2166,149 @@ function isJsonSchemaObjectNode(schema: Record<string, unknown>): boolean {
 	return false;
 }
 
-function normalizeAnthropicToolSchema(
-	schema: unknown,
-	cache: WeakMap<Record<string, unknown>, Record<string, unknown>> = new WeakMap(),
-): unknown {
+/**
+ * Pick the principal non-null scalar type from a `type` keyword. Anthropic accepts
+ * `type` as either a single string or an array (e.g. `["number", "null"]` for a
+ * nullable value); the SDK whitelist is keyed off the scalar type, with `"null"`
+ * ignored so nullable variants are normalized as their underlying type.
+ */
+function pickAnthropicScalarType(type: unknown): string | undefined {
+	if (typeof type === "string") return type;
+	if (Array.isArray(type)) {
+		for (const entry of type) {
+			if (typeof entry === "string" && entry !== "null") return entry;
+		}
+	}
+	return undefined;
+}
+
+function anthropicPerTypeKeep(scalarType: string | undefined): Set<string> | undefined {
+	switch (scalarType) {
+		case "object":
+			return ANTHROPIC_TOOL_SCHEMA_OBJECT_KEEP;
+		case "array":
+			return ANTHROPIC_TOOL_SCHEMA_ARRAY_KEEP;
+		case "string":
+			return ANTHROPIC_TOOL_SCHEMA_STRING_KEEP;
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Per-schema-object memoization slot for the normalized Anthropic tool form. We stamp
+ * the result onto the host via a `Symbol` property (mirroring `utils/schema/stamps.ts`)
+ * instead of using a `WeakMap`: it's a single hidden-class slot, so warm reads are
+ * direct property access and write-once cycles resolve to the in-progress result.
+ */
+const kAnthropicToolNormal = Symbol("pi.schema.anthropic.toolNormal");
+
+/**
+ * Normalize a JSON Schema node for Anthropic tool `input_schema`.
+ *
+ * Applies the full whitelist semantics from the Anthropic Python SDK's
+ * `lib/_parse/_transform.py::transform_schema`:
+ *
+ * 1. Universal keys (`$ref`, `$defs`, `type`, `anyOf`/`oneOf`/`allOf`, `enum`, `const`,
+ *    `description`, `title`, `default`, `nullable`) are preserved on every node.
+ * 2. Per-type keys are kept additively (object → `properties`/`required`/`additionalProperties`,
+ *    array → `items`/`prefixItems` plus `minItems` only when 0 or 1, string → `format`
+ *    only when in the supported value set).
+ * 3. Everything else is demoted into the node's `description` as `\n\n{key: value, ...}`
+ *    so the model still sees the constraint as a natural-language hint.
+ *
+ * Object nodes default to `additionalProperties: false`, but explicit open-map
+ * declarations (`additionalProperties: true` or a schema literal — Zod's
+ * `z.record(z.string(), z.unknown())` produces `{}`) are preserved. The strict-mode
+ * pass downstream demotes those shapes to non-strict instead of fabricating a closed
+ * object, so callers like the resolve tool keep working open-map semantics.
+ */
+export function normalizeAnthropicToolSchema(schema: unknown): unknown {
+	if (Array.isArray(schema)) return schema.map(entry => normalizeAnthropicToolSchema(entry));
 	if (!isRecord(schema)) return schema;
 
-	const cached = cache.get(schema);
-	if (cached) return cached;
+	const slot = schema as Record<symbol, Record<string, unknown> | undefined>;
+	const existing = slot[kAnthropicToolNormal];
+	if (existing !== undefined) return existing;
 
-	const result = Object.fromEntries(
-		Object.entries(schema).filter(([key]) => !ANTHROPIC_UNSUPPORTED_TOOL_SCHEMA_FIELDS.has(key)),
-	);
-	cache.set(schema, result);
-	if (isJsonSchemaObjectNode(result)) {
-		delete result.minItems;
-	} else {
+	const result: Record<string, unknown> = {};
+	// Pre-stamp before recursion so cyclic schemas resolve to the in-progress object
+	// (mirrors the WeakMap-set-before-recurse pattern the original implementation used).
+	Object.defineProperty(schema, kAnthropicToolNormal, { value: result, writable: true, configurable: true });
+
+	const scalarType = pickAnthropicScalarType(schema.type);
+	const perTypeKeep = anthropicPerTypeKeep(scalarType);
+	const spill: Array<[string, unknown]> = [];
+
+	for (const key in schema) {
+		if (!Object.hasOwn(schema, key)) continue;
+		const value = schema[key];
+		if (ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP.has(key) || perTypeKeep?.has(key)) {
+			result[key] = value;
+		} else {
+			spill.push([key, value]);
+		}
+	}
+
+	// Per-type conditional keys: prune within the kept set.
+	if (scalarType === "string") {
+		const format = result.format;
+		if (typeof format === "string" && !ANTHROPIC_TOOL_SCHEMA_STRING_FORMATS.has(format)) {
+			spill.push(["format", format]);
+			delete result.format;
+		}
+	}
+	if (scalarType === "array" && result.minItems !== undefined) {
 		const minItems = result.minItems;
-		if (typeof minItems === "number" && minItems !== 0 && minItems !== 1) {
+		if (!(typeof minItems === "number" && (minItems === 0 || minItems === 1))) {
+			spill.push(["minItems", minItems]);
 			delete result.minItems;
 		}
 	}
-
-	const type = result.type;
-	const canBeObject =
-		type === "object" || (Array.isArray(type) && type.includes("object")) || isRecord(result.properties);
-	if (canBeObject) {
+	if (scalarType === "object" && result.additionalProperties === undefined) {
 		result.additionalProperties = false;
 	}
 
+	// Recurse on structural keys.
 	if (isRecord(result.properties)) {
-		result.properties = Object.fromEntries(
-			Object.entries(result.properties).map(([propertyName, propertySchema]) => [
-				propertyName,
-				normalizeAnthropicToolSchema(propertySchema, cache),
-			]),
-		);
+		const normalizedProperties: Record<string, unknown> = {};
+		const sourceProperties = result.properties as Record<string, unknown>;
+		for (const propName in sourceProperties) {
+			if (!Object.hasOwn(sourceProperties, propName)) continue;
+			normalizedProperties[propName] = normalizeAnthropicToolSchema(sourceProperties[propName]);
+		}
+		result.properties = normalizedProperties;
 	}
-
+	if (isRecord(result.additionalProperties)) {
+		result.additionalProperties = normalizeAnthropicToolSchema(result.additionalProperties);
+	}
 	if (Array.isArray(result.items)) {
-		result.items = result.items.map(item => normalizeAnthropicToolSchema(item, cache));
+		result.items = result.items.map(item => normalizeAnthropicToolSchema(item));
 	} else if (isRecord(result.items)) {
-		result.items = normalizeAnthropicToolSchema(result.items, cache);
+		result.items = normalizeAnthropicToolSchema(result.items);
 	}
-
+	if (Array.isArray(result.prefixItems)) {
+		result.prefixItems = result.prefixItems.map(item => normalizeAnthropicToolSchema(item));
+	}
 	for (const key of COMBINATOR_KEYS) {
 		const variants = result[key];
 		if (Array.isArray(variants)) {
-			result[key] = variants.map(variant => normalizeAnthropicToolSchema(variant, cache));
+			result[key] = variants.map(variant => normalizeAnthropicToolSchema(variant));
 		}
 	}
-
 	for (const defsKey of ["$defs", "definitions"] as const) {
 		const definitions = result[defsKey];
 		if (!isRecord(definitions)) continue;
-		result[defsKey] = Object.fromEntries(
-			Object.entries(definitions).map(([definitionName, definitionSchema]) => [
-				definitionName,
-				normalizeAnthropicToolSchema(definitionSchema, cache),
-			]),
-		);
+		const normalizedDefs: Record<string, unknown> = {};
+		const sourceDefs = definitions as Record<string, unknown>;
+		for (const name in sourceDefs) {
+			if (!Object.hasOwn(sourceDefs, name)) continue;
+			normalizedDefs[name] = normalizeAnthropicToolSchema(sourceDefs[name]);
+		}
+		result[defsKey] = normalizedDefs;
 	}
 
+	spillToDescription(result, spill);
 	return result;
 }
 
@@ -2211,6 +2372,12 @@ function normalizeAnthropicStrictSchemaNode(
 	const cached = cache.get(schema);
 	if (cached) return cached;
 
+	// Strict tool use only supports closed objects. Open maps stay available on
+	// the non-strict schema plan instead of producing an Anthropic 400.
+	if (isJsonSchemaObjectNode(schema) && schema.additionalProperties !== false) {
+		return undefined;
+	}
+
 	const result: Record<string, unknown> = { ...schema };
 	cache.set(schema, result);
 
@@ -2265,6 +2432,11 @@ function normalizeAnthropicStrictSchemaNode(
 		if (items === undefined) return undefined;
 		result.items = items;
 	}
+	if (Array.isArray(result.prefixItems)) {
+		const prefixItems = normalizeAnthropicStrictSchemaNode(result.prefixItems, budget, cache);
+		if (prefixItems === undefined) return undefined;
+		result.prefixItems = prefixItems;
+	}
 
 	for (const key of COMBINATOR_KEYS) {
 		const variants = result[key];
@@ -2306,7 +2478,7 @@ function normalizeAnthropicStrictSchema(
 }
 
 function buildAnthropicBaseToolInputSchema(tool: Tool): Record<string, unknown> {
-	const jsonSchema = tool.parameters as Record<string, unknown>;
+	const jsonSchema = toolWireSchema(tool);
 	return normalizeAnthropicToolSchema({
 		...jsonSchema,
 		type: "object",

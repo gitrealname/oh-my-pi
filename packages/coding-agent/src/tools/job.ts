@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
@@ -22,28 +22,13 @@ import {
 } from "./render-utils";
 import { ToolError } from "./tool-errors";
 
-const jobSchema = Type.Object({
-	poll: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "background job ids to wait for; omit (with no `cancel`) to wait on all running jobs",
-			examples: [["job-1234"]],
-		}),
-	),
-	cancel: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "background job ids to cancel",
-			examples: [["job-1234"]],
-		}),
-	),
-	list: Type.Optional(
-		Type.Boolean({
-			description:
-				"Return an immediate snapshot of every job spawned by this agent (running + completed within retention). Read-only \u2014 cannot be combined with `poll` or `cancel`.",
-		}),
-	),
+const jobSchema = z.object({
+	poll: z.array(z.string()).optional().describe("job ids to wait for"),
+	cancel: z.array(z.string()).optional().describe("job ids to cancel"),
+	list: z.boolean().optional().describe("snapshot all jobs"),
 });
 
-type JobParams = Static<typeof jobSchema>;
+type JobParams = z.infer<typeof jobSchema>;
 
 const WAIT_DURATION_MS: Record<string, number> = {
 	"5s": 5_000,
@@ -362,6 +347,8 @@ const COLLAPSED_LIST_LIMIT = PREVIEW_LIMITS.COLLAPSED_ITEMS;
 const LABEL_MAX_WIDTH = 60;
 const PREVIEW_LINES_COLLAPSED = 1;
 const PREVIEW_LINES_EXPANDED = 4;
+const LABEL_LINES_COLLAPSED = 1;
+const LABEL_LINES_EXPANDED = 3;
 const PREVIEW_LINE_WIDTH = 80;
 
 function statusToIcon(status: JobSnapshot["status"]): ToolUIStatus {
@@ -488,14 +475,21 @@ export const jobToolRenderer = {
 							);
 							const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
 							const idText = uiTheme.fg("muted", job.id);
-							const label = truncateToWidth(
-								replaceTabs(job.label || "(no label)"),
-								LABEL_MAX_WIDTH,
-								Ellipsis.Unicode,
-							);
-							const labelText = uiTheme.fg("toolOutput", label);
+							const rawLabelLines = (job.label || "(no label)").split(/\r?\n/);
+							const maxLabelLines = expanded ? LABEL_LINES_EXPANDED : LABEL_LINES_COLLAPSED;
+							const visibleLabelLines = rawLabelLines
+								.slice(0, maxLabelLines)
+								.map(l => truncateToWidth(replaceTabs(l), LABEL_MAX_WIDTH, Ellipsis.Unicode));
+							if (rawLabelLines.length > maxLabelLines && visibleLabelLines.length > 0) {
+								const last = visibleLabelLines[visibleLabelLines.length - 1]!;
+								visibleLabelLines[visibleLabelLines.length - 1] = `${last} …`;
+							}
 							const durationText = uiTheme.fg("dim", formatDuration(job.durationMs));
-							lines.push(`${icon} ${idText} ${typeBadge} ${labelText} ${durationText}`);
+							const headLabel = uiTheme.fg("toolOutput", visibleLabelLines[0] ?? "");
+							lines.push(`${icon} ${idText} ${typeBadge} ${headLabel} ${durationText}`);
+							for (let i = 1; i < visibleLabelLines.length; i++) {
+								lines.push(`  ${uiTheme.fg("toolOutput", visibleLabelLines[i]!)}`);
+							}
 
 							const preview = job.errorText?.trim() || job.resultText?.trim();
 							if (preview) {

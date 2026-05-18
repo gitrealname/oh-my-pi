@@ -12,8 +12,10 @@ import { padding } from "@oh-my-pi/pi-tui";
 
 export type LineEnding = "\r\n" | "\n";
 
+// AWS-CORP: custom — merge with care
 /** Detect the predominant line ending in content (count-based, handles mixed endings) */
 export function detectLineEnding(content: string): LineEnding {
+	// AWS-CORP: custom — merge with care
 	let crlf = 0;
 	let lf = 0;
 	for (let i = 0; i < content.length; i++) {
@@ -30,7 +32,7 @@ export function detectLineEnding(content: string): LineEnding {
 
 /** Normalize all line endings to LF */
 export function normalizeToLF(text: string): string {
-	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	return text.replace(/\r\n?/g, "\n");
 }
 
 /** Restore line endings to the specified type */

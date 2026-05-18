@@ -119,6 +119,7 @@ export async function getSearchProvider(id: SearchProviderId): Promise<SearchPro
 
 export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"tavily",
+	// AWS-CORP: custom — merge with care
 	"exa",
 	"perplexity",
 	"brave",

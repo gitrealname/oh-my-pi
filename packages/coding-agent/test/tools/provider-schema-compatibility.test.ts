@@ -1,10 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
 	adaptSchemaForStrict,
-	prepareSchemaForCCA,
+	normalizeSchemaForCCA,
+	normalizeSchemaForGoogle,
 	type SchemaCompatibilityProvider,
 	type SchemaCompatibilityResult,
-	sanitizeSchemaForGoogle,
+	toolWireSchema,
 	validateSchemaCompatibility,
 	validateStrictSchemaEnforcement,
 } from "@oh-my-pi/pi-ai/utils/schema";
@@ -38,8 +39,8 @@ async function collectToolSchemas(): Promise<ToolSchemaEntry[]> {
 	const byToolName = new Map<string, Record<string, unknown>>();
 
 	for (const tool of await createTools(session)) {
-		const schema = asSchemaObject(tool.parameters);
-		if (!schema) {
+		const schema = toolWireSchema(tool);
+		if (!asSchemaObject(schema)) {
 			continue;
 		}
 		byToolName.set(tool.name, schema);
@@ -50,8 +51,8 @@ async function collectToolSchemas(): Promise<ToolSchemaEntry[]> {
 		if (!tool) {
 			continue;
 		}
-		const schema = asSchemaObject(tool.parameters);
-		if (!schema) {
+		const schema = toolWireSchema(tool);
+		if (!asSchemaObject(schema)) {
 			continue;
 		}
 		byToolName.set(name, schema);
@@ -102,16 +103,16 @@ describe("builtin tool schemas provider compatibility", () => {
 			}
 
 			try {
-				const googleSchema = sanitizeSchemaForGoogle(schema);
+				const googleSchema = normalizeSchemaForGoogle(schema);
 				const googleCompatibility = validateSchemaCompatibility(googleSchema, "google");
 				if (!googleCompatibility.compatible) {
 					failures.push(formatCompatibilityIssues(name, "google", googleCompatibility));
 				}
 			} catch (error) {
-				failures.push(`${name} (google): sanitizeSchemaForGoogle threw: ${String(error)}`);
+				failures.push(`${name} (google): normalizeSchemaForGoogle threw: ${String(error)}`);
 			}
 
-			const cloudCodeAssistSchema = prepareSchemaForCCA(schema);
+			const cloudCodeAssistSchema = normalizeSchemaForCCA(schema);
 			const cloudCodeAssistCompatibility = validateSchemaCompatibility(
 				cloudCodeAssistSchema,
 				"cloud-code-assist-claude",

@@ -12,9 +12,11 @@ import { spawnSync } from "node:child_process";
 import { fromSSO } from "@aws-sdk/credential-provider-sso";
 import { parseKnownFiles, loadSsoSessionData, getSSOTokenFromFile } from "@smithy/shared-ini-file-loader";
 import { type BedrockOptions, streamBedrock } from "./amazon-bedrock";
-import type { AssistantMessageEventStream, Context, Model, StreamFunction } from "../types";
+import { AssistantMessageEventStream } from "../utils/event-stream";
+import type { Context, Model, StreamFunction } from "../types";
+import { $flag } from "@oh-my-pi/pi-utils";
 
-const log = (msg: string) => console.error("[aws-corp] " + msg);
+const log = (msg: string) => { if ($flag("AWS_BEDROCK_DEBUG")) console.error("[aws-corp] " + msg); };
 
 function env(k: string): string {
 	return Bun.env[k] || process.env[k] || "";
@@ -301,9 +303,29 @@ export const streamAwsCorp: StreamFunction<"bedrock-converse-stream"> = (
 	context: Context,
 	options: BedrockOptions,
 ): AssistantMessageEventStream => {
-	ensureCredentials();
 	const region = getRegion();
-	// Construct full inference profile ARN for corp accounting
 	const modelIdOverride = _accountId ? toInferenceProfileArn(model.id, region, _accountId) : undefined;
-	return streamBedrock(model, context, { ...options, region, profile: undefined, modelIdOverride });
+
+	// Outer stream returned to the caller immediately.
+	// We resolve credentials async, then pipe the inner streamBedrock output into it.
+	const outer = new AssistantMessageEventStream();
+
+	(async () => {
+		try {
+			const ok = await ensureCredentials();
+			const creds = _corpCreds;
+			log(`streamAwsCorp: creds=${ok ? "ok" : "FAILED"} accessKeyId=${creds?.accessKeyId?.slice(0, 8) ?? "null"} sessionToken=${creds?.sessionToken ? "present" : "MISSING"} region=${region} model=${model.id} modelIdOverride=${modelIdOverride ?? "none"}`);
+			if (!ok || !creds) {
+				throw new Error("[aws-corp] Failed to resolve AWS credentials — run 'aws sso login --profile " + getProfile() + "'");
+			}
+			const inner = streamBedrock(model, context, { ...options, region, profile: undefined, modelIdOverride, credentials: creds });
+			for await (const event of inner) {
+				outer.push(event);
+			}
+		} catch (err) {
+			outer.fail(err);
+		}
+	})();
+
+	return outer;
 };

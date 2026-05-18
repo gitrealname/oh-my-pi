@@ -3,8 +3,8 @@
  *
  * Basic neural/keyword search, deep research, code search, and URL crawling.
  */
-import { StringEnum } from "@oh-my-pi/pi-ai";
-import { Type } from "@sinclair/typebox";
+import type { TSchema } from "@oh-my-pi/pi-ai";
+import * as z from "zod/v4";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { createExaTool } from "./factory";
 import type { ExaRenderDetails } from "./types";
@@ -29,57 +29,19 @@ Parameters:
 - highlights: Include highlighted relevant snippets (default: false)
 - num_results: Maximum number of results to return (default: 10, max: 100)`,
 
-	Type.Object({
-		query: Type.String({ description: "Search query" }),
-		type: Type.Optional(
-			StringEnum(["keyword", "neural", "auto"], {
-				description: "Search type - neural (semantic), keyword (exact), or auto",
-			}),
-		),
-		include_domains: Type.Optional(
-			Type.Array(Type.String(), {
-				description: "Only include results from these domains",
-			}),
-		),
-		exclude_domains: Type.Optional(
-			Type.Array(Type.String(), {
-				description: "Exclude results from these domains",
-			}),
-		),
-		start_published_date: Type.Optional(
-			Type.String({
-				description: "Filter results published after this date (ISO 8601 format)",
-			}),
-		),
-		end_published_date: Type.Optional(
-			Type.String({
-				description: "Filter results published before this date (ISO 8601 format)",
-			}),
-		),
-		use_autoprompt: Type.Optional(
-			Type.Boolean({
-				description: "Let Exa optimize your query automatically (default: true)",
-			}),
-		),
-		text: Type.Optional(
-			Type.Boolean({
-				description: "Include page text content in results (costs more, default: false)",
-			}),
-		),
-		highlights: Type.Optional(
-			Type.Boolean({
-				description: "Include highlighted relevant snippets (default: false)",
-			}),
-		),
-		num_results: Type.Optional(
-			Type.Number({
-				description: "Maximum number of results to return (default: 10, max: 100)",
-				minimum: 1,
-				maximum: 100,
-			}),
-		),
+	z.object({
+		query: z.string().describe("search query"),
+		type: z.enum(["keyword", "neural", "auto"]).describe("search type").optional(),
+		include_domains: z.array(z.string()).describe("include domains").optional(),
+		exclude_domains: z.array(z.string()).describe("exclude domains").optional(),
+		start_published_date: z.string().describe("published after (iso 8601)").optional(),
+		end_published_date: z.string().describe("published before (iso 8601)").optional(),
+		use_autoprompt: z.boolean().describe("autoprompt").optional(),
+		text: z.boolean().describe("include page text").optional(),
+		highlights: z.boolean().describe("include highlights").optional(),
+		num_results: z.number().int().min(1).max(100).describe("max results (1-100)").optional(),
 	}),
 	"web_search_exa",
 );
 
-export const searchTools: CustomTool<any, ExaRenderDetails>[] = [exaSearchTool];
+export const searchTools: CustomTool<TSchema, ExaRenderDetails>[] = [exaSearchTool];

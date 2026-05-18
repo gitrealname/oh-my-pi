@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "../extensibility/typebox";
 import { notify } from "./notifications.js";
 
 export interface ToolManagerDeps {

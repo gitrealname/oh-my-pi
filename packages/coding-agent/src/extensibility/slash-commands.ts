@@ -6,6 +6,7 @@ import type { SlashCommand } from "../discovery";
 import { loadCapability } from "../discovery";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
+	// AWS-CORP: custom — merge with care
 	getBuiltinSlashCommandDefs,
 	type BuiltinSlashCommand,
 	type SubcommandDef,
@@ -117,6 +118,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<
 	return cmd;
 });
 
+// AWS-CORP: custom — merge with care
 /** Dynamic version that respects disabledCommands setting */
 export function getBuiltinSlashCommands(): ReadonlyArray<
 	BuiltinSlashCommand & {

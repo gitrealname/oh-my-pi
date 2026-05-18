@@ -4,11 +4,12 @@
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+// AWS-CORP: custom — merge with care
 import { isRecord, logger, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { BashResult } from "../../exec/bash-executor";
 import type { SessionStats } from "../../session/agent-session";
-import type { CompactionResult } from "../../session/compaction";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -88,6 +89,7 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_start",
 	"tool_execution_update",
 	"tool_execution_end",
+	// AWS-CORP: custom — merge with care
 	// corp extensions: tui_output + exec_step_result frames from headed+pipe child sessions
 	"tui_output" as AgentEvent["type"],
 	"exec_step_result" as AgentEvent["type"],
@@ -157,11 +159,12 @@ export class RpcClient {
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
 	#abortController = new AbortController();
 
+	// AWS-CORP: custom — merge with care
 	/** Protected accessor so RpcPipeClient subclass can read/write the child process. */
 	protected get process(): ptree.ChildProcess | null { return this.#process; }
 	protected set process(v: ptree.ChildProcess | null) { this.#process = v; }
 
-	constructor(private options: RpcClientOptions = {}) {
+	constructor(protected options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
 	}
 
@@ -195,6 +198,7 @@ export class RpcClient {
 			stdin: "pipe",
 		});
 
+		// AWS-CORP: custom — merge with care
 		await this._startHandshake(
 			readJsonl(this.#process.stdout, this.#abortController.signal),
 			false,
@@ -217,16 +221,19 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					readySettled = true;
+					// AWS-CORP: custom — merge with care
 					this._onReadyFrame(line as Record<string, unknown>);
 					readyResolve();
 					continue;
 				}
 				this.#handleLine(line);
 			}
+			// AWS-CORP: custom — merge with care
 			// Stream ended without ready signal — process exited (or pipe closed)
 			if (!readySettled) {
 				readySettled = true;
 				readyReject(new Error(`Agent process exited before ready. Stderr: ${this.#process?.peekStderr() ?? ""}`));
+			// AWS-CORP: custom — merge with care
 			} else if (!isPipe) {
 				// Natural stream end after ready in stdio mode — no-op (process.exited handles it)
 			}
@@ -237,6 +244,7 @@ export class RpcClient {
 			}
 		});
 
+		// AWS-CORP: custom — merge with care
 		// Race against process exit — skip in pipe mode (launcher exits immediately)
 		if (!isPipe) {
 			void this.#process!.exited.then((exitCode: number) => {
@@ -259,10 +267,12 @@ export class RpcClient {
 
 		try {
 			await readyPromise;
+			// AWS-CORP: custom — merge with care
 			logger.debug("[rpc-client] agent ready");
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
+		// AWS-CORP: custom — merge with care
 		} catch (e) {
 			logger.error("[rpc-client] agent failed to start", { err: String(e) });
 			throw e;
@@ -271,6 +281,7 @@ export class RpcClient {
 		}
 	}
 
+	// AWS-CORP: custom — merge with care
 	/**
 	 * Called when the ready frame arrives. Subclass may override to capture
 	 * extra fields (e.g. child pid in RpcPipeClient).
@@ -294,6 +305,7 @@ export class RpcClient {
 		this.#pendingHostToolCalls.clear();
 	}
 
+	// AWS-CORP: custom — merge with care
 	/** Escape hatch for extension commands not in the base RpcCommand union. */
 	_sendCommand(command: object, timeoutMs = 30_000): Promise<unknown> {
 	    return this.#send(command as RpcCommandBody, timeoutMs);
@@ -627,9 +639,11 @@ export class RpcClient {
 	 * Resolves when agent_end event is received.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
+	    // AWS-CORP: custom — merge with care
 	    const { promise, resolve, reject } = Promise.withResolvers<void>();
 	    let settled = false;
 
+	    // AWS-CORP: custom — merge with care
 	    const settle = (ok: boolean, err?: Error) => {
 	        if (settled) return;
 	        settled = true;
@@ -735,6 +749,7 @@ export class RpcClient {
 	}
 
 	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
+		// AWS-CORP: custom — merge with care
 		if (!this.#process) {
 			throw new Error("Client not started");
 		}
@@ -767,6 +782,7 @@ export class RpcClient {
 			},
 		});
 
+		// AWS-CORP: custom — merge with care
 		this.writeFrame(fullCommand, err => {
 			this.#pendingRequests.delete(id);
 			if (settled) return;
@@ -780,6 +796,7 @@ export class RpcClient {
 	async #handleHostToolCall(request: RpcHostToolCallRequest): Promise<void> {
 		const tool = this.#customTools.find(candidate => candidate.name === request.toolName);
 		if (!tool) {
+			// AWS-CORP: custom — merge with care
 			this.writeFrame({
 				type: "host_tool_result",
 				id: request.id,
@@ -797,6 +814,7 @@ export class RpcClient {
 
 		const sendUpdate = (partialResult: RpcClientToolResult<unknown>): void => {
 			if (controller.signal.aborted) return;
+			// AWS-CORP: custom — merge with care
 			this.writeFrame({
 				type: "host_tool_update",
 				id: request.id,
@@ -811,6 +829,7 @@ export class RpcClient {
 				sendUpdate,
 			});
 			if (controller.signal.aborted) return;
+			// AWS-CORP: custom — merge with care
 			this.writeFrame({
 				type: "host_tool_result",
 				id: request.id,
@@ -818,6 +837,7 @@ export class RpcClient {
 			} satisfies RpcHostToolResult);
 		} catch (error) {
 			if (controller.signal.aborted) return;
+			// AWS-CORP: custom — merge with care
 			this.writeFrame({
 				type: "host_tool_result",
 				id: request.id,
@@ -832,6 +852,7 @@ export class RpcClient {
 		}
 	}
 
+	// AWS-CORP: custom — merge with care
 	protected writeFrame(frame: RpcCommand | RpcHostToolResult | RpcHostToolUpdate, onError?: (error: Error) => void): void {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");

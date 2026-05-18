@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL, Text } from "@oh-my-pi/pi-tui";
-import { $env, getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { Type } from "@sinclair/typebox";
+import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -17,10 +17,12 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
+import { applyBashFixups, formatBashFixupNotice } from "./bash-command-fixup";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
+import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
-import { formatStyledTruncationWarning, type OutputMeta } from "./output-meta";
+import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
@@ -43,30 +45,16 @@ async function saveBashOriginalArtifact(session: ToolSession, originalText: stri
 	}
 }
 
-const bashSchemaBase = Type.Object({
-	command: Type.String({ description: "command to execute", examples: ["ls -la", "echo hi"] }),
-	env: Type.Optional(
-		Type.Record(Type.String({ pattern: BASH_ENV_NAME_PATTERN.source }), Type.String(), {
-			description: "extra env vars",
-		}),
-	),
-	timeout: Type.Optional(Type.Number({ description: "timeout in seconds", default: 300 })),
-	cwd: Type.Optional(Type.String({ description: "working directory", examples: ["src/", "/tmp"] })),
-
-	pty: Type.Optional(
-		Type.Boolean({
-			description: "run in pty mode",
-		}),
-	),
+const bashSchemaBase = z.object({
+	command: z.string().describe("command to execute"),
+	env: z.record(z.string().regex(BASH_ENV_NAME_PATTERN), z.string()).optional().describe("extra env vars"),
+	timeout: z.number().default(300).describe("timeout in seconds").optional(),
+	cwd: z.string().describe("working directory").optional(),
+	pty: z.boolean().describe("run in pty mode").optional(),
 });
 
-const bashSchemaWithAsync = Type.Object({
-	...bashSchemaBase.properties,
-	async: Type.Optional(
-		Type.Boolean({
-			description: "run in background",
-		}),
-	),
+const bashSchemaWithAsync = bashSchemaBase.extend({
+	async: z.boolean().describe("run in background").optional(),
 });
 
 type BashToolSchema = typeof bashSchemaBase | typeof bashSchemaWithAsync;
@@ -245,6 +233,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;
+	#bashFixupNoticeEmitted = false;
 
 	constructor(private readonly session: ToolSession) {
 		this.#asyncEnabled = this.session.settings.get("async.enabled");
@@ -291,7 +280,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	#buildCompletedResult(
 		result: BashResult | BashInteractiveResult,
 		timeoutSec: number,
-		options: { requestedTimeoutSec?: number; notices?: string[]; terminalId?: string } = {},
+		options: { requestedTimeoutSec?: number; notices?: readonly string[]; terminalId?: string } = {},
 	): AgentToolResult<BashToolDetails> {
 		const outputLines = [this.#formatResultOutput(result)];
 		const notices = options.notices?.filter(Boolean) ?? [];
@@ -314,7 +303,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		label: string,
 		previewText: string,
 		timeoutSec: number,
-		options: { requestedTimeoutSec?: number; notices?: string[] } = {},
+		options: { requestedTimeoutSec?: number; notices?: readonly string[] } = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
 			timeoutSeconds: timeoutSec,
@@ -352,7 +341,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		timeoutMs: number;
 		timeoutSec: number;
 		requestedTimeoutSec?: number;
-		timeoutClampNotice?: string;
+		notices?: readonly string[];
 
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
@@ -392,7 +381,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					});
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
-						notices: [options.timeoutClampNotice].filter((notice): notice is string => Boolean(notice)),
+						notices: options.notices ?? [],
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -483,6 +472,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let command = rawCommand;
 		const env = normalizeBashEnv(rawEnv);
 
+		// Apply conservative bash fixups (strip trailing `| head|tail` and redundant
+		// `2>&1`). The helper is single-line only and refuses anything that could
+		// change semantics.
+		let bashFixups: string[] = [];
+		if (this.session.settings.get("bash.stripTrailingHeadTail")) {
+			const fixup = applyBashFixups(command);
+			if (fixup.stripped.length > 0) {
+				command = fixup.command;
+				bashFixups = fixup.stripped;
+			}
+		}
+
 		// Extract leading `cd <path> && ...` into cwd when the model ignores the cwd parameter.
 		// Constrained to a single line so a `&&` that sits on a later line of a multiline
 		// script can't pull the entire script into the "cwd" capture.
@@ -558,7 +559,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const requestedTimeoutSec = rawTimeout;
 		const timeoutSec = clampTimeout("bash", requestedTimeoutSec);
 		const timeoutMs = timeoutSec * 1000;
+		const pendingNotices: string[] = [];
 		const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec);
+		if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);
+		const bashFixupNotice = this.#bashFixupNoticeEmitted ? undefined : formatBashFixupNotice(bashFixups);
+		if (bashFixupNotice) {
+			pendingNotices.push(bashFixupNotice);
+			this.#bashFixupNoticeEmitted = true;
+		}
 
 		if (asyncRequested) {
 			if (!AsyncJobManager.instance()) {
@@ -570,7 +578,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
-				timeoutClampNotice,
+				notices: pendingNotices,
 
 				resolvedEnv,
 				onUpdate,
@@ -578,7 +586,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
-				notices: [timeoutClampNotice].filter((notice): notice is string => Boolean(notice)),
+				notices: pendingNotices,
 			});
 		}
 
@@ -592,7 +600,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
-				timeoutClampNotice,
+				notices: pendingNotices,
 
 				resolvedEnv,
 				onUpdate,
@@ -601,7 +609,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 					requestedTimeoutSec,
-					notices: [timeoutClampNotice].filter((notice): notice is string => Boolean(notice)),
+					notices: pendingNotices,
 				});
 			}
 			const waitResult = await this.#waitForManagedBashJob(job, autoBackgroundWaitMs, signal);
@@ -621,7 +629,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			job.setBackgrounded(true);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
-				notices: [timeoutClampNotice].filter((notice): notice is string => Boolean(notice)),
+				notices: pendingNotices,
 			});
 		}
 
@@ -722,7 +730,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							};
 							return this.#buildCompletedResult(timedOutResult, timeoutSec, {
 								requestedTimeoutSec,
-								notices: [timeoutClampNotice].filter((notice): notice is string => Boolean(notice)),
+								notices: pendingNotices,
 								terminalId: handle.terminalId,
 							});
 						}
@@ -778,7 +786,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 				const bridgeNotices: string[] = [];
 				if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
-				if (timeoutClampNotice) bridgeNotices.push(timeoutClampNotice);
+				for (const notice of pendingNotices) bridgeNotices.push(notice);
 
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
 					requestedTimeoutSec,
@@ -800,9 +808,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Allocate artifact for truncated output storage
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 
-		const usePty = pty && $env.PI_NO_PTY !== "1" && ctx?.hasUI === true && ctx.ui !== undefined;
-		const result: BashResult | BashInteractiveResult = usePty
-			? await runInteractiveBashPty(ctx.ui!, {
+		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
+		const result: BashResult | BashInteractiveResult = interactiveUi
+			? await runInteractiveBashPty(interactiveUi, {
 					command,
 					cwd: commandCwd,
 					timeoutMs,
@@ -833,7 +841,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {
 			requestedTimeoutSec,
-			notices: [timeoutClampNotice].filter((notice): notice is string => Boolean(notice)),
+			notices: pendingNotices,
 		});
 	}
 }
@@ -960,8 +968,11 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					const expanded = renderContext?.expanded ?? options.expanded;
 					const previewLines = renderContext?.previewLines ?? BASH_DEFAULT_PREVIEW_LINES;
 
-					// Get output from context (preferred) or fall back to result content
-					const output = renderContext?.output ?? result.content?.find(c => c.type === "text")?.text ?? "";
+					// Get output from context (preferred) or fall back to result content.
+					// Strip the LLM-facing notice appended by wrappedExecute so we don't
+					// double-print it alongside the styled warning line below.
+					const rawOutput = renderContext?.output ?? result.content?.find(c => c.type === "text")?.text ?? "";
+					const output = stripOutputNotice(rawOutput, details?.meta);
 					const displayOutput = output.trimEnd();
 					const showingFullOutput = expanded && renderContext?.isFullOutput === true;
 

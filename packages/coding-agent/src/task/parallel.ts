@@ -14,6 +14,7 @@ export interface ParallelResult<R> {
  * Results are returned in the same order as input items.
  *
  * On abort: returns partial results with `aborted: true`. Completed tasks are preserved,
+ // AWS-CORP: custom — merge with care
  * in-progress tasks return immediately when aborted (teardown continues in background),
  * skipped tasks are `undefined`.
  *
@@ -53,6 +54,7 @@ export async function mapWithConcurrencyLimit<T, R>(
 			const index = nextIndex++;
 			if (index >= items.length) return;
 			try {
+				// AWS-CORP: custom — merge with care
 				// Race the task against the abort signal so that when the signal fires we
 				// return immediately rather than waiting for the task's internal teardown
 				// (e.g. subagent session flush + dispose). The task still handles its own
@@ -68,6 +70,7 @@ export async function mapWithConcurrencyLimit<T, R>(
 				});
 				results[index] = await Promise.race([taskPromise, abortPromise]);
 			} catch (error) {
+				// AWS-CORP: custom — merge with care
 				// On abort, the fn itself handles it and returns a result.
 				// Only propagate non-abort errors.
 				if (!workerSignal.aborted) {
@@ -75,6 +78,7 @@ export async function mapWithConcurrencyLimit<T, R>(
 					rejectFirst(error);
 					throw error;
 				}
+				// AWS-CORP: custom — merge with care
 				// Aborted mid-task: leave results[index] as undefined (aborted sentinel)
 				return;
 			}

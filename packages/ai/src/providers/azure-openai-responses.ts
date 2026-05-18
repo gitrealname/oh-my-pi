@@ -1,4 +1,4 @@
-import { $env } from "@oh-my-pi/pi-utils";
+import { $env, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import { AzureOpenAI } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -26,6 +26,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
+import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
 import { normalizeOpenAIResponsesPromptCacheKey, supportsDeveloperRole } from "./openai-responses";
@@ -172,6 +173,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			for (const block of output.content) delete (block as { index?: number }).index;
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
+			output.errorStatus = extractHttpStatusFromError(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -241,6 +243,8 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 
 	const { baseUrl, apiVersion } = resolveAzureConfig(model, options);
 
+	const baseFetch = options?.fetch ?? fetch;
+	const onSseEvent = options?.onSseEvent;
 	return new AzureOpenAI({
 		apiKey,
 		apiVersion,
@@ -248,7 +252,7 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		maxRetries: 5,
 		defaultHeaders: headers,
 		baseURL: baseUrl,
-		fetch: options?.onSseEvent ? wrapFetchForSseDebug(fetch, event => options.onSseEvent?.(event, model)) : fetch,
+		fetch: onSseEvent ? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model)) : baseFetch,
 	});
 }
 
@@ -327,7 +331,7 @@ function convertTools(tools: Tool[]): OpenAITool[] {
 		type: "function",
 		name: tool.name,
 		description: tool.description || "",
-		parameters: tool.parameters as Record<string, unknown>,
+		parameters: sanitizeSchemaForOpenAIResponses(toolWireSchema(tool)),
 		strict: false,
 	}));
 }

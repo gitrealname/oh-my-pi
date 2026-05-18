@@ -1,3 +1,4 @@
+// AWS-CORP: custom — merge with care
 import { MMEMORY_SCHEMA_ENTRIES, type MmemorySettings } from "./settings-schema-m-extensions";
 import { PRUNE_SCHEMA_ENTRIES } from "./settings-schema-m-prune";
 import { SCRIPT_SCHEMA_ENTRIES } from "./settings-schema-m-scripts";
@@ -238,6 +239,13 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	lastChangelogVersion: { type: "string", default: undefined },
 
+	// Auth broker — credentials proxied through a remote `omp auth-broker serve`
+	// host. Hidden from the UI; populate via env vars or hand-edited config.yml.
+	// Env (`OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN`) takes precedence so
+	// per-machine overrides remain trivial.
+	"auth.broker.url": { type: "string", default: undefined },
+	"auth.broker.token": { type: "string", default: undefined },
+
 	autoResume: {
 		type: "boolean",
 		default: false,
@@ -310,6 +318,7 @@ export const SETTINGS_SCHEMA = {
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
+	// AWS-CORP: custom — merge with care
 	disabledCommands: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
@@ -876,6 +885,7 @@ export const SETTINGS_SCHEMA = {
 	// Input and startup
 	doubleEscapeAction: {
 		type: "enum",
+		// AWS-CORP: custom — merge with care
 		values: ["branch", "tree", "mtree", "none"] as const,
 		default: "tree",
 		ui: {
@@ -911,6 +921,16 @@ export const SETTINGS_SCHEMA = {
 				{ value: "15", label: "15 items" },
 				{ value: "20", label: "20 items" },
 			],
+		},
+	},
+
+	emojiAutocomplete: {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Emoji Autocomplete",
+			description: "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
 		},
 	},
 
@@ -1229,6 +1249,7 @@ export const SETTINGS_SCHEMA = {
 	// the local backend; see config/settings.ts migration for details.
 	"memory.backend": {
 		type: "enum",
+		// AWS-CORP: custom — merge with care
 		values: ["off", "local", "hindsight", "mmemory"] as const,
 		default: "off",
 		ui: {
@@ -1236,6 +1257,7 @@ export const SETTINGS_SCHEMA = {
 			label: "Memory Backend",
 			description: "Off, local memory pipeline, or Hindsight remote memory",
 			options: [
+				// AWS-CORP: custom — merge with care
 				{ value: "off",      label: "Off",       description: "No memory subsystem runs" },
 				{ value: "local",    label: "Local",     description: "Local rollout summarisation pipeline (memory_summary.md)" },
 				{ value: "hindsight",label: "Hindsight", description: "Vectorize Hindsight remote memory service" },
@@ -1654,6 +1676,17 @@ export const SETTINGS_SCHEMA = {
 	},
 	"bashInterceptor.patterns": { type: "array", default: DEFAULT_BASH_INTERCEPTOR_RULES },
 
+	"bash.stripTrailingHeadTail": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "editing",
+			label: "Strip Trailing head/tail",
+			description:
+				"Silently drop trailing `| head`/`| tail` pipes from single-line bash commands. Output is already truncated automatically.",
+		},
+	},
+
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
 		type: "boolean",
@@ -1966,6 +1999,7 @@ export const SETTINGS_SCHEMA = {
 			description: "Launch browser in headless mode (disable to show browser UI)",
 		},
 	},
+	// AWS-CORP: custom — merge with care
 	"browser.connectUrl": {
 		type: "string",
 		default: undefined,
@@ -1987,6 +2021,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// AWS-CORP: custom — merge with care
 	"mbrowser.enabled": {
 		type: "boolean",
 		default: true,
@@ -2230,6 +2265,36 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"goal.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			label: "Goal Mode",
+			description: "Enable per-session goal mode and the hidden goal tool",
+		},
+	},
+
+	"goal.statusInFooter": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			label: "Goal Status In Footer",
+			description: "Show token budget alongside the goal indicator in the status line",
+		},
+	},
+
+	"goal.continuationModes": {
+		type: "array",
+		default: ["interactive"],
+		ui: {
+			tab: "tasks",
+			label: "Goal Continuation Modes",
+			description: "Run modes where active goals may auto-continue between turns",
+		},
+	},
+
 	// Delegation
 	"task.isolation.mode": {
 		type: "enum",
@@ -2379,6 +2444,24 @@ export const SETTINGS_SCHEMA = {
 				{ value: "1", label: "Single" },
 				{ value: "2", label: "Double" },
 				{ value: "3", label: "Triple" },
+			],
+		},
+	},
+
+	"task.maxRuntimeMs": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			label: "Max Subagent Runtime",
+			description:
+				"Hard wall-clock limit per subagent (ms). 0 disables it. Defense-in-depth against provider-side stream hangs that escape the inference-layer watchdog; triggers a normal subagent abort with a 'timed out' reason.",
+			options: [
+				{ value: "0", label: "Unlimited", description: "Default" },
+				{ value: "300000", label: "5 minutes" },
+				{ value: "900000", label: "15 minutes" },
+				{ value: "1800000", label: "30 minutes" },
+				{ value: "3600000", label: "1 hour" },
 			],
 		},
 	},
@@ -2672,6 +2755,41 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"dev.autoqaPush.endpoint": {
+		type: "string",
+		// Bundled QA collector — runs `/work/pi-www/autoqa` behind qa.omp.sh.
+		// Override via `PI_AUTO_QA_PUSH_URL` or `dev.autoqaPush.endpoint`
+		// in `config.yml` to point at a self-hosted instance.
+		default: "https://qa.omp.sh/v1/grievances" as const,
+		ui: {
+			tab: "tools",
+			label: "Auto QA Push Endpoint",
+			description: "Full URL that receives the JSON payload (default ships to https://qa.omp.sh/v1/grievances)",
+		},
+	},
+
+	"dev.autoqaPush.token": {
+		type: "string",
+		default: undefined,
+	},
+
+	/**
+	 * User decision on sharing automatic `report_tool_issue` grievances.
+	 *
+	 *   - `"unset"`  — never asked; the first `report_tool_issue` invocation
+	 *                  pops a consent dialog and persists the answer here.
+	 *   - `"granted"` — record and (when push is configured) ship grievances.
+	 *   - `"denied"`  — silently no-op every `report_tool_issue` call.
+	 *
+	 * Owned by `packages/coding-agent/src/tools/report-tool-issue.ts` via the
+	 * process-global consent handler registered by `InteractiveMode`.
+	 */
+	"dev.autoqa.consent": {
+		type: "enum",
+		values: ["unset", "granted", "denied"] as const,
+		default: "unset" as const,
+	},
+
 	"thinkingBudgets.minimal": { type: "number", default: 1024 },
 
 	"thinkingBudgets.low": { type: "number", default: 2048 },
@@ -2681,6 +2799,7 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
+	// AWS-CORP: custom — merge with care
 	...SCRIPT_SCHEMA_ENTRIES,
 	...PRUNE_SCHEMA_ENTRIES,
 } as const;
@@ -2828,6 +2947,7 @@ export interface SkillsSettings {
 	ignoredSkills?: string[];
 	includeSkills?: string[];
 	disabledExtensions?: string[];
+	// AWS-CORP: custom — merge with care
 	disabledCommands?: string[];
 }
 
@@ -2914,6 +3034,7 @@ export interface GroupTypeMap {
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;
+	// AWS-CORP: custom — merge with care
 	mmemory: MmemorySettings;
 
 }

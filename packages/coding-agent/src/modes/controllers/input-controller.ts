@@ -1,11 +1,9 @@
+import * as fs from "node:fs/promises";
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { registerInputController } from "../../modes/rpc/rpc-inject-handler";
-import { sanitizeText } from "@oh-my-pi/pi-natives";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
-import { $env, logger } from "@oh-my-pi/pi-utils";
-import { settings } from "../../config/settings";
-import { runScriptSlot } from "./input-controller-m-scripts";
-import { injectKey as injectKeyIntoTui, injectText as injectTextIntoEditor, injectCommand as injectCommandIntoEditor } from "./input-controller-inject";
+import { $env, sanitizeText } from "@oh-my-pi/pi-utils";
+import { isSettingsInitialized, settings } from "../../config/settings";
+import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
@@ -17,6 +15,8 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+// AWS-CORP: custom — merge with care
+import { injectKey as _injectKey, injectText as _injectText, injectCommand as _injectCommand } from "./input-controller-inject";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -25,15 +25,6 @@ interface Expandable {
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
-
-// Dispatch map for doubleEscapeAction — add new actions here, no logic changes needed.
-type DoubleEscapeAction = "branch" | "tree" | "mtree" | "none";
-const DOUBLE_ESCAPE_HANDLERS: Record<DoubleEscapeAction, (ctx: InteractiveModeContext) => void> = {
-	tree:   ctx => ctx.showTreeSelector(),
-	branch: ctx => ctx.showUserMessageSelector(),
-	mtree:  ctx => (ctx as unknown as { showMTreeSelector(): void }).showMTreeSelector(),
-	none:   () => {},
-};
 
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
@@ -49,6 +40,7 @@ export class InputController {
 					this.ctx.session.isGeneratingHandoff ||
 					this.ctx.session.isBashRunning ||
 					this.ctx.session.isEvalRunning ||
+					// AWS-CORP: custom — merge with care
 					this.ctx.session.isTaskRunning ||
 					this.ctx.autoCompactionLoader ||
 					this.ctx.retryLoader ||
@@ -68,6 +60,8 @@ export class InputController {
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				return;
 			}
+			// AWS-CORP: custom — merge with care
+			const setCancelling = () => this.ctx.loadingAnimation?.setMessage("cancelling...");
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
 					return;
@@ -75,17 +69,19 @@ export class InputController {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.ctx.session.isBashRunning) {
 				this.ctx.session.abortBash();
-				this.ctx.loadingAnimation?.setMessage("cancelling...");
+				// AWS-CORP: custom — merge with care
+				setCancelling();
 			} else if (this.ctx.isBashMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isBashMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isEvalRunning) {
 				this.ctx.session.abortEval();
-				this.ctx.loadingAnimation?.setMessage("cancelling...");
+				// AWS-CORP: custom — merge with care
+				setCancelling();
 			} else if (this.ctx.session.isTaskRunning) {
 				this.ctx.session.abortTask();
-				this.ctx.loadingAnimation?.setMessage("cancelling...");
+				setCancelling();
 			} else if (this.ctx.isPythonMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isPythonMode = false;
@@ -93,13 +89,16 @@ export class InputController {
 			} else if (this.ctx.session.isStreaming) {
 				void this.ctx.session.abort();
 			} else if (!this.ctx.editor.getText().trim()) {
-				// Double-escape with empty editor — action driven by doubleEscapeAction setting.
-				const action = settings.get("doubleEscapeAction") as DoubleEscapeAction;
-				const handler = DOUBLE_ESCAPE_HANDLERS[action] ?? DOUBLE_ESCAPE_HANDLERS.none;
+				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
+				const action = settings.get("doubleEscapeAction");
 				if (action !== "none") {
 					const now = Date.now();
 					if (now - this.ctx.lastEscapeTime < 500) {
-						handler(this.ctx);
+						if (action === "tree") {
+							this.ctx.showTreeSelector();
+						} else {
+							this.ctx.showUserMessageSelector();
+						}
 						this.ctx.lastEscapeTime = 0;
 					} else {
 						this.ctx.lastEscapeTime = now;
@@ -186,20 +185,6 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionObserver());
 		}
 
-		for (let slot = 1; slot <= 10; slot++) {
-			const keys = this.ctx.keybindings.getKeys(`app.script.${slot}` as "app.script.1");
-			if (keys.length > 0) {
-				logger.debug("[script] registering slot", { slot, keys });
-			}
-			for (const key of keys) {
-				const capturedSlot = slot;
-				this.ctx.editor.setCustomKeyHandler(key, () => {
-					logger.debug("[script] key fired", { slot: capturedSlot, key });
-					void this.handleScript(capturedSlot);
-				});
-			}
-		}
-
 		this.ctx.editor.onChange = (text: string) => {
 			const wasBashMode = this.ctx.isBashMode;
 			const wasPythonMode = this.ctx.isPythonMode;
@@ -215,6 +200,7 @@ export class InputController {
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			text = text.trim();
+			if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 
 			// Empty submit while streaming with queued messages: flush queues immediately
 			if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
@@ -668,12 +654,6 @@ export class InputController {
 		}
 	}
 
-	// ─── Script executor (aws-corp) ──────────────────────────────────────────
-	/** Thin wrapper — all logic lives in input-controller-m-scripts.ts */
-	async handleScript(slot: number): Promise<void> {
-		return runScriptSlot(slot, this.ctx);
-	}
-
 	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
 		return createPromptActionAutocompleteProvider({
 			commands,
@@ -881,18 +861,17 @@ export class InputController {
 		}
 	}
 
-	/**
- 	 * Inject a keypress — delegates to input-controller-inject.ts.
- 	 * Routes through full TUI pipeline; ESC works in both editor and panel contexts.
- 	 */
-	injectKey(key: string): void { injectKeyIntoTui(key, this.ctx); }
+// AWS-CORP: custom — merge with care
 
-	/** Inject text into the editor at cursor position (triggers render). */
-	injectText(text: string): void { injectTextIntoEditor(text, this.ctx); }
+	injectKey(key: string): void {
+		_injectKey(key, this.ctx);
+	}
 
-	/**
- 	 * Inject a command as if the user typed it and pressed Enter.
- 	 * TUI handles slash commands natively — LLM never sees them.
- 	 */
-	injectCommand(text: string): void { injectCommandIntoEditor(text, this.ctx); }
+	injectText(text: string): void {
+		_injectText(text, this.ctx);
+	}
+
+	injectCommand(text: string): void {
+		_injectCommand(text, this.ctx);
+	}
 }

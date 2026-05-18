@@ -11,8 +11,8 @@
 import { ANTHROPIC_THINKING } from "../stream";
 import type { Context, Model, SimpleStreamOptions } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { createProviderErrorMessage } from "./error-message";
 import { streamAnthropic, streamOpenAICompletions } from "./register-builtins";
-import { createProviderErrorMessage } from "./shared/error-message";
 
 export type OpenAIAnthropicApiFormat = "openai" | "anthropic";
 
@@ -88,6 +88,7 @@ export function streamOpenAIAnthropicShim(
 					onPayload: options?.onPayload,
 					onResponse: options?.onResponse,
 					onSseEvent: options?.onSseEvent,
+					fetch: options?.fetch,
 					thinkingEnabled,
 					thinkingBudgetTokens: thinkingBudget,
 				});
@@ -116,6 +117,7 @@ export function streamOpenAIAnthropicShim(
 					onPayload: options?.onPayload,
 					onResponse: options?.onResponse,
 					onSseEvent: options?.onSseEvent,
+					fetch: options?.fetch,
 					reasoning: reasoningEffort,
 				});
 

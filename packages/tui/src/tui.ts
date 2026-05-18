@@ -421,6 +421,7 @@ export class TUI extends Container {
 		};
 	}
 
+	// AWS-CORP: custom — merge with care
 	/**
 	 * Inject a raw input sequence as if it came from the terminal.
 	 * Routes through the full TUI input pipeline to the currently focused component.

@@ -25,10 +25,8 @@ const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 };
 
 function sanitizeLoadedText(text: string): string {
-	return replaceTabs(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"))
-		.split("")
-		.filter(char => char === "\n" || char.charCodeAt(0) >= 32)
-		.join("");
+	// Normalize CRLF/CR → LF, then strip C0 control chars except \n.
+	return replaceTabs(text.replace(/\r\n?/g, "\n")).replace(/[\x00-\x09\x0b-\x1f]/g, "");
 }
 
 const segmenter = getSegmenter();
@@ -987,6 +985,7 @@ export class Editor implements Component, Focusable {
 						this.#setCursorCol(result.cursorCol);
 
 						this.#cancelAutocomplete();
+						this.onAutocompleteUpdate?.();
 
 						if (this.onChange) {
 							this.onChange(this.getText());
@@ -1046,6 +1045,7 @@ export class Editor implements Component, Focusable {
 						this.#setCursorCol(result.cursorCol);
 
 						this.#cancelAutocomplete();
+						this.onAutocompleteUpdate?.();
 
 						if (this.onChange) {
 							this.onChange(this.getText());
@@ -1495,6 +1495,29 @@ export class Editor implements Component, Focusable {
 			this.onChange(this.getText());
 		}
 
+		// Synchronous inline replacement (e.g. emoji shortcodes `:joy:` → 😂).
+		// Runs before autocomplete trigger so the popup doesn't briefly chase a
+		// prefix that's about to be rewritten.
+		if (char.length === 1 && this.#autocompleteProvider?.trySyncInlineReplace) {
+			const replaceLine = this.#state.lines[this.#state.cursorLine] || "";
+			const textBeforeCursor = replaceLine.slice(0, this.#state.cursorCol);
+			const replacement = this.#autocompleteProvider.trySyncInlineReplace(textBeforeCursor);
+			if (replacement) {
+				const before = replaceLine.slice(0, this.#state.cursorCol - replacement.replaceLen);
+				const after = replaceLine.slice(this.#state.cursorCol);
+				this.#state.lines[this.#state.cursorLine] = before + replacement.insert + after;
+				this.#setCursorCol(before.length + replacement.insert.length);
+				if (this.onChange) {
+					this.onChange(this.getText());
+				}
+				if (this.#autocompleteState) {
+					this.#cancelAutocomplete();
+					this.onAutocompleteUpdate?.();
+				}
+				return;
+			}
+		}
+
 		// Check if we should trigger or update autocomplete
 		if (!this.#autocompleteState) {
 			// Auto-trigger for "/" at the start of a line (slash commands)
@@ -1531,6 +1554,10 @@ export class Editor implements Component, Focusable {
 				else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 					this.#tryTriggerAutocomplete();
 				}
+				// Check if we're in a :emoji shortcode context
+				else if (textBeforeCursor.match(/(?:^|[\s([{>]):[a-zA-Z0-9_+-]*$/)) {
+					this.#tryTriggerAutocomplete();
+				}
 			}
 		} else {
 			this.#debouncedUpdateAutocomplete();
@@ -1556,7 +1583,7 @@ export class Editor implements Component, Focusable {
 			});
 
 			// Clean the pasted text
-			const cleanText = decodedText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+			const cleanText = decodedText.replace(/\r\n?/g, "\n");
 
 			// Convert tabs to spaces (4 spaces per tab)
 			const tabExpandedText = cleanText.replace(/\t/g, "    ");
@@ -1906,7 +1933,7 @@ export class Editor implements Component, Focusable {
 		this.#resetKillSequence();
 		this.#recordUndoState();
 
-		const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+		const normalized = text.replace(/\r\n?/g, "\n");
 		const lines = normalized.split("\n");
 
 		if (lines.length === 1) {

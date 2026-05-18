@@ -96,6 +96,12 @@ export interface FetchWithRetryOptions extends RequestInit {
 	 * token refresh or user-agent rotation.
 	 */
 	prepareInit?: (attempt: number) => RequestInit | Promise<RequestInit>;
+	/**
+	 * Optional `fetch` implementation override. Defaults to `globalThis.fetch`.
+	 * Useful for routing requests through a proxy, instrumented transport, or
+	 * mock during tests.
+	 */
+	fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 }
 
 const DEFAULT_MAX_DELAY_MS = 60_000;
@@ -119,6 +125,7 @@ export async function fetchWithRetry(
 		maxDelayMs = DEFAULT_MAX_DELAY_MS,
 		defaultDelayMs,
 		prepareInit,
+		fetch: fetchImpl = fetch,
 		...baseInit
 	} = options;
 	const signal = baseInit.signal as AbortSignal | undefined;
@@ -130,7 +137,7 @@ export async function fetchWithRetry(
 
 		let response: Response;
 		try {
-			response = await fetch(requestUrl, init);
+			response = await fetchImpl(requestUrl, init);
 		} catch (error) {
 			if (signal?.aborted) throw new Error("Request was aborted");
 			const wrapped = wrapNetworkError(error);
@@ -191,7 +198,7 @@ function resolveDefaultDelay(
  * Inspect an arbitrary error value (or its `cause` chain, up to depth 2) for an
  * HTTP status code. Reads `status`, `statusCode`, and `response.status` fields,
  * coerces string values, and falls back to scanning the error message for
- * common patterns like `error (429)` or `HTTP 503`.
+ * common patterns like `Error: 401`, `error (429)`, or `HTTP 503`.
  */
 export function extractHttpStatusFromError(error: unknown): number | undefined {
 	return extractHttpStatusFromErrorInternal(error, 0);
@@ -229,6 +236,7 @@ function extractHttpStatusFromErrorInternal(error: unknown, depth: number): numb
 }
 
 const STATUS_MESSAGE_PATTERNS = [
+	/\berror\s*[:=]\s*(\d{3})\b/i,
 	/error\s*\((\d{3})\)/i,
 	/status\s*[:=]?\s*(\d{3})/i,
 	/\bhttp\s*(\d{3})\b/i,

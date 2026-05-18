@@ -10,15 +10,13 @@
  * this one tool rather than each needing their own private SCHEDULE_SLASH emit.
  */
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { Type } from "@sinclair/typebox";
+import { z } from "zod/v4";
 import type { ToolSession } from "..";
 import { SCHEDULE_SLASH_CHANNEL } from "../utils/event-bus";
 import { toolResult } from "./tool-result";
 
-const schema = Type.Object({
-	command: Type.String({
-		description: 'The slash command to run, including the leading "/". e.g. "/mmemory recall mtuicontrol"',
-	}),
+const schema = z.object({
+	command: z.string().describe('The slash command to run, including the leading "/". e.g. "/mmemory recall mtuicontrol"'),
 });
 
 export class MCommandTool implements AgentTool<typeof schema> {

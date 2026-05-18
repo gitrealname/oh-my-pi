@@ -5,10 +5,10 @@
  */
 
 import path from "node:path";
-import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
+import { isJsonSchemaValueValid } from "@oh-my-pi/pi-ai/utils/schema";
 import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import type { TSchema } from "@sinclair/typebox";
-import Ajv, { type ValidateFunction } from "ajv";
 import { ModelRegistry } from "../config/model-registry";
 import { resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -16,6 +16,7 @@ import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
+import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -50,7 +51,6 @@ import {
 } from "./types";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
-const ajv = new Ajv({ allErrors: true, strict: false, logger: false });
 
 /** Agent event types to forward for progress tracking. */
 const agentEventTypes = new Set<AgentEvent["type"]>([
@@ -181,6 +181,15 @@ export interface ExecutorOptions {
 	 */
 	parentArtifactManager?: ArtifactManager;
 	parentHindsightSessionState?: HindsightSessionState;
+	/**
+	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
+	 * loop is started with the same tracer/hooks but its own agent identity
+	 * stamped, so its `invoke_agent` / `chat` / `execute_tool` spans appear as
+	 * a sub-tree under the parent's active `execute_tool task` span. A
+	 * `handoff` span is emitted on dispatch to mark the parent → subagent
+	 * transition explicitly.
+	 */
+	parentTelemetry?: AgentTelemetryConfig;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -195,16 +204,12 @@ function parseStringifiedJson(value: unknown): unknown {
 	}
 }
 
-function buildOutputValidator(schema: unknown): { validate?: ValidateFunction; error?: string } {
+function buildOutputValidator(schema: unknown): { validate?: (value: unknown) => boolean; error?: string } {
 	const { normalized, error } = normalizeSchema(schema);
 	if (error) return { error };
 	if (normalized === undefined) return {};
 	const jsonSchema = jtdToJsonSchema(normalized);
-	try {
-		return { validate: ajv.compile(jsonSchema as any) };
-	} catch (err) {
-		return { error: err instanceof Error ? err.message : String(err) };
-	}
+	return { validate: value => isJsonSchemaValueValid(jsonSchema, value) };
 }
 
 function tryParseJsonOutput(text: string): unknown | undefined {
@@ -407,14 +412,14 @@ function getUsageTokens(usage: unknown): number {
 /**
  * Create proxy tools that reuse the parent's MCP connections.
  */
-function createMCPProxyTools(mcpManager: MCPManager): CustomTool<TSchema>[] {
+function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 	return mcpManager.getTools().map(tool => {
 		const mcpTool = tool as { mcpToolName?: string; mcpServerName?: string };
 		return {
 			name: tool.name,
 			label: tool.label ?? tool.name,
 			description: tool.description ?? "",
-			parameters: tool.parameters as TSchema,
+			parameters: tool.parameters,
 			execute: async (_toolCallId, params, _onUpdate, _ctx, signal) => {
 				if (signal?.aborted) {
 					throw new ToolAbortError();
@@ -542,6 +547,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const settings = options.settings ?? Settings.isolated();
 	const subagentSettings = createSubagentSettings(settings);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
+	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
@@ -589,9 +595,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let recentOutputTail = "";
 	let stderr = "";
 	let resolved = false;
-	type AbortReason = "signal" | "terminate";
+	type AbortReason = "signal" | "terminate" | "timeout";
 	let abortSent = false;
 	let abortReason: AbortReason | undefined;
+	let runtimeLimitExceeded = false;
 	const listenerController = new AbortController();
 	const listenerSignal = listenerController.signal;
 	const abortController = new AbortController();
@@ -612,8 +619,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let hasUsage = false;
 
 	const requestAbort = (reason: AbortReason) => {
+		if (reason === "timeout") {
+			runtimeLimitExceeded = true;
+		}
 		if (abortSent) {
-			if (reason === "signal" && abortReason !== "signal") {
+			if (reason === "signal" && abortReason !== "signal" && abortReason !== "timeout") {
 				abortReason = "signal";
 			}
 			return;
@@ -635,6 +645,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		signal.addEventListener("abort", onAbort, { once: true, signal: listenerSignal });
 	}
 
+	// Wall-clock hard limit. Defense-in-depth for the case where a provider stream
+	// hang escapes the inference-layer watchdog (see openai-completions
+	// `isOpenAICompletionsProgressChunk`). Disabled by default; set
+	// `task.maxRuntimeMs > 0` to cap each subagent's lifetime.
+	let runtimeTimeoutId: NodeJS.Timeout | undefined;
+	if (maxRuntimeMs > 0) {
+		runtimeTimeoutId = setTimeout(() => {
+			if (!resolved) {
+				logger.warn("Subagent runtime limit exceeded; aborting", {
+					id,
+					agent: agent.name,
+					maxRuntimeMs,
+				});
+				requestAbort("timeout");
+			}
+		}, maxRuntimeMs);
+	}
+
 	const resolveSignalAbortReason = (): string => {
 		const reason = signal?.reason;
 		if (reason instanceof Error) {
@@ -645,6 +673,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (message.length > 0) return message;
 		}
 		return "Cancelled by caller";
+	};
+	const resolveAbortReasonText = (): string => {
+		if (runtimeLimitExceeded) {
+			return `Subagent runtime limit exceeded (task.maxRuntimeMs=${maxRuntimeMs})`;
+		}
+		return resolveSignalAbortReason();
 	};
 	const PROGRESS_COALESCE_MS = 150;
 	let lastProgressEmitMs = 0;
@@ -906,6 +940,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					}
 					// Accumulate tokens for progress display
 					progress.tokens += getUsageTokens(messageUsage);
+					// Track latest per-turn context size so the UI can show
+					// "current context", not just cumulative billing volume.
+					if (role === "assistant") {
+						const perTurnTotal = getNumberField(messageUsage as Record<string, unknown>, "totalTokens");
+						if (perTurnTotal !== undefined && perTurnTotal > 0) {
+							progress.contextTokens = perTurnTotal;
+						}
+					}
 				}
 				break;
 			}
@@ -946,12 +988,29 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let abortReasonText: string | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
-				aborted = abortReason === "signal" || abortReason === undefined;
+				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
 				if (aborted) {
-					abortReasonText ??= resolveSignalAbortReason();
+					abortReasonText ??= resolveAbortReasonText();
 				}
 				exitCode = 1;
 				throw new ToolAbortError();
+			}
+		};
+		const awaitAbortable = async <T>(promise: Promise<T>): Promise<T> => {
+			checkAbort();
+			const { promise: abortPromise, reject } = Promise.withResolvers<never>();
+			const onAbort = () => {
+				try {
+					checkAbort();
+				} catch (err) {
+					reject(err);
+				}
+			};
+			abortSignal.addEventListener("abort", onAbort, { once: true });
+			try {
+				return await Promise.race([promise, abortPromise]);
+			} finally {
+				abortSignal.removeEventListener("abort", onAbort);
 			}
 		};
 
@@ -960,7 +1019,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Pin authStorage to modelRegistry.authStorage — mirrors the createAgentSession invariant.
 			const registryFromParent = options.modelRegistry !== undefined;
 			const modelRegistry =
-				options.modelRegistry ?? new ModelRegistry(options.authStorage ?? (await discoverAuthStorage()));
+				options.modelRegistry ??
+				new ModelRegistry(options.authStorage ?? (await awaitAbortable(discoverAuthStorage())));
 			const authStorage = modelRegistry.authStorage;
 			if (options.authStorage && options.authStorage !== authStorage) {
 				throw new Error(
@@ -969,7 +1029,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 			if (!registryFromParent) {
-				await modelRegistry.refresh();
+				await awaitAbortable(modelRegistry.refresh());
 			} else {
 				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
 			}
@@ -980,11 +1040,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
 				authFallbackUsed,
-			} = await resolveModelOverrideWithAuthFallback(
-				modelPatterns,
-				options.parentActiveModelPattern,
-				modelRegistry,
-				settings,
+			} = await awaitAbortable(
+				resolveModelOverrideWithAuthFallback(
+					modelPatterns,
+					options.parentActiveModelPattern,
+					modelRegistry,
+					settings,
+				),
 			);
 			if (authFallbackUsed && model) {
 				logger.warn("Subagent model has no working credentials; falling back to parent session model", {
@@ -994,12 +1056,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					resolvedModel: model.id,
 				});
 			}
+			if (model?.contextWindow && model.contextWindow > 0) {
+				progress.contextWindow = model.contextWindow;
+			}
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 
 			const sessionManager = sessionFile
-				? await SessionManager.open(sessionFile)
+				? await awaitAbortable(SessionManager.open(sessionFile))
 				: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
@@ -1008,52 +1073,84 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const mcpProxyTools = options.mcpManager ? createMCPProxyTools(options.mcpManager) : [];
 			const enableMCP = !options.mcpManager;
 
+			// Derive subagent-scoped telemetry from the parent's config so the
+			// child loop's spans nest under the parent's active execute_tool span
+			// (OTEL context propagation handles parent linkage automatically),
+			// carry the subagent's own agent identity, and use the subagent's
+			// own session id for `gen_ai.conversation.id`.
+			const subagentAgentIdentity: AgentIdentity | undefined = options.parentTelemetry
+				? { id, name: agent.name, description: agent.description }
+				: undefined;
+			const subagentTelemetry: AgentTelemetryConfig | undefined =
+				options.parentTelemetry && subagentAgentIdentity
+					? {
+							...options.parentTelemetry,
+							agent: subagentAgentIdentity,
+							// Clear parent's conversationId; the child loop falls back to
+							// its own AgentLoopConfig.sessionId.
+							conversationId: undefined,
+						}
+					: undefined;
+
+			if (options.parentTelemetry && subagentAgentIdentity) {
+				const parentTelemetryHandle = resolveTelemetry(
+					options.parentTelemetry,
+					options.parentTelemetry.conversationId,
+				);
+				recordHandoff(parentTelemetryHandle, {
+					fromAgent: options.parentTelemetry.agent,
+					toAgent: subagentAgentIdentity,
+				});
+			}
+
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
-			const { session } = await createAgentSession({
-				cwd: worktree ?? cwd,
-				authStorage,
-				modelRegistry,
-				settings: subagentSettings,
-				model,
-				thinkingLevel: effectiveThinkingLevel,
-				toolNames,
-				outputSchema,
-				requireYieldTool: true,
-				contextFiles: options.contextFiles,
-				skills: options.skills,
-				promptTemplates: options.promptTemplates,
-				workspaceTree: options.workspaceTree,
-				systemPrompt: defaultPrompt => {
-					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-						agent: agent.systemPrompt,
-						context: options.context?.trim() ?? "",
-						worktree: worktree ?? "",
-						outputSchema: normalizedOutputSchema,
-						contextFile: contextFileForPrompt,
-						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
-						ircSelfId: ircEnabled ? id : "",
-					});
-					return defaultPrompt.length === 0
-						? [subagentPrompt]
-						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
-				},
-				sessionManager,
-				hasUI: false,
-				spawns: spawnsEnv,
-				taskDepth: childDepth,
-				parentHindsightSessionState: options.parentHindsightSessionState,
-				parentTaskPrefix: id,
-				agentId: id,
-				agentDisplayName: agent.name,
-				enableLsp: lspEnabled,
-				skipPythonPreflight,
-				enableMCP,
-				mcpManager: options.mcpManager,
-				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-				localProtocolOptions: options.localProtocolOptions,
-			memory: agent.memory,
-			});
+			const { session } = await awaitAbortable(
+				createAgentSession({
+					cwd: worktree ?? cwd,
+					authStorage,
+					modelRegistry,
+					settings: subagentSettings,
+					model,
+					thinkingLevel: effectiveThinkingLevel,
+					toolNames,
+					outputSchema,
+					requireYieldTool: true,
+					contextFiles: options.contextFiles,
+					skills: options.skills,
+					promptTemplates: options.promptTemplates,
+					workspaceTree: options.workspaceTree,
+					systemPrompt: defaultPrompt => {
+						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+							agent: agent.systemPrompt,
+							context: options.context?.trim() ?? "",
+							worktree: worktree ?? "",
+							outputSchema: normalizedOutputSchema,
+							contextFile: contextFileForPrompt,
+							ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
+							ircSelfId: ircEnabled ? id : "",
+						});
+						return defaultPrompt.length === 0
+							? [subagentPrompt]
+							: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+					},
+					sessionManager,
+					hasUI: false,
+					spawns: spawnsEnv,
+					taskDepth: childDepth,
+					parentHindsightSessionState: options.parentHindsightSessionState,
+					parentTaskPrefix: id,
+					agentId: id,
+					agentDisplayName: agent.name,
+					enableLsp: lspEnabled,
+					skipPythonPreflight,
+					enableMCP,
+					mcpManager: options.mcpManager,
+					customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+					localProtocolOptions: options.localProtocolOptions,
+					telemetry: subagentTelemetry,
+				}),
+			);
 
 			activeSession = session;
 
@@ -1074,7 +1171,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const parentOwnedToolNames = new Set(["todo_write"]);
 			const filteredSubagentTools = subagentToolNames.filter(name => !parentOwnedToolNames.has(name));
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
-				await session.setActiveToolsByName(filteredSubagentTools);
+				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
 
 			session.sessionManager.appendSessionInit({
@@ -1091,6 +1188,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				},
 				{ once: true, signal: sessionAbortController.signal },
 			);
+			// Defensive: if the wall-clock timer (or external signal) fired during
+			// the awaited setup above, the listener registration races the dispatch
+			// and may not observe the already-fired abort event. Mirror it manually.
+			if (abortSignal.aborted) {
+				void session.abort();
+			}
 
 			const extensionRunner = session.extensionRunner;
 			if (extensionRunner) {
@@ -1120,7 +1223,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getAllTools: () => session.getAllToolNames(),
 						setActiveTools: (toolNames: string[]) =>
 							session.setActiveToolsByName(toolNames.filter(name => !parentOwnedToolNames.has(name))),
-						getCommands: () => [],
+						getCommands: () => getSessionSlashCommands(session),
 						setModel: model => runExtensionSetModel(session, model),
 						getThinkingLevel: () => session.thinkingLevel,
 						setThinkingLevel: level => session.setThinkingLevel(level),
@@ -1143,7 +1246,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				extensionRunner.onError(err => {
 					logger.error("Extension error", { path: err.extensionPath, error: err.error });
 				});
-				await extensionRunner.emit({ type: "session_start" });
+				await awaitAbortable(extensionRunner.emit({ type: "session_start" }));
 			}
 
 			const MAX_YIELD_RETRIES = 3;
@@ -1160,8 +1263,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			});
 
-			await session.prompt(task, { attribution: "agent" });
-			await session.waitForIdle();
+			checkAbort();
+			await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+			await awaitAbortable(session.waitForIdle());
 
 			const reminderToolChoice = buildNamedToolChoice("yield", session.model);
 
@@ -1175,11 +1279,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					});
 
 					const isFinalRetry = retryCount >= MAX_YIELD_RETRIES;
-					await session.prompt(reminder, {
-						attribution: "agent",
-						...(isFinalRetry && reminderToolChoice ? { toolChoice: reminderToolChoice } : {}),
-					});
-					await session.waitForIdle();
+					await awaitAbortable(
+						session.prompt(reminder, {
+							attribution: "agent",
+							...(isFinalRetry && reminderToolChoice ? { toolChoice: reminderToolChoice } : {}),
+						}),
+					);
+					await awaitAbortable(session.waitForIdle());
 				} catch (err) {
 					logger.error("Subagent prompt failed", {
 						error: err instanceof Error ? err.message : String(err),
@@ -1187,7 +1293,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
-			await session.waitForIdle();
+			await awaitAbortable(session.waitForIdle());
 			if (!yieldCalled && !abortSignal.aborted) {
 				exitCode = 0;
 			}
@@ -1195,9 +1301,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const lastAssistant = session.getLastAssistantMessage();
 			if (lastAssistant) {
 				if (lastAssistant.stopReason === "aborted") {
-					aborted = abortReason === "signal" || abortReason === undefined;
+					aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
 					if (aborted) {
-						abortReasonText ??= resolveSignalAbortReason();
+						abortReasonText ??= resolveAbortReasonText();
 					}
 					exitCode = 1;
 				} else if (lastAssistant.stopReason === "error") {
@@ -1212,9 +1318,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 		} finally {
 			if (abortSignal.aborted) {
-				aborted = abortReason === "signal" || abortReason === undefined;
+				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
 				if (aborted) {
-					abortReasonText ??= resolveSignalAbortReason();
+					abortReasonText ??= resolveAbortReasonText();
 				}
 				if (exitCode === 0) exitCode = 1;
 			}
@@ -1233,13 +1339,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				try {
 					await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
 				} catch {
-					// Dispose timed out or threw — force-abort the session to stop any
-					// remaining in-flight work (LLM streams, tool calls, DB writes).
-					try {
-						await session.abort();
-					} catch {
-						// Ignore escalation errors — best-effort cleanup only
-					}
+					// Ignore cleanup errors
 				}
 			}
 		}
@@ -1256,6 +1356,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const done = await runSubagent();
 	resolved = true;
 	listenerController.abort();
+	if (runtimeTimeoutId !== undefined) {
+		clearTimeout(runtimeTimeoutId);
+		runtimeTimeoutId = undefined;
+	}
 
 	if (progressTimeoutId) {
 		clearTimeout(progressTimeoutId);
@@ -1309,12 +1413,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		}
 	}
 
-	// Update final progress
-	const wasAborted = abortedViaYield || (!hasYield && (done.aborted || signal?.aborted || false));
+	// Update final progress. A wall-clock timeout always wins: if the runtime
+	// limit fired we report aborted/failed regardless of whether a yield landed
+	// while we were tearing the session down. The yield data is still surfaced
+	// to the caller via `progress.extractedToolData`, but the exit status must
+	// reflect the timeout so on-call doesn't mistake a stuck run for success.
+	if (runtimeLimitExceeded && exitCode === 0) {
+		exitCode = 1;
+	}
+	const wasAborted =
+		runtimeLimitExceeded || abortedViaYield || (!hasYield && (done.aborted || signal?.aborted || false));
 	const finalAbortReason = wasAborted
-		? abortedViaYield
-			? yieldAbortReason
-			: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : "Subagent aborted task"))
+		? runtimeLimitExceeded
+			? resolveAbortReasonText()
+			: abortedViaYield
+				? yieldAbortReason
+				: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : resolveAbortReasonText()))
 		: undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
@@ -1347,6 +1461,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		truncated: Boolean(truncated),
 		durationMs: Date.now() - startTime,
 		tokens: progress.tokens,
+		contextTokens: progress.contextTokens,
+		contextWindow: progress.contextWindow,
 		modelOverride,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,

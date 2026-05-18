@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { Type } from "@sinclair/typebox";
+import { z } from "zod/v4";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
 import { executeMemoryRetain, loadMmemoryConfig } from ".";
@@ -7,12 +7,11 @@ import embeddedRetainDesc from "../../sidecars/mme-retain.tool-desc.md" with { t
 import { createSidecar, sidecarPath } from "../../utils/m-utils";
 const resolveDesc = createSidecar(sidecarPath("mme-retain.tool-desc.md"), embeddedRetainDesc);
 
-const schema = Type.Object({
-	content: Type.String({
-		description:
-			"Information to store in project memory. Include relevant context: " +
-			"what was decided, why, and under what constraints.",
-	}),
+const schema = z.object({
+	content: z.string().describe(
+		"Information to store in project memory. Include relevant context: " +
+		"what was decided, why, and under what constraints.",
+	),
 });
 
 export class MmemoryRetainTool implements AgentTool<typeof schema> {

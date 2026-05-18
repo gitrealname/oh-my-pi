@@ -74,7 +74,7 @@ describe("trimToolResult", () => {
 		const result = trimToolResult(content, 100);
 		expect(result).not.toBe(content);
 		expect(result[0]).not.toBe(content[0]);
-		expect(result[0].text).toContain("chars trimmed");
+		expect((result[0] as { type: "text"; text: string }).text).toContain("chars trimmed");
 	});
 
 	it("passes through image blocks unchanged", () => {

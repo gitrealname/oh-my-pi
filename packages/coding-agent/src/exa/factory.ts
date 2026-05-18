@@ -1,9 +1,9 @@
 /**
  * Shared factory for creating Exa tools with consistent error handling and response formatting.
  */
-import type { TObject, TProperties } from "@sinclair/typebox";
+import type { TSchema } from "@oh-my-pi/pi-ai";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import { callExaTool, findApiKey, formatSearchResults, isSearchResponse } from "./mcp-client";
+import { callExaTool, findApiKey, formatGenericResponse, formatSearchResults, isSearchResponse } from "./mcp-client";
 import type { ExaRenderDetails } from "./types";
 
 /** Creates an Exa tool with standardized API key handling, error wrapping, and optional search response formatting. */
@@ -11,7 +11,7 @@ export function createExaTool(
 	name: string,
 	label: string,
 	description: string,
-	parameters: TObject<TProperties>,
+	parameters: TSchema,
 	mcpToolName: string,
 	options?: {
 		/** When true, checks isSearchResponse and formats with formatSearchResults. Default: true */
@@ -19,7 +19,7 @@ export function createExaTool(
 		/** Transform params before passing to callExaTool */
 		transformParams?: (params: Record<string, unknown>) => Record<string, unknown>;
 	},
-): CustomTool<any, ExaRenderDetails> {
+): CustomTool<TSchema, ExaRenderDetails> {
 	const formatResponse = options?.formatResponse ?? true;
 	const transformParams = options?.transformParams;
 
@@ -32,7 +32,8 @@ export function createExaTool(
 			try {
 				const apiKey = findApiKey();
 				// Exa MCP endpoint is publicly accessible; API key is optional
-				const args = transformParams ? transformParams(params as Record<string, unknown>) : params;
+				const rawArgs = params as Record<string, unknown>;
+				const args = transformParams ? transformParams(rawArgs) : rawArgs;
 				const response = await callExaTool(mcpToolName, args, apiKey);
 
 				if (formatResponse && isSearchResponse(response)) {
@@ -44,7 +45,7 @@ export function createExaTool(
 				}
 
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
+					content: [{ type: "text" as const, text: formatGenericResponse(response) }],
 					details: { raw: response, toolName: name },
 				};
 			} catch (error) {

@@ -1,6 +1,6 @@
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { SCHEDULE_SLASH_CHANNEL } from "../../utils/event-bus";
-import { Type } from "@sinclair/typebox";
+import { z } from "zod/v4";
 import type { ToolSession } from "..";
 import { toolResult } from "../tool-result";
 import { executeMemoryRecall, loadMmemoryConfig } from ".";
@@ -8,17 +8,14 @@ import embeddedRecallDesc from "../../sidecars/mme-recall.tool-desc.md" with { t
 import { createSidecar, sidecarPath } from "../../utils/m-utils";
 const resolveDesc = createSidecar(sidecarPath("mme-recall.tool-desc.md"), embeddedRecallDesc);
 
-const schema = Type.Object({
-	query: Type.String({
-		description:
-			"Natural language search query. Be specific about what you need to know. " +
-			"Include entity names, file paths, or decision context for best results.",
-	}),
-	scope: Type.Optional(
-		Type.String({
-			description: "Scope override: per-project | global | / (one-time global for this query only)",
-		}),
+const schema = z.object({
+	query: z.string().describe(
+		"Natural language search query. Be specific about what you need to know. " +
+		"Include entity names, file paths, or decision context for best results.",
 	),
+	scope: z.string().describe(
+		"Scope override: per-project | global | / (one-time global for this query only)",
+	).optional(),
 });
 
 export class MmemoryRecallTool implements AgentTool<typeof schema> {

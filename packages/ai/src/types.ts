@@ -1,4 +1,4 @@
-import type { TSchema } from "@sinclair/typebox";
+import type { ZodType, z } from "zod/v4";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -204,6 +204,15 @@ export interface RawSseEvent {
 	raw: string[];
 }
 
+/**
+ * `fetch`-compatible function. Accepts any callable matching the standard
+ * fetch signature; `preconnect` is optional because non-Bun runtimes (browsers,
+ * test mocks) won't expose it.
+ */
+export type FetchImpl = ((input: string | URL | Request, init?: RequestInit) => Promise<Response>) & {
+	preconnect?: typeof globalThis.fetch.preconnect;
+};
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -211,9 +220,27 @@ export interface StreamOptions {
 	minP?: number;
 	presencePenalty?: number;
 	repetitionPenalty?: number;
+	/**
+	 * Stop sequences. Anthropic encodes as `stop_sequences` (array, max 4);
+	 * OpenAI chat-completions encodes as `stop` (string or array of up to 4);
+	 * OpenAI Responses API has no `stop` field today (silently dropped by the
+	 * provider when present).
+	 */
+	stopSequences?: string[];
+	/**
+	 * Frequency penalty (OpenAI). Penalizes new tokens based on existing frequency
+	 * in the text so far. Range -2.0 to 2.0. Parallel to {@link presencePenalty}.
+	 */
+	frequencyPenalty?: number;
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/**
+	 * Called when a provider returns 401 before any replay-unsafe assistant
+	 * event has been emitted. Returning a different key retries the provider
+	 * request once.
+	 */
+	onAuthError?: (provider: string, apiKey: string, error: unknown) => Promise<string | undefined>;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Additional headers to include in provider requests.
@@ -275,6 +302,18 @@ export interface StreamOptions {
 	 * Set to 0 to disable the inter-event idle watchdog for this request.
 	 */
 	streamIdleTimeoutMs?: number;
+	/**
+	 * Optional retry delay hook for tests and transports that need custom scheduling.
+	 */
+	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	/**
+	 * Optional `fetch` implementation override. Providers route every HTTP
+	 * request — direct calls, SDK clients, and retry helpers — through this
+	 * implementation when set. Defaults to `globalThis.fetch`. Providers that
+	 * do not use `fetch` (Bedrock's AWS SDK transport, Cursor's HTTP/2
+	 * channel) silently ignore the override.
+	 */
+	fetch?: FetchImpl;
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
 }
@@ -461,6 +500,8 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
+	errorStatus?: number;
 	/** Provider-specific opaque payload used to reconstruct transport-native history. */
 	providerPayload?: ProviderPayload;
 	timestamp: number; // Unix timestamp in milliseconds
@@ -519,6 +560,23 @@ export interface CursorExecHandlers {
 	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;
 	onToolResult?: CursorToolResultHandler;
 }
+
+/**
+ * Plain JSON Schema document used by extension-authored tools (legacy TypeBox
+ * emits this shape). Distinguished from Zod at runtime via {@link isZodSchema}.
+ */
+export type TJsonSchema = Record<string, unknown>;
+
+/**
+ * Schema type accepted by the {@link Tool} interface.
+ *
+ * Canonical authoring uses Zod. Extension compat may supply a JSON Schema
+ * object (including TypeBox static schema objects).
+ */
+export type TSchema = ZodType | TJsonSchema;
+
+/** Resolve parameter types for tool execution / handlers. */
+export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
@@ -613,7 +671,7 @@ export interface OpenAICompat {
 	requiresThinkingAsText?: boolean;
 	/** Whether tool call IDs must be normalized to Mistral format (exactly 9 alphanumeric chars). Default: auto-detected from URL. */
 	requiresMistralToolIds?: boolean;
-	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "zai" uses thinking: { type: "enabled" }, "qwen" uses top-level enable_thinking, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
+	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "zai" uses thinking: { type: "enabled" | "disabled" } (also used by Moonshot Kimi), "qwen" uses top-level enable_thinking, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
 	thinkingFormat?: "openai" | "openrouter" | "zai" | "qwen" | "qwen-chat-template";
 	/** Which reasoning content field to emit on assistant messages. Default: auto-detected. */
 	reasoningContentField?: "reasoning_content" | "reasoning" | "reasoning_text";
@@ -721,6 +779,21 @@ export interface Model<TApi extends Api = any> {
 	contextWindow: number;
 	maxTokens: number;
 	headers?: Record<string, string>;
+	/**
+	 * Streaming transport override. When `"pi-native"`, `streamSimple` routes
+	 * the request to the model's `baseUrl` via the auth-gateway's
+	 * `POST /v1/pi/stream` endpoint instead of dispatching the per-API
+	 * provider client. The `baseUrl` must point at an `omp auth-gateway`
+	 * (or compatible) host; `headers.Authorization` (or `apiKey` resolved by
+	 * the registry) carries the gateway bearer.
+	 *
+	 * Used by containerized omp installs (e.g. robomp slots) to route every
+	 * LLM call through a sidecar gateway that holds the real provider
+	 * credentials. The model's other metadata (pricing, context window,
+	 * thinking config, …) still resolves locally; only the streaming
+	 * dispatch is redirected.
+	 */
+	transport?: "pi-native";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */

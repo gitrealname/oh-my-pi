@@ -1,5 +1,4 @@
-import { fetchWithRetry } from "@oh-my-pi/pi-utils";
-import type { TSchema } from "@sinclair/typebox";
+import { extractHttpStatusFromError, fetchWithRetry } from "@oh-my-pi/pi-utils";
 import { getEnvApiKey } from "../stream";
 import type {
 	Api,
@@ -19,6 +18,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
+import { toolWireSchema } from "../utils/schema/wire";
 import { transformMessages } from "./transform-messages";
 
 export interface OllamaChatOptions extends StreamOptions {
@@ -31,7 +31,7 @@ type OllamaFunctionTool = {
 	function: {
 		name: string;
 		description: string;
-		parameters: TSchema;
+		parameters: Record<string, unknown>;
 	};
 };
 
@@ -223,7 +223,7 @@ function convertTools(tools: Tool[] | undefined): OllamaFunctionTool[] | undefin
 		function: {
 			name: tool.name,
 			description: tool.description,
-			parameters: tool.parameters,
+			parameters: toolWireSchema(tool),
 		},
 	}));
 }
@@ -378,6 +378,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				body: JSON.stringify(body),
 				signal: options.signal,
 				defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
+				fetch: options.fetch,
 			});
 			if (!response.ok) {
 				throw new Error(`HTTP ${response.status} from ${baseUrl}/api/chat`);
@@ -504,6 +505,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				}
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
+			output.errorStatus = extractHttpStatusFromError(error);
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) {

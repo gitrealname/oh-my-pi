@@ -8,6 +8,7 @@
  * - Interact with the user via UI primitives
  */
 import type { AgentMessage, AgentToolResult, AgentToolUpdateCallback, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	Api,
 	AssistantMessageEvent,
@@ -17,22 +18,29 @@ import type {
 	Model,
 	ProviderResponseMetadata,
 	SimpleStreamOptions,
+	Static,
 	TextContent,
+	TSchema,
 } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/utils/oauth/types";
 import type * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
-import type { Static, TSchema } from "@sinclair/typebox";
+
+// AWS-CORP: custom — merge with care
+
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
+// AWS-CORP: custom — merge with care
 import type { PythonExecutorOptions } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
-import type { CompactionResult } from "../../session/compaction";
+
+// AWS-CORP: custom — merge with care
+
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
@@ -55,6 +63,7 @@ import type {
 	AutoRetryEndEvent,
 	AutoRetryStartEvent,
 	ContextEvent,
+	GoalUpdatedEvent,
 	SessionBeforeBranchEvent,
 	SessionBeforeBranchResult,
 	SessionBeforeCompactEvent,
@@ -284,6 +293,7 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
+	// AWS-CORP: custom — merge with care
 	/** Execute Python code via the shared kernel (session-scoped or per-call). */
 	executePython?(
 		code: string,
@@ -322,6 +332,8 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Navigate to a different point in the session tree. */
 	navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 
+
+// AWS-CORP: custom — merge with care
 
 	/** AbortSignal for the current command invocation. */
 	signal: AbortSignal;
@@ -367,7 +379,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	label: string;
 	/** Description for LLM */
 	description: string;
-	/** Parameter schema (TypeBox) */
+	/** Parameter schema (Zod, or TypeBox for legacy/extension compat). */
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
@@ -380,6 +392,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	// AWS-CORP: custom — merge with care
 	/** Short snippet included in the tool prompt section to guide LLM tool selection. */
 	promptSnippet?: string;
 	/** Execute the tool. */
@@ -742,6 +755,7 @@ export type ExtensionEvent =
 	| AutoRetryEndEvent
 	| TtsrTriggeredEvent
 	| TodoReminderEvent
+	| GoalUpdatedEvent
 	| CredentialDisabledEvent
 	| UserBashEvent
 	| UserPythonEvent
@@ -846,8 +860,11 @@ export interface ExtensionAPI {
 	/** File logger for error/warning/debug messages */
 	logger: typeof import("@oh-my-pi/pi-utils").logger;
 
-	/** Injected @sinclair/typebox module for defining tool parameters */
-	typebox: typeof import("@sinclair/typebox");
+	/** Injected zod-backed typebox shim for legacy `Type.Object(...)` parameter authoring. */
+	typebox: typeof import("../typebox");
+
+	/** Injected zod module for Zod-authored extension tools (canonical going forward). */
+	zod: typeof import("zod/v4");
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof piCodingAgent;
@@ -900,6 +917,7 @@ export interface ExtensionAPI {
 	on(event: "auto_retry_end", handler: ExtensionHandler<AutoRetryEndEvent>): void;
 	on(event: "ttsr_triggered", handler: ExtensionHandler<TtsrTriggeredEvent>): void;
 	on(event: "todo_reminder", handler: ExtensionHandler<TodoReminderEvent>): void;
+	on(event: "goal_updated", handler: ExtensionHandler<GoalUpdatedEvent>): void;
 	on(event: "credential_disabled", handler: ExtensionHandler<CredentialDisabledEvent>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
@@ -1215,6 +1233,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	// AWS-CORP: custom — merge with care
 	executePython?: ExtensionContext["executePython"];
 }
 

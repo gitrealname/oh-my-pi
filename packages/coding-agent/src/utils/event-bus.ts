@@ -1,5 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 
+// AWS-CORP: custom — merge with care
 /**
  * Channel for tools to schedule a slash command to run after the current agent turn.
  * Payload: full slash command string including leading '/' (e.g. "/mreview /abs/path").

@@ -1,12 +1,15 @@
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
 import type { PromptTemplate } from "../config/prompt-templates";
+// AWS-CORP: custom — merge with care
 import type { Settings, SettingPath } from "../config/settings";
 import { SETTINGS_SCHEMA } from "../config/settings-schema";
 import { EditTool } from "../edit";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
+import type { GoalModeState, GoalRuntime } from "../goals";
+import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import { LspTool } from "../lsp";
 import type { PlanModeState } from "../plan-mode/state";
@@ -26,6 +29,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
+// AWS-CORP: custom — merge with care
 import { MBrowserTool } from "./mbrowser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
@@ -39,7 +43,7 @@ import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
-import { NotebookTool } from "./notebook";
+// AWS-CORP: custom — merge with care
 import { MCommandTool } from "./mcommand";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
@@ -60,6 +64,7 @@ import { YieldTool } from "./yield";
 export * from "../edit";
 export * from "../exa";
 export type * from "../exa/types";
+export * from "../goals";
 export * from "../lsp";
 export * from "../session/streaming-output";
 export * from "../task";
@@ -150,6 +155,7 @@ export interface ToolSession {
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get session ID */
+	// AWS-CORP: custom — merge with care
 	/** Track tool-owned task work so ESC can abort it independently of the full agent loop. */
 	trackTaskExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	getSessionId?: () => string | null;
@@ -183,6 +189,10 @@ export interface ToolSession {
 	settings: Settings;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
+	/** Goal mode state (if active or paused) */
+	getGoalModeState?: () => GoalModeState | undefined;
+	/** Goal runtime for the active agent session. */
+	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
@@ -249,10 +259,14 @@ export interface ToolSession {
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
+	// AWS-CORP: custom — merge with care
 	/** Active skill role bindings: maps tool name → model role.
 	 *  Populated from skills that have both `role` and `tools` frontmatter fields.
 	 *  Tools can check this to prefer a skill-specified role over config defaults. */
 	activeSkillRoles?: Map<string, string>;
+	/** Get the active OpenTelemetry config so subagent dispatch can forward
+	 *  the parent's tracer/hooks with the subagent's own identity stamped. */
+	getTelemetry?: () => AgentTelemetryConfig | undefined;
 }
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;
@@ -298,6 +312,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
+	// AWS-CORP: custom — merge with care
 	mbrowser: s => new MBrowserTool(s),
 	mcommand: MCommandTool.createIf,
 	checkpoint: CheckpointTool.createIf,
@@ -320,6 +335,7 @@ export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 	report_finding: () => reportFindingTool,
 	report_tool_issue: s => createReportToolIssueTool(s),
 	resolve: s => new ResolveTool(s),
+	goal: s => new GoalTool(s),
 };
 
 export type ToolName = keyof typeof BUILTIN_TOOLS;
@@ -366,8 +382,13 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
-	const requestedTools =
+	let requestedTools =
 		toolNames && toolNames.length > 0 ? [...new Set(toolNames.map(name => name.toLowerCase()))] : undefined;
+	const goalEnabled = session.settings.get("goal.enabled");
+	const goalModeActive = goalEnabled && session.getGoalModeState?.()?.enabled === true;
+	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
+		requestedTools = [...requestedTools, "goal"];
+	}
 	const backends = resolveEvalBackends(session);
 	const allowPython = backends.python;
 	const allowJs = backends.js;
@@ -439,6 +460,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
+		if (name === "goal") return goalEnabled && goalModeActive;
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return true;
 		if (name === "eval") return allowEval;
@@ -473,6 +495,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			const currentDepth = session.taskDepth ?? 0;
 			return maxDepth < 0 || currentDepth < maxDepth;
 		}
+		// AWS-CORP: custom — merge with care
 		if (name === "mbrowser") return session.settings.get("mbrowser.enabled");
 		if (name === "mreview") return session.settings.get("mreview.enabled");
 		if (name.startsWith("mmemory")) {
@@ -493,6 +516,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 						.filter(([name]) => isToolAllowed(name))
 						.map(([name, factory]) => [name, factory] as const),
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
+					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];
 
 	const baseResults = await Promise.all(
@@ -513,7 +537,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// Injected unconditionally into every agent, regardless of requested tool list.
 	const autoQA = isAutoQaEnabled(session.settings);
 	if (autoQA && !tools.some(t => t.name === "report_tool_issue")) {
-		const qaTool = await HIDDEN_TOOLS.report_tool_issue(session);
+		// Build the enum from tools we just constructed via BUILTIN_TOOLS / HIDDEN_TOOLS.
+		// Extension overrides (e.g. a user's custom `bash`) get added later by
+		// other code paths, so they're absent here — exactly what we want; MCP /
+		// extension tools never end up in the report enum.
+		const activeBuiltinNames = tools
+			.map(t => t.name)
+			.filter(name => (name in BUILTIN_TOOLS || name in HIDDEN_TOOLS) && name !== "report_tool_issue");
+		const qaTool = createReportToolIssueTool(session, activeBuiltinNames);
 		if (qaTool) {
 			tools.push(wrapToolWithMetaNotice(qaTool));
 		}

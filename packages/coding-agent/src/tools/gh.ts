@@ -3,9 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { StringEnum } from "@oh-my-pi/pi-ai";
+
 import { getWorktreesDir, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+import * as z from "zod/v4";
 import type { Settings } from "../config/settings";
 import githubDescription from "../prompts/tools/github.md" with { type: "text" };
 import * as git from "../utils/git";
@@ -197,135 +197,54 @@ const RUN_SUCCESS_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
 const RUN_FAILURE_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure"]);
 const JOB_FAILURE_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required"]);
 
-const githubSchema = Type.Object({
-	op: StringEnum(
-		[
-			"repo_view",
-			"pr_create",
-			"pr_checkout",
-			"pr_push",
-			"search_issues",
-			"search_prs",
-			"search_code",
-			"search_commits",
-			"search_repos",
-			"run_watch",
-		],
-		{ description: "github operation" },
-	),
-	repo: Type.Optional(
-		Type.String({
-			description: "owner/repo (any op)",
-			examples: ["facebook/react"],
-		}),
-	),
-	branch: Type.Optional(
-		Type.String({
-			description: "branch (repo_view, pr_push local branch, run_watch)",
-			examples: ["main", "develop"],
-		}),
-	),
-	pr: Type.Optional(
-		Type.Union(
-			[
-				Type.String({ examples: ["123", "feature-branch"] }),
-				Type.Array(Type.String(), {
-					examples: [["123", "456"]],
-				}),
-			],
-			{
-				description:
-					"pr number, url, or branch (pr_checkout); pass an array to batch-process multiple pull requests in one call",
-			},
-		),
-	),
-	force: Type.Optional(Type.Boolean({ description: "reset existing local branch (pr_checkout)" })),
-	forceWithLease: Type.Optional(Type.Boolean({ description: "force-with-lease push (pr_push)" })),
-	title: Type.Optional(
-		Type.String({
-			description: "PR title (pr_create)",
-			examples: ["Fix login bug"],
-		}),
-	),
-	body: Type.Optional(
-		Type.String({
-			description: "PR body markdown (pr_create); mutually exclusive with fill",
-		}),
-	),
-	base: Type.Optional(
-		Type.String({
-			description: "PR base branch (pr_create); defaults to repo default branch",
-			examples: ["main"],
-		}),
-	),
-	head: Type.Optional(
-		Type.String({
-			description: "PR head branch (pr_create); defaults to current branch",
-			examples: ["feature/foo"],
-		}),
-	),
-	draft: Type.Optional(Type.Boolean({ description: "open PR as draft (pr_create)" })),
-	fill: Type.Optional(
-		Type.Boolean({
-			description: "auto-fill PR title/body from commits (pr_create); mutually exclusive with title/body",
-		}),
-	),
-	reviewer: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "reviewers to request (pr_create); accepts users or org/team",
-			examples: [["octocat", "myorg/team"]],
-		}),
-	),
-	assignee: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "assignees (pr_create); use @me for the authenticated user",
-			examples: [["@me"]],
-		}),
-	),
-	label: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "labels to apply (pr_create)",
-			examples: [["bug", "enhancement"]],
-		}),
-	),
-	query: Type.Optional(
-		Type.String({
-			description: "search query (search_issues, search_prs, search_code, search_commits, search_repos)",
-			examples: ["is:open label:bug"],
-		}),
-	),
-	since: Type.Optional(
-		Type.String({
-			description:
-				"lower-bound date for search_issues/search_prs/search_commits/search_repos. Accepts a relative duration (`<n><unit>` with unit `m`/`h`/`d`/`w`/`mo`/`y`, e.g. `3d`, `12h`, `2w`) or an ISO date (`YYYY-MM-DD`) / datetime. Translated to a `created:>=…` (or `committer-date:`/`pushed:`) qualifier; not supported by search_code.",
-			examples: ["3d", "2w", "2026-05-01"],
-		}),
-	),
-	until: Type.Optional(
-		Type.String({
-			description:
-				"upper-bound date in the same format as `since`. With both, builds a `field:since..until` range qualifier.",
-			examples: ["1d", "2026-05-09"],
-		}),
-	),
-	dateField: Type.Optional(
-		StringEnum(["created", "updated"], {
-			description:
-				"date field used by `since`/`until`. issues/prs: `created` (default) or `updated`. repos: `created` (default) or `updated` (mapped to GitHub's `pushed:`). commits: ignored — always uses `committer-date`.",
-			default: "created",
-		}),
-	),
-	limit: Type.Optional(
-		Type.Number({
-			description: "max results (search_issues, search_prs, search_code, search_commits, search_repos)",
-			default: 10,
-		}),
-	),
-	run: Type.Optional(Type.String({ description: "actions run id or url (run_watch)", examples: ["123456"] })),
-	tail: Type.Optional(Type.Number({ description: "log lines per failed job (run_watch)", default: 15 })),
-});
+const githubSchema = z
+	.object({
+		op: z
+			.enum([
+				"repo_view",
+				"pr_create",
+				"pr_checkout",
+				"pr_push",
+				"search_issues",
+				"search_prs",
+				"search_code",
+				"search_commits",
+				"search_repos",
+				"run_watch",
+			] as const)
+			.describe("github operation"),
+		repo: z.string().describe("owner/repo").optional(),
+		branch: z.string().describe("branch").optional(),
+		pr: z
+			.union([z.string(), z.array(z.string())])
+			.describe("pr number, url, or branch")
+			.optional(),
+		force: z.boolean().describe("reset existing local branch").optional(),
+		forceWithLease: z.boolean().describe("force-with-lease push").optional(),
+		title: z.string().describe("pr title").optional(),
+		body: z.string().describe("pr body markdown").optional(),
+		base: z.string().describe("pr base branch").optional(),
+		head: z.string().describe("pr head branch").optional(),
+		draft: z.boolean().describe("open pr as draft").optional(),
+		fill: z.boolean().describe("auto-fill pr title/body from commits").optional(),
+		reviewer: z.array(z.string()).describe("reviewers").optional(),
+		assignee: z.array(z.string()).describe("assignees").optional(),
+		label: z.array(z.string()).describe("labels").optional(),
+		query: z.string().describe("search query").optional(),
+		since: z.string().describe("lower-bound date filter").optional(),
+		until: z.string().describe("upper-bound date filter").optional(),
+		dateField: z
+			.enum(["created", "updated"] as const)
+			.describe("date field")
+			.default("created")
+			.optional(),
+		limit: z.number().default(10).describe("max results").optional(),
+		run: z.string().describe("actions run id or url").optional(),
+		tail: z.number().default(15).describe("log lines per failed job").optional(),
+	})
+	.strict();
 
-type GithubInput = Static<typeof githubSchema>;
+type GithubInput = z.infer<typeof githubSchema>;
 
 export interface GhToolDetails {
 	meta?: OutputMeta;
@@ -1772,6 +1691,39 @@ export async function resolveDefaultRepoMemoized(cwd: string, signal?: AbortSign
 		DEFAULT_REPO_INFLIGHT.set(key, pending);
 	}
 	return untilAborted(signal, pending);
+}
+
+/**
+ * Matches search-query qualifiers that already scope to a repository, org, or
+ * user. When present, callers should avoid layering a default `repo:<current>`
+ * on top — the user has already expressed an explicit scope.
+ *
+ * Only the leading `repo:`/`org:`/`user:`/`owner:` token is treated as a
+ * scope marker; arbitrary substrings (e.g. inside quoted text) are ignored.
+ */
+const REPO_SCOPE_QUALIFIER_PATTERN = /(?:^|\s)-?(?:repo|org|user|owner):\S/i;
+
+/**
+ * Resolve the effective `repo:` scope for a search op. Returns the explicit
+ * `repo` when set, `undefined` when the query already carries a scoping
+ * qualifier, and otherwise the current checkout's `owner/repo` via
+ * `resolveDefaultRepoMemoized`. Resolution failures (no git/gh context, no
+ * configured remote) silently fall back to `undefined` so the search proceeds
+ * across all of GitHub instead of throwing.
+ */
+async function resolveSearchRepoScope(
+	cwd: string,
+	repo: string | undefined,
+	query: string | undefined,
+	signal: AbortSignal | undefined,
+): Promise<string | undefined> {
+	if (repo) return repo;
+	if (query && REPO_SCOPE_QUALIFIER_PATTERN.test(query)) return undefined;
+	try {
+		return await resolveDefaultRepoMemoized(cwd, signal);
+	} catch {
+		return undefined;
+	}
 }
 
 async function resolveGitHubBranchHead(
@@ -3267,11 +3219,11 @@ async function executeSearchIssues(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
 	const dateField = resolveSearchDateField("issues", params.dateField);
 	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
 	const displayQuery = composeSearchQuery([params.query, dateQualifier]);
+	const repo = await resolveSearchRepoScope(session.cwd, normalizeOptionalString(params.repo), displayQuery, signal);
 	const apiQuery = composeSearchQuery([displayQuery, repo ? `repo:${repo}` : undefined, "is:issue"]);
 	const args = buildGhApiSearchArgs("issues", apiQuery, limit);
 
@@ -3285,11 +3237,11 @@ async function executeSearchPrs(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
 	const dateField = resolveSearchDateField("prs", params.dateField);
 	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
 	const displayQuery = composeSearchQuery([params.query, dateQualifier]);
+	const repo = await resolveSearchRepoScope(session.cwd, normalizeOptionalString(params.repo), displayQuery, signal);
 	const apiQuery = composeSearchQuery([displayQuery, repo ? `repo:${repo}` : undefined, "is:pr"]);
 	const args = buildGhApiSearchArgs("issues", apiQuery, limit);
 
@@ -3307,8 +3259,8 @@ async function executeSearchCode(
 	if (params.since !== undefined || params.until !== undefined) {
 		throw new ToolError("search_code does not support since/until; GitHub code search has no date qualifier.");
 	}
-	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
+	const repo = await resolveSearchRepoScope(session.cwd, normalizeOptionalString(params.repo), query, signal);
 	const apiQuery = composeSearchQuery([query, repo ? `repo:${repo}` : undefined]);
 	const args = buildGhApiSearchArgs("code", apiQuery, limit, ["Accept: application/vnd.github.text-match+json"]);
 
@@ -3322,11 +3274,11 @@ async function executeSearchCommits(
 	params: GithubInput,
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
-	const repo = normalizeOptionalString(params.repo);
 	const limit = resolveSearchLimit(params.limit);
 	const dateField = resolveSearchDateField("commits", params.dateField);
 	const dateQualifier = buildSearchDateQualifier(dateField, params.since, params.until);
 	const displayQuery = composeSearchQuery([params.query, dateQualifier]);
+	const repo = await resolveSearchRepoScope(session.cwd, normalizeOptionalString(params.repo), displayQuery, signal);
 	const apiQuery = composeSearchQuery([displayQuery, repo ? `repo:${repo}` : undefined]);
 	const args = buildGhApiSearchArgs("commits", apiQuery, limit);
 

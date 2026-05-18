@@ -30,7 +30,9 @@ const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
 import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/utils/oauth/types";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+
+// AWS-CORP: custom — merge with care
+
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
@@ -43,6 +45,13 @@ import {
 	formatCanonicalVariantSelector,
 	type ModelEquivalenceConfig,
 } from "./model-equivalence";
+import {
+	type ModelOverride,
+	type ModelsConfig,
+	ModelsConfigSchema,
+	type ProviderAuthMode,
+	type ProviderDiscovery,
+} from "./models-config-schema";
 import { type Settings, settings } from "./settings";
 
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
@@ -121,195 +130,8 @@ export function getRoleInfo(role: string, settings: Settings): RoleInfo {
 	return { name: role, color: "muted" };
 }
 
-const OpenRouterRoutingSchema = Type.Object({
-	only: Type.Optional(Type.Array(Type.String())),
-	order: Type.Optional(Type.Array(Type.String())),
-});
 
-// Schema for Vercel AI Gateway routing preferences
-const VercelGatewayRoutingSchema = Type.Object({
-	only: Type.Optional(Type.Array(Type.String())),
-	order: Type.Optional(Type.Array(Type.String())),
-});
-
-// Schema for OpenAI compatibility settings
-const ReasoningEffortMapSchema = Type.Object({
-	minimal: Type.Optional(Type.String()),
-	low: Type.Optional(Type.String()),
-	medium: Type.Optional(Type.String()),
-	high: Type.Optional(Type.String()),
-	xhigh: Type.Optional(Type.String()),
-});
-
-const OpenAICompatSchema = Type.Object({
-	supportsStore: Type.Optional(Type.Boolean()),
-	supportsDeveloperRole: Type.Optional(Type.Boolean()),
-	supportsReasoningEffort: Type.Optional(Type.Boolean()),
-	reasoningEffortMap: Type.Optional(ReasoningEffortMapSchema),
-	maxTokensField: Type.Optional(Type.Union([Type.Literal("max_completion_tokens"), Type.Literal("max_tokens")])),
-	supportsUsageInStreaming: Type.Optional(Type.Boolean()),
-	requiresToolResultName: Type.Optional(Type.Boolean()),
-	requiresMistralToolIds: Type.Optional(Type.Boolean()),
-	requiresAssistantAfterToolResult: Type.Optional(Type.Boolean()),
-	requiresThinkingAsText: Type.Optional(Type.Boolean()),
-	reasoningContentField: Type.Optional(
-		Type.Union([Type.Literal("reasoning_content"), Type.Literal("reasoning"), Type.Literal("reasoning_text")]),
-	),
-	requiresReasoningContentForToolCalls: Type.Optional(Type.Boolean()),
-	requiresAssistantContentForToolCalls: Type.Optional(Type.Boolean()),
-	supportsToolChoice: Type.Optional(Type.Boolean()),
-	disableReasoningOnForcedToolChoice: Type.Optional(Type.Boolean()),
-	thinkingFormat: Type.Optional(
-		Type.Union([
-			Type.Literal("openai"),
-			Type.Literal("openrouter"),
-			Type.Literal("zai"),
-			Type.Literal("qwen"),
-			Type.Literal("qwen-chat-template"),
-		]),
-	),
-	openRouterRouting: Type.Optional(OpenRouterRoutingSchema),
-	vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
-	extraBody: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-	supportsStrictMode: Type.Optional(Type.Boolean()),
-	toolStrictMode: Type.Optional(Type.Union([Type.Literal("all_strict"), Type.Literal("none")])),
-});
-
-const EffortSchema = Type.Union([
-	Type.Literal("minimal"),
-	Type.Literal("low"),
-	Type.Literal("medium"),
-	Type.Literal("high"),
-	Type.Literal("xhigh"),
-]);
-
-const ThinkingControlModeSchema = Type.Union([
-	Type.Literal("effort"),
-	Type.Literal("budget"),
-	Type.Literal("google-level"),
-	Type.Literal("anthropic-adaptive"),
-	Type.Literal("anthropic-budget-effort"),
-]);
-
-const ModelThinkingSchema = Type.Object({
-	minLevel: EffortSchema,
-	maxLevel: EffortSchema,
-	mode: ThinkingControlModeSchema,
-	defaultLevel: Type.Optional(EffortSchema),
-});
-
-// Schema for custom model definition
-// Most fields are optional with sensible defaults for local models (Ollama, LM Studio, etc.)
-const ModelDefinitionSchema = Type.Object({
-	id: Type.String({ minLength: 1 }),
-	name: Type.Optional(Type.String({ minLength: 1 })),
-	api: Type.Optional(
-		Type.Union([
-			Type.Literal("openai-completions"),
-			Type.Literal("openai-responses"),
-			Type.Literal("openai-codex-responses"),
-			Type.Literal("azure-openai-responses"),
-			Type.Literal("anthropic-messages"),
-			Type.Literal("google-generative-ai"),
-			Type.Literal("google-vertex"),
-			Type.Literal("bedrock-converse-stream"),
-		]),
-	),
-	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
-	reasoning: Type.Optional(Type.Boolean()),
-	thinking: Type.Optional(ModelThinkingSchema),
-	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
-	cost: Type.Optional(
-		Type.Object({
-			input: Type.Number(),
-			output: Type.Number(),
-			cacheRead: Type.Number(),
-			cacheWrite: Type.Number(),
-		}),
-	),
-	premiumMultiplier: Type.Optional(Type.Number()),
-	contextWindow: Type.Optional(Type.Number()),
-	maxTokens: Type.Optional(Type.Number()),
-	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-	compat: Type.Optional(OpenAICompatSchema),
-	contextPromotionTarget: Type.Optional(Type.String({ minLength: 1 })),
-});
-
-// Schema for per-model overrides (all fields optional, merged with built-in model)
-const ModelOverrideSchema = Type.Object({
-	name: Type.Optional(Type.String({ minLength: 1 })),
-	reasoning: Type.Optional(Type.Boolean()),
-	thinking: Type.Optional(ModelThinkingSchema),
-	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
-	cost: Type.Optional(
-		Type.Object({
-			input: Type.Optional(Type.Number()),
-			output: Type.Optional(Type.Number()),
-			cacheRead: Type.Optional(Type.Number()),
-			cacheWrite: Type.Optional(Type.Number()),
-		}),
-	),
-	premiumMultiplier: Type.Optional(Type.Number()),
-	contextWindow: Type.Optional(Type.Number()),
-	maxTokens: Type.Optional(Type.Number()),
-	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-	compat: Type.Optional(OpenAICompatSchema),
-	contextPromotionTarget: Type.Optional(Type.String({ minLength: 1 })),
-});
-
-type ModelOverride = Static<typeof ModelOverrideSchema>;
-
-const ProviderDiscoverySchema = Type.Object({
-	type: Type.Union([
-		Type.Literal("ollama"),
-		Type.Literal("llama.cpp"),
-		Type.Literal("lm-studio"),
-		Type.Literal("openai-models-list"),
-	]),
-});
-
-const ProviderAuthSchema = Type.Union([Type.Literal("apiKey"), Type.Literal("none"), Type.Literal("oauth")]);
-
-const ProviderConfigSchema = Type.Object({
-	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
-	apiKey: Type.Optional(Type.String({ minLength: 1 })),
-	api: Type.Optional(
-		Type.Union([
-			Type.Literal("openai-completions"),
-			Type.Literal("openai-responses"),
-			Type.Literal("openai-codex-responses"),
-			Type.Literal("azure-openai-responses"),
-			Type.Literal("anthropic-messages"),
-			Type.Literal("google-generative-ai"),
-			Type.Literal("google-vertex"),
-			Type.Literal("bedrock-converse-stream"),
-		]),
-	),
-	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-	compat: Type.Optional(OpenAICompatSchema),
-	authHeader: Type.Optional(Type.Boolean()),
-	auth: Type.Optional(ProviderAuthSchema),
-	discovery: Type.Optional(ProviderDiscoverySchema),
-	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
-	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
-	/** When true, disables strict tool schemas for this provider (for third-party Anthropic-compatible endpoints that reject the strict field). */
-	disableStrictTools: Type.Optional(Type.Boolean()),
-});
-
-const EquivalenceConfigSchema = Type.Object({
-	overrides: Type.Optional(Type.Record(Type.String(), Type.String({ minLength: 1 }))),
-	exclude: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
-});
-
-const ModelsConfigSchema = Type.Object({
-	providers: Type.Optional(Type.Record(Type.String(), ProviderConfigSchema)),
-	equivalence: Type.Optional(EquivalenceConfigSchema),
-});
-
-type ModelsConfig = Static<typeof ModelsConfigSchema>;
-
-type ProviderAuthMode = Static<typeof ProviderAuthSchema>;
-type ProviderDiscovery = Static<typeof ProviderDiscoverySchema>;
+// AWS-CORP: custom — merge with care
 
 type ProviderValidationMode = "models-config" | "runtime-register";
 
@@ -349,17 +171,19 @@ function validateProviderConfiguration(
 				!config.baseUrl &&
 				!config.headers &&
 				!config.compat &&
+				!config.apiKey &&
 				!config.disableStrictTools &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "compat", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
 				);
 			}
 		}
 	} else {
-		if (!config.baseUrl) {
+		// AWS-CORP: custom — merge with care
+		if (!config.baseUrl && (config.auth ?? "apiKey") !== "none") {
 			throw new Error(`Provider ${providerName}: "baseUrl" is required when defining custom models.`);
 		}
 		const requiresAuth =
@@ -425,13 +249,14 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 	},
 );
 
-/** Provider override config (baseUrl, headers, apiKey, compat) without custom models */
+/** Provider override config (baseUrl, headers, apiKey, compat, transport) without custom models */
 interface ProviderOverride {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	apiKey?: string;
 	authHeader?: boolean;
 	compat?: Model<Api>["compat"];
+	transport?: Model<Api>["transport"];
 }
 
 interface DiscoveryProviderConfig {
@@ -975,6 +800,10 @@ export class ModelRegistry {
 		this.#customProviderApiKeys.clear();
 		this.#keylessProviders.clear();
 		this.#discoverableProviders = [];
+		// Drop config-sourced apiKeys from AuthStorage before reload; entries
+		// removed from models.yml must actually disappear from the resolver, not
+		// linger from the previous parse. The post-load setters below repopulate.
+		this.authStorage.clearConfigApiKeys();
 		// Restore runtime API keys before #loadModels — survives because
 		// #loadModels only calls .set() on #customProviderApiKeys, never reassigns it.
 		for (const [k, v] of this.#runtimeProviderApiKeys) {
@@ -1017,8 +846,12 @@ export class ModelRegistry {
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
+		const cachedStandardModels = this.#applyHardcodedModelPolicies(this.#loadCachedStandardProviderModels());
 		const cachedDiscoveries = this.#applyHardcodedModelPolicies(this.#loadCachedDiscoverableModels());
-		const resolvedDefaults = this.#mergeResolvedModels(builtInModels, cachedDiscoveries);
+		const resolvedDefaults = this.#mergeResolvedModels(
+			this.#mergeResolvedModels(builtInModels, cachedStandardModels),
+			cachedDiscoveries,
+		);
 		const withConfigModels = this.#mergeCustomModels(resolvedDefaults, this.#customModelOverlays);
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
@@ -1117,6 +950,32 @@ export class ModelRegistry {
 		return merged;
 	}
 
+	#loadCachedStandardProviderModels(): Model<Api>[] {
+		const configuredDiscoveryProviders = new Set(this.#discoverableProviders.map(provider => provider.provider));
+		const cachedModels: Model<Api>[] = [];
+		for (const descriptor of PROVIDER_DESCRIPTORS) {
+			if (configuredDiscoveryProviders.has(descriptor.providerId)) {
+				continue;
+			}
+			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+			if (!cache) {
+				continue;
+			}
+			const models = cache.models.map(model =>
+				model.provider === descriptor.providerId ? model : { ...model, provider: descriptor.providerId },
+			);
+			const providerOverride = this.#providerOverrides.get(descriptor.providerId);
+			const withTransport = providerOverride
+				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
+				: models;
+			const withCompat = providerOverride?.compat
+				? withTransport.map(model => ({ ...model, compat: mergeCompat(model.compat, providerOverride.compat) }))
+				: withTransport;
+			cachedModels.push(...this.#applyProviderModelOverrides(descriptor.providerId, withCompat));
+		}
+		return cachedModels;
+	}
+
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoverableProviders) {
@@ -1165,6 +1024,7 @@ export class ModelRegistry {
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
+		// AWS-CORP: custom — merge with care
 		const disabled = getDisabledProviderIdsFromSettings();
 		if (!configuredProviders.has("ollama") && !disabled.has("ollama")) {
 			this.#discoverableProviders.push({
@@ -1176,6 +1036,7 @@ export class ModelRegistry {
 			});
 			this.#keylessProviders.add("ollama");
 		}
+		// AWS-CORP: custom — merge with care
 		if (!configuredProviders.has("llama.cpp") && !disabled.has("llama.cpp")) {
 			this.#discoverableProviders.push({
 				provider: "llama.cpp",
@@ -1189,6 +1050,7 @@ export class ModelRegistry {
 				this.#keylessProviders.add("llama.cpp");
 			}
 		}
+		// AWS-CORP: custom — merge with care
 		if (!configuredProviders.has("lm-studio") && !disabled.has("lm-studio")) {
 			this.#discoverableProviders.push({
 				provider: "lm-studio",
@@ -1235,14 +1097,15 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
-			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools are present
+			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools/transport are present
 			if (
 				providerConfig.baseUrl ||
 				providerConfig.headers ||
 				providerConfig.apiKey ||
 				providerConfig.authHeader !== undefined ||
 				providerConfig.compat ||
-				providerConfig.disableStrictTools
+				providerConfig.disableStrictTools ||
+				providerConfig.transport
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
 				overrides.set(providerName, {
@@ -1251,6 +1114,7 @@ export class ModelRegistry {
 					apiKey: providerConfig.apiKey,
 					authHeader: providerConfig.authHeader,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
+					transport: providerConfig.transport,
 				});
 			}
 
@@ -1271,9 +1135,14 @@ export class ModelRegistry {
 				});
 			}
 
-			// Always store API key for fallback resolver
+			// Store API key for fallback resolver AND register as config override
+			// so it wins over OAuth tokens from the broker — when the user pins a
+			// bearer in models.yml (e.g. for an auth-gateway baseUrl), that bearer
+			// must authenticate the outbound request.
 			if (providerConfig.apiKey) {
 				this.#customProviderApiKeys.set(providerName, providerConfig.apiKey);
+				const resolved = resolveApiKeyConfig(providerConfig.apiKey);
+				if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
 			}
 
 			// Parse per-model overrides
@@ -1337,6 +1206,7 @@ export class ModelRegistry {
 							headers: providerOverride.headers
 								? { ...model.headers, ...providerOverride.headers }
 								: model.headers,
+							...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
 						}
 					: model;
 			}),
@@ -1838,11 +1708,12 @@ export class ModelRegistry {
 			authHeader: override.authHeader ?? baseOverride?.authHeader,
 			headers: override.headers ? { ...(baseOverride?.headers ?? {}), ...override.headers } : baseOverride?.headers,
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
+			transport: override.transport ?? baseOverride?.transport,
 		};
 	}
 	#applyProviderTransportOverride<T extends { baseUrl?: string; headers?: Record<string, string> }>(
 		entry: T,
-		override: Pick<ProviderOverride, "baseUrl" | "headers" | "authHeader" | "apiKey">,
+		override: Pick<ProviderOverride, "baseUrl" | "headers" | "authHeader" | "apiKey" | "transport">,
 	): T {
 		const headers = mergeAuthHeader(
 			override.headers ? { ...entry.headers, ...override.headers } : entry.headers,
@@ -1853,6 +1724,9 @@ export class ModelRegistry {
 			...entry,
 			baseUrl: override.baseUrl ?? entry.baseUrl,
 			headers,
+			// Preserve the model's existing transport when the override omits one;
+			// providers without a `transport` field keep the default per-API dispatch.
+			...(override.transport !== undefined ? { transport: override.transport } : {}),
 		};
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
@@ -1920,6 +1794,8 @@ export class ModelRegistry {
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
 			if (providerConfig.apiKey) {
 				this.#customProviderApiKeys.set(providerName, providerConfig.apiKey);
+				const resolved = resolveApiKeyConfig(providerConfig.apiKey);
+				if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
 			}
 			for (const modelDef of modelDefs) {
 				const providerCompat = providerConfig.disableStrictTools
@@ -2162,6 +2038,7 @@ export class ModelRegistry {
 		this.#runtimeProviderApiKeys.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
+		this.authStorage.removeConfigApiKey(providerName);
 	}
 
 	/**
@@ -2269,6 +2146,8 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(providerName, config.apiKey);
 			// Persist runtime API keys so they survive #reloadStaticModels() cycles
 			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
+			const resolved = resolveApiKeyConfig(config.apiKey);
+			if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
 		}
 
 		if (config.models && config.models.length > 0) {
@@ -2322,12 +2201,19 @@ export class ModelRegistry {
 			return;
 		}
 
-		if (config.baseUrl || config.headers || config.apiKey || config.authHeader !== undefined) {
+		if (
+			config.baseUrl ||
+			config.headers ||
+			config.apiKey ||
+			config.authHeader !== undefined ||
+			config.transport !== undefined
+		) {
 			const transportOverride = {
 				baseUrl: config.baseUrl,
 				headers: config.headers,
 				apiKey: config.apiKey,
 				authHeader: config.authHeader,
+				transport: config.transport,
 			};
 			const nextRuntimeOverride = this.#mergeProviderOverride(
 				this.#runtimeProviderOverrides.get(providerName),
@@ -2375,6 +2261,8 @@ export interface ProviderConfigInput {
 	headers?: Record<string, string>;
 	compat?: Model<Api>["compat"];
 	authHeader?: boolean;
+	/** Streaming transport override — see {@link Model.transport}. */
+	transport?: Model<Api>["transport"];
 	oauth?: {
 		name: string;
 		login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string>;
