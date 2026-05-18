@@ -97,12 +97,27 @@ function mimeFromPath(p: string): string {
 export const INLINE_LIMIT = 1000;
 
 async function handleImageDirective(path: string, ctx: InteractiveModeContext, desc: string): Promise<void> {
-	const bytes = await fs.readFile(path);
-	let imageData = await ensureSupportedImageInput({
-		type: "image",
-		data: bytes.toBase64(),
-		mimeType: mimeFromPath(path),
-	});
+	let base64: string;
+	let mimeType: string;
+
+	if (path.startsWith("data:")) {
+		// data:<mime>;base64,<data>
+		const comma = path.indexOf(",");
+		if (comma === -1) {
+			ctx.showStatus(`${desc}: malformed data URL`);
+			return;
+		}
+		const header = path.slice(5, comma); // strip "data:"
+		const semi = header.indexOf(";");
+		mimeType = semi === -1 ? header : header.slice(0, semi);
+		base64 = path.slice(comma + 1);
+	} else {
+		const bytes = await fs.readFile(path);
+		base64 = bytes.toBase64();
+		mimeType = mimeFromPath(path);
+	}
+
+	let imageData = await ensureSupportedImageInput({ type: "image", data: base64, mimeType });
 	if (!imageData) {
 		ctx.showStatus(`${desc}: unsupported image format`);
 		return;
