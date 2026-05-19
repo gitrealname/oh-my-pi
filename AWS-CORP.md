@@ -619,7 +619,7 @@ Config key: `mtuicontrol.enabled` (default: `false`).
 ## Config Surface
 
 All features are controlled via `config.yml`.
-See `research/omp/dist-templates/config-ow.yml` for the fully annotated config.
+See `<cwd>\OMP\dist\templates\config-ow.yml` for the fully annotated config.
 
 | Feature | Config Key | Default | Docs |
 |---|---|---|---|
@@ -651,16 +651,15 @@ cd D:\.ai\research\omp\.oh-my-pi
 bun run build
 
 # Deploy (stop omp first) — copies binary + sidecars
-deploy.cmd
+<cwd>\OMP\dist\deploy.cmd
 
 # Bundle for distribution
-cd D:\.ai\research\omp
-bundle.cmd
+<cwd>\OMP\dist\bundle.cmd
 ```
 
-Bundle output: `D:\.ai\research\omp\dist\omp-dist.zip`
+Bundle output: `<cwd>\OMP\dist\omp-aws-corp.zip`
 
-Deploy copies `omp.exe` plus `mreview-editor.ui.html` to `%LOCALAPPDATA%\omp\`.
+Deploy copies `omp-aws-corp.exe` plus `mreview-editor.ui.html` to `%LOCALAPPDATA%\omp\`.
 The sidecar system handles all other sidecars at runtime (flushed to `<agentDir>/sidecars/`
 on first use — no manual copy needed).
 
@@ -670,7 +669,7 @@ on first use — no manual copy needed).
 
 - The `aws-corp` branch is periodically rebased onto upstream releases.
   Use `MERGE-INSTRUCTIONS.md` for the checklist.
-- Config templates live in `research/omp/dist-templates/` (tracked separately).
+- Config templates live in `<cwd>\OMP\dist\templates\` (canonical) and `research/omp/dist-templates/` (source mirror).
 - Native `.node` binaries are gitignored — must be built per machine.
 - Role → model resolution pitfalls are documented in `.role2model-mapping.md`.
 - The `detectAvx2Support()` fix in `index.js` ensures the modern binary
