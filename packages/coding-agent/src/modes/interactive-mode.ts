@@ -308,9 +308,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				// AWS-CORP: custom — merge with care
 				eventBus.on(SCHEDULE_SLASH_CHANNEL, data => {
 					const command = typeof data === "string" ? data : null;
+					logger.debug(`[DBG schedule] SCHEDULE_SLASH received command=${command}`);
 					logger.debug("[interactive] SCHEDULE_SLASH_CHANNEL", { command, hasOnSubmit: !!this.editor.onSubmit });
 					if (command) void this.session.waitForIdle().then(() => {
 						logger.debug("[interactive] SCHEDULE_SLASH executing", { command });
+					logger.debug(`[DBG schedule] SCHEDULE_SLASH firing onSubmit command=${command}`);
 						this.editor.onSubmit?.(command);
 					});
 			}),

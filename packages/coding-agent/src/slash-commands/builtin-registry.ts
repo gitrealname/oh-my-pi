@@ -496,6 +496,7 @@ const mpruneHandler = async (command: ParsedSlashCommand, runtime: BuiltinSlashC
 	}
 };
 const mreviewHandler = async (command: ParsedSlashCommand, runtime: BuiltinSlashCommandRuntime): Promise<SlashCommandResult> => {
+	logger.debug(`[DBG mreview] handler called args="${command.args.trim()}"`);
 	const args = command.args.trim().replace(/^@/, ""); // strip leading @ from @file mentions
 	if (!args) {
 		runtime.ctx.showStatus(`Usage: /${command.name} <file.md>`);

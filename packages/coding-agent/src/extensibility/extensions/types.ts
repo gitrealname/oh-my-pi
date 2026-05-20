@@ -32,8 +32,6 @@ import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
-// AWS-CORP: custom — merge with care
-import type { PythonExecutorOptions } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
@@ -293,12 +291,6 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
-	// AWS-CORP: custom — merge with care
-	/** Execute Python code via the shared kernel (session-scoped or per-call). */
-	executePython?(
-		code: string,
-		options?: Pick<PythonExecutorOptions, "sessionId" | "cwd" | "deadlineMs" | "timeoutMs" | "signal">,
-	): Promise<PythonResult>;
 	/** Task recursion depth. 0 = top-level session; >0 = subagent. */
 	readonly taskDepth: number;
 	/** Navigate to a different point in the session tree (available in command context). */
@@ -1233,8 +1225,6 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
-	// AWS-CORP: custom — merge with care
-	executePython?: ExtensionContext["executePython"];
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

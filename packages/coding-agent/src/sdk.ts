@@ -289,6 +289,8 @@ export interface CreateAgentSessionResult {
 }
 
 // Re-exports
+// AWS-CORP: custom — merge with care
+export { completeSimple } from "@oh-my-pi/pi-ai";
 
 export type { PromptTemplate } from "./config/prompt-templates";
 export { Settings, type SkillsSettings } from "./config/settings";

@@ -62,7 +62,9 @@ export class InputController {
 		this.ctx.editor.onEscape = () => {
 			if (this.ctx.loopModeEnabled) {
 				this.ctx.pauseLoop();
-				if (this.ctx.session.isStreaming) {
+				// AWS-CORP: custom — merge with care
+			logger.debug(`[DBG onSubmit-branch] text="${text.slice(0,60)}" isStreaming=${this.ctx.session.isStreaming} hasInputCallback=${!!this.ctx.onInputCallback}`);
+			if (this.ctx.session.isStreaming) {
 					void this.ctx.session.abort();
 				} else {
 					this.ctx.cancelPendingSubmission();
@@ -224,6 +226,7 @@ export class InputController {
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			text = text.trim();
+			logger.debug(`[DBG input] onSubmit text=${text.slice(0,120)}`);
 			if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 
 			// Empty submit while streaming with queued messages: flush queues immediately
@@ -398,6 +401,8 @@ export class InputController {
 				// Render user message immediately, then let session events catch up
 				const submission = this.ctx.startPendingSubmission({ text, images });
 
+				// AWS-CORP: custom — merge with care
+				logger.debug(`[DBG onSubmit-callback] calling onInputCallback text="${text.slice(0,60)}"`);
 				this.ctx.onInputCallback(submission);
 			}
 			this.ctx.editor.addToHistory(text);
