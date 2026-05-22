@@ -295,7 +295,8 @@ export async function buildSkillPromptMessage(
 ): Promise<BuiltSkillPromptMessage> {
 	const content = await Bun.file(skill.filePath).text();
 	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
-	const metaLines = [`Skill: ${skill.filePath}`];
+	// AWS-CORP: custom — merge with care
+	const metaLines = [`Skill: ${skill.filePath.replace(/\\/g, "/")}`];
 	const trimmedArgs = args.trim();
 	if (trimmedArgs) {
 		metaLines.push(`User: ${trimmedArgs}`);

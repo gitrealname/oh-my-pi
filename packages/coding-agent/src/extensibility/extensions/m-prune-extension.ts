@@ -143,7 +143,8 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 		}
 		if (ctx.taskDepth > 0) return; // subagent — silent
 		logger.debug("[mprune] active", {
-			imagesKeepTurns: settings.get("mprune.images.keepTurns"),
+			keepTurns:       settings.get("mprune.keepTurns"),
+			imagesKeepTurns: settings.get("mprune.images.keepTurns") || settings.get("mprune.keepTurns"),
 			softTrimChars:   settings.get("mprune.trim.softTrimChars"),
 			pruneModel:      settings.getModelRole("prune") ?? "(fallback to default)",
 		});
@@ -239,7 +240,16 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 			}
 		}
 
-		const batchesToFlush = state.pendingBatches.splice(0);
+		// AWS-CORP: custom — merge with care: only flush batches outside the keepTurns window
+		const keepTurns = settings.get("mprune.keepTurns");
+		const eligible = keepTurns > 0
+			? state.pendingBatches.filter(b => event.turnIndex - b.turnIndex > keepTurns)
+			: state.pendingBatches;
+		if (keepTurns > 0) state.pendingBatches = state.pendingBatches.filter(b => event.turnIndex - b.turnIndex <= keepTurns);
+		else state.pendingBatches = [];
+		const batchesToFlush = eligible;
+		if (batchesToFlush.length === 0) return;
+
 		const rawChars = batchesToFlush
 			.flatMap(b => b.toolResults)
 			.reduce((n, r) => n + r.charCount, 0);
@@ -320,8 +330,8 @@ export function createMpruneExtension(api: ExtensionAPI): void {
 	api.on("turn_end", async (event, ctx) => {
 		if (!settings.get("mprune.enabled")) return;
 
-		const keepTurns = settings.get("mprune.images.keepTurns");
-		if (!keepTurns) return;
+		// AWS-CORP: custom — merge with care: images.keepTurns:0 inherits global keepTurns
+		const keepTurns = settings.get("mprune.images.keepTurns") || settings.get("mprune.keepTurns");
 		if (ctx.taskDepth > 0) return;
 
 		const entries = ctx.sessionManager.getBranch();

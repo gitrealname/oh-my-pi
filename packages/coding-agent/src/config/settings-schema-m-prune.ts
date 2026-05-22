@@ -9,6 +9,11 @@
 export const PRUNE_SCHEMA_ENTRIES = {
 	"mprune.enabled":            { type: "boolean" as const, default: false },
 	"mprune.showStatusLine":     { type: "boolean" as const, default: true },
-	"mprune.images.keepTurns":   { type: "number"  as const, default: 5 },
+	// AWS-CORP: custom — merge with care
+	// How many recent turns to keep unpruned (sliding window). Applies to both batch
+	// summarization and image aging unless overridden by the specific sub-setting.
+	"mprune.keepTurns":          { type: "number"  as const, default: 10 },
+	// images.keepTurns: 0 = inherit from mprune.keepTurns; positive = explicit override
+	"mprune.images.keepTurns":   { type: "number"  as const, default: 0 },
 	"mprune.trim.softTrimChars": { type: "number"  as const, default: 12000 },
 } as const;
