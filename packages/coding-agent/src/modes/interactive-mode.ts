@@ -226,6 +226,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	retryEscapeHandler?: () => void;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
+	// AWS-CORP: custom — merge with care
+	#inputReadyResolvers: (() => void)[] = [];
 	optimisticUserMessageSignature: string | undefined = undefined;
 	locallySubmittedUserSignatures: Set<string> = new Set();
 	#pendingSubmittedInput: SubmittedUserInput | undefined;
@@ -305,16 +307,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
 					this.#handleLspStartupEvent(data as LspStartupEvent);
 				}),
-				// AWS-CORP: custom — merge with care
-				eventBus.on(SCHEDULE_SLASH_CHANNEL, data => {
-					const command = typeof data === "string" ? data : null;
-					logger.debug(`[DBG schedule] SCHEDULE_SLASH received command=${command}`);
-					logger.debug("[interactive] SCHEDULE_SLASH_CHANNEL", { command, hasOnSubmit: !!this.editor.onSubmit });
-					if (command) void this.session.waitForIdle().then(() => {
-						logger.debug("[interactive] SCHEDULE_SLASH executing", { command });
+			// AWS-CORP: custom — merge with care
+			eventBus.on(SCHEDULE_SLASH_CHANNEL, data => {
+				const command = typeof data === "string" ? data : null;
+				logger.debug(`[DBG schedule] SCHEDULE_SLASH received command=${command}`);
+				if (!command) return;
+				void this.waitForInputReady().then(() => {
 					logger.debug(`[DBG schedule] SCHEDULE_SLASH firing onSubmit command=${command}`);
-						this.editor.onSubmit?.(command);
-					});
+					this.editor.onSubmit?.(command);
+				});
 			}),
 		);
 		}
@@ -597,9 +598,17 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
+		// AWS-CORP: custom — merge with care
+		for (const r of this.#inputReadyResolvers.splice(0)) r();
 		this.#scheduleLoopAutoSubmit();
 		this.#scheduleGoalContinuation();
 		return promise;
+	}
+
+	// AWS-CORP: custom — merge with care
+	waitForInputReady(): Promise<void> {
+		if (this.onInputCallback) return Promise.resolve();
+		return new Promise(resolve => { this.#inputReadyResolvers.push(resolve); });
 	}
 
 	#scheduleLoopAutoSubmit(): void {

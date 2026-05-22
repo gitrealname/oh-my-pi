@@ -343,7 +343,9 @@ export class InputController {
 
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
+			// AWS-CORP: custom — merge with care
 			if (this.ctx.session.isStreaming) {
+				logger.debug(`[DBG onSubmit-streaming] text="${text.slice(0,80)}" — taking steer path`);
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
