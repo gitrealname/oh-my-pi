@@ -225,7 +225,7 @@ export class InputController {
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
 			text = text.trim();
-			logger.debug(`[DBG input] onSubmit text=${text.slice(0,120)}`);
+			// logger.debug(`[DBG input] onSubmit text=${text.slice(0,120)}`);
 			if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 
 			// Empty submit while streaming with queued messages: flush queues immediately
@@ -273,6 +273,8 @@ export class InputController {
 				handleBackgroundCommand: () => this.handleBackgroundCommand(),
 			});
 			if (slashResult === true) {
+				// AWS-CORP: custom — merge with care
+				this.ctx.editor.addToHistory(text);
 				return;
 			}
 			if (typeof slashResult === "string") {
@@ -344,7 +346,7 @@ export class InputController {
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			// AWS-CORP: custom — merge with care
 			if (this.ctx.session.isStreaming) {
-				logger.debug(`[DBG onSubmit-streaming] text="${text.slice(0,80)}" — taking steer path`);
+				// logger.debug(`[DBG onSubmit-streaming] text="${text.slice(0,80)}" — taking steer path`);
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
@@ -403,7 +405,7 @@ export class InputController {
 				const submission = this.ctx.startPendingSubmission({ text, images });
 
 				// AWS-CORP: custom — merge with care
-				logger.debug(`[DBG onSubmit-callback] calling onInputCallback text="${text.slice(0,60)}"`);
+				// logger.debug(`[DBG onSubmit-callback] calling onInputCallback text="${text.slice(0,60)}"`);
 				this.ctx.onInputCallback(submission);
 			}
 			this.ctx.editor.addToHistory(text);

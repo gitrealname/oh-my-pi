@@ -3908,7 +3908,7 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		// AWS-CORP: custom — merge with care
-		if (text.startsWith("/")) logger.debug(`[DBG prompt] text="${text.slice(0,80)}" expandPromptTemplates=${expandPromptTemplates}`);
+		// if (text.startsWith("/")) logger.debug(`[DBG prompt] text="${text.slice(0,80)}" expandPromptTemplates=${expandPromptTemplates}`);
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			const handled = await this.#tryExecuteExtensionCommand(text);
@@ -3936,7 +3936,7 @@ export class AgentSession {
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
 
 		// AWS-CORP: custom — merge with care
-		if (this.isStreaming && text.startsWith("/")) logger.debug(`[DBG prompt-streaming] text="${text.slice(0,60)}" streamingBehavior=${options?.streamingBehavior}`);
+		// if (this.isStreaming && text.startsWith("/")) logger.debug(`[DBG prompt-streaming] text="${text.slice(0,60)}" streamingBehavior=${options?.streamingBehavior}`);
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
 			if (!options?.streamingBehavior) {
@@ -4173,9 +4173,9 @@ export class AgentSession {
 		const ctx = this.#extensionRunner.createCommandContext();
 
 		try {
-			logger.debug(`[DBG ext-cmd] calling handler: ${commandName} args="${args}"`);
+			// logger.debug(`[DBG ext-cmd] calling handler: ${commandName} args="${args}"`);
 			await command.handler(args, ctx);
-			logger.debug(`[DBG ext-cmd] handler returned ok: ${commandName}`);
+			// logger.debug(`[DBG ext-cmd] handler returned ok: ${commandName}`);
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
