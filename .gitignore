@@ -73,3 +73,12 @@ python/robomp/.env
 # Generated index viewers (build_index.py output)
 .index.html
 **/.index.html
+# Local session / notes files (dot-prefixed, never commit)
+/.MERGE-*
+/.merge_*
+/.improvement-*
+/.mmemory*
+/.mtuicontol*
+/.ow-*
+/.role2model*
+/.pi_*
