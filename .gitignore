@@ -1,17 +1,8 @@
-# Dot-prefixed files/dirs at repo root
-/.*
-!/.git
-!/.gitignore
-!/.gitattributes
-!/.github
-!/.omp
-
 # Dependencies
 node_modules/
 .npm/
 
 # Build output
-packages/coding-agent/binaries/
 dist/
 packages/*/dist/
 packages/*/dist-chrome/
@@ -65,11 +56,9 @@ pi-*.html
 
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
-**/.index.html
 /runs/
 python/omp-rpc/src/omp_rpc.egg-info/
 # parallel-agent worktrees
-.index.html
 .wt/
 CPU*.md
 packages/coding-agent/binaries/
@@ -80,4 +69,7 @@ python/robomp/.cache/
 python/robomp/src/robomp/static/
 python/robomp/web/dist/
 python/robomp/.env
-/n# Private merge docs/n.MERGE-INSTRUCTIONS.md/n.merge_v*.md/n.mtuicontol-handoff.md/n
+
+# Generated index viewers (build_index.py output)
+.index.html
+**/.index.html

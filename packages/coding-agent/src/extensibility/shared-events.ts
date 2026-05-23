@@ -135,6 +135,7 @@ export interface GoalUpdatedEvent {
 	goal: Goal | null;
 	state?: GoalModeState;
 }
+
 export type SessionEvent =
 	| SessionStartEvent
 	| SessionBeforeSwitchEvent

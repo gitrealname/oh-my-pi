@@ -3165,6 +3165,13 @@ export class AgentSession {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					// Short-circuit on persisted decisions.
+				const command =
+					target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
+						? getStringProperty(args as Record<string, unknown>, "command")
+						: undefined;
+				const commandContent = command
+					? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
+					: undefined;
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
@@ -3186,16 +3193,18 @@ export class AgentSession {
 						const permissionPromise = bridge.requestPermission!(
 							{
 								toolCallId,
-								toolName: target.name,
-								title: permissionIntent.title,
-								status: "pending",
-								rawInput: args,
-								locations: extractPermissionLocations(
-									args,
-									this.sessionManager.getCwd(),
-									permissionIntent.paths,
-								),
-							},
+							toolName: target.name,
+							title: permissionIntent.title,
+							...(target.name === "bash" ? { kind: "execute" } : {}),
+							status: "pending",
+							rawInput: args,
+							...(commandContent ? { content: commandContent } : {}),
+							locations: extractPermissionLocations(
+								args,
+								this.sessionManager.getCwd(),
+								permissionIntent.paths,
+							),
+						},
 							PERMISSION_OPTIONS,
 							signal,
 						).then(outcome => ({ kind: "permission" as const, outcome }));
@@ -5186,7 +5195,7 @@ export class AgentSession {
 		return nextLevel;
 	}
 
-	isFastModeEnabled(): boolean {
+	get isFastModeActive(): boolean {
 		return this.serviceTier === "priority";
 	}
 
@@ -5201,7 +5210,7 @@ export class AgentSession {
 	}
 
 	toggleFastMode(): boolean {
-		const enabled = !this.isFastModeEnabled();
+		const enabled = !this.isFastModeActive;
 		this.setFastMode(enabled);
 		return enabled;
 	}

@@ -4,8 +4,10 @@ import * as path from "node:path";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outputPath = path.join(packageDir, "dist", "omp");
+
 // AWS-CORP: custom — merge with care
 const binariesPath = path.join(packageDir, "binaries", "omp-aws-corp.exe");
+
 
 function shouldAdhocSignDarwinBinary(): boolean {
 	return process.platform === "darwin";
@@ -25,8 +27,10 @@ async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): 
 }
 
 async function main(): Promise<void> {
+
 	// AWS-CORP: custom — merge with care
 	const buildTime = new Date().toISOString();
+
 
 	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 	try {
@@ -45,9 +49,11 @@ async function main(): Promise<void> {
 					"--keep-names",
 					"--define",
 					'process.env.PI_COMPILED="true"',
+
 					// AWS-CORP: custom — merge with care
 					"--define",
 					`process.env.BUILD_TIME="${buildTime}"`,
+
 					"--external",
 					"mupdf",
 					"--root",
@@ -70,11 +76,13 @@ async function main(): Promise<void> {
 				buildEnv,
 			);
 
+
 			// AWS-CORP: custom — merge with care
 			// Copy to binaries/ so deploy.cmd (which reads from there) stays in sync.
 			if (process.platform === "win32") {
 				await Bun.write(binariesPath, Bun.file(outputPath + ".exe"));
 			}
+
 			// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 			if (shouldAdhocSignDarwinBinary()) {
 				await runCommand(["codesign", "--force", "--sign", "-", outputPath]);

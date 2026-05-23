@@ -590,10 +590,38 @@ export const SETTINGS_SCHEMA = {
 		description:
 			"Maximum height in terminal rows for inline images (default 20). Set to 0 to use only the viewport-based limit (60% of terminal height).",
 	},
+
+	"tui.hyperlinks": {
+		type: "enum",
+		values: ["off", "auto", "always"] as const,
+		default: "auto",
+		ui: {
+			tab: "appearance",
+			label: "Terminal Hyperlinks",
+			description:
+				"Wrap file paths in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+		},
+	},
 	// Display rendering
 	"display.tabWidth": {
 		type: "number",
 		default: 3,
+	},
+
+	"display.shimmer": {
+		type: "enum",
+		values: ["classic", "kitt", "disabled"] as const,
+		default: "classic",
+		ui: {
+			tab: "appearance",
+			label: "Shimmer",
+			description: "Animation style for working/loading messages",
+			options: [
+				{ value: "classic", label: "Classic", description: "Soft cosine wave sweeping across the text" },
+				{ value: "kitt", label: "KITT Scanner", description: "Knight Rider 1982 red light bouncing left-right" },
+				{ value: "disabled", label: "Disabled", description: "No animation; static muted text" },
+			],
+		},
 	},
 
 	"display.showTokenUsage": {

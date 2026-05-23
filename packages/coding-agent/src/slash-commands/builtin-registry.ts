@@ -688,7 +688,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (arg === "status") {
-				await runtime.output(`Fast mode is ${runtime.session.isFastModeEnabled() ? "on" : "off"}.`);
+				await runtime.output(`Fast mode is ${runtime.session.isFastModeActive ? "on" : "off"}.`);
 				return commandConsumed();
 			}
 			return usage("Usage: /fast [on|off|status]", runtime);
@@ -717,7 +717,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (arg === "status") {
-				const enabled = runtime.ctx.session.isFastModeEnabled();
+				const enabled = runtime.ctx.session.isFastModeActive;
 				runtime.ctx.showStatus(`Fast mode is ${enabled ? "on" : "off"}.`);
 				runtime.ctx.editor.setText("");
 				return;

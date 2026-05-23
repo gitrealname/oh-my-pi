@@ -11,7 +11,7 @@ import { SearchProviderError } from "../../../web/search/types";
 import { clampNumResults, dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
-import { findCredential, isApiKeyAvailable } from "./utils";
+import { classifyProviderHttpError, findCredential, isApiKeyAvailable, withHardTimeout } from "./utils";
 
 const KIMI_SEARCH_URL = "https://api.kimi.com/coding/v1/search";
 
@@ -78,11 +78,13 @@ async function callKimiSearch(
 			enable_page_crawling: params.includeContent,
 			timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
 		}),
-		signal: params.signal,
+		signal: withHardTimeout(params.signal),
 	});
 
 	if (!response.ok) {
 		const errorText = await response.text();
+		const classified = classifyProviderHttpError("kimi", response.status, errorText);
+		if (classified) throw classified;
 		throw new SearchProviderError(
 			"kimi",
 			`Kimi search API error (${response.status}): ${errorText}`,

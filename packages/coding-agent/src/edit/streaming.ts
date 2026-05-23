@@ -22,6 +22,8 @@ import {
 	containsRecognizableHashlineOperations,
 	END_PATCH_MARKER,
 	type HashlineInputSection,
+	HL_FILE_PREFIX,
+	HL_OP_CHARS,
 	splitHashlineInputs,
 } from "../hashline";
 import type { Theme } from "../modes/theme/theme";
@@ -45,6 +47,13 @@ export interface StreamingDiffContext {
 	fuzzyThreshold?: number;
 	allowFuzzy?: boolean;
 	hashlineAutoDropPureInsertDuplicates?: boolean;
+	/**
+	 * True while the tool's arguments are still streaming in. Strategies that
+	 * accept free-form text input (apply_patch, hashline) trim the trailing
+	 * partial line so per-character growth of an in-flight `+added` line does
+	 * not flicker in the preview.
+	 */
+	isStreaming?: boolean;
 }
 
 export interface EditStreamingStrategy<Args = unknown> {
@@ -70,8 +79,19 @@ const STREAMING_FALLBACK_LINES = 12;
 const STREAMING_FALLBACK_WIDTH = 80;
 
 function isHashlineHeaderLine(line: string): boolean {
+	return line.trimEnd().startsWith(HL_FILE_PREFIX);
+}
+
+function parseHashlineHeaderPath(line: string): string {
 	const trimmed = line.trimEnd();
-	return trimmed.startsWith("@") && trimmed.length > 1;
+	let prefixEnd = 0;
+	while (prefixEnd < trimmed.length && trimmed[prefixEnd] === HL_FILE_PREFIX) prefixEnd++;
+	return trimmed.slice(prefixEnd).trim();
+}
+
+function isHashlineOpLine(line: string): boolean {
+	const first = line[0];
+	return first !== undefined && HL_OP_CHARS.includes(first);
 }
 
 function isHashlineEnvelopeMarkerLine(line: string): boolean {
@@ -274,21 +294,145 @@ interface HashlineArgs {
 	__partialJson?: string;
 }
 
+/**
+ * While streaming a free-form text payload (apply_patch envelope, hashline
+ * input), trim the trailing partial line so per-character growth of an
+ * in-flight `+added` line does not cause the diff preview to flicker. The
+ * full line will show on the next streaming tick once its `\n` arrives.
+ * Returns `text` unchanged when not streaming or when no newline is present.
+ */
+function trimTrailingPartialLine(text: string, isStreaming: boolean | undefined): string {
+	if (!isStreaming) return text;
+	const idx = text.lastIndexOf("\n");
+	if (idx === -1) return "";
+	return text.slice(0, idx + 1);
+}
+
+/**
+ * Build a per-file diff preview directly from a partial `apply_patch`
+ * envelope by emitting its body lines in *input order*. This bypasses the
+ * file-state re-diff (`computePatchDiff` → `Diff.structuredPatch`) whose
+ * coalescing reorders the model's `-old +new -old +new` stream into
+ * `-old -old +new +new` and visibly shifts existing `+added` lines
+ * downward each time a new `-` arrives. The preview therefore grows
+ * monotonically at the bottom while streaming and only becomes a real
+ * unified diff once the args are complete.
+ */
+function buildApplyPatchNaturalOrderPreviews(input: string): PerFileDiffPreview[] | null {
+	const lines = input.split("\n");
+	const groups = new Map<string, string[]>();
+	let currentPath: string | undefined;
+	const ensure = (path: string): string[] => {
+		let bucket = groups.get(path);
+		if (!bucket) {
+			bucket = [];
+			groups.set(path, bucket);
+		}
+		return bucket;
+	};
+	for (const raw of lines) {
+		const trimmedEnd = raw.trimEnd();
+		if (trimmedEnd === BEGIN_PATCH_MARKER || trimmedEnd === END_PATCH_MARKER || trimmedEnd === ABORT_MARKER) {
+			continue;
+		}
+		if (trimmedEnd.startsWith("*** Add File: ")) {
+			currentPath = trimmedEnd.slice("*** Add File: ".length);
+			ensure(currentPath);
+			continue;
+		}
+		if (trimmedEnd.startsWith("*** Delete File: ")) {
+			currentPath = trimmedEnd.slice("*** Delete File: ".length);
+			ensure(currentPath);
+			continue;
+		}
+		if (trimmedEnd.startsWith("*** Update File: ")) {
+			currentPath = trimmedEnd.slice("*** Update File: ".length);
+			ensure(currentPath);
+			continue;
+		}
+		if (trimmedEnd.startsWith("*** Move to:") || trimmedEnd.startsWith("*** End of File")) {
+			continue;
+		}
+		if (!currentPath) continue;
+		// Diff body: keep `-/+/space`-prefixed lines and `@@` hunk headers in
+		// input order. parseDiffLine accepts the no-line-number legacy form so
+		// the renderer styles them as additions/removals/context naturally.
+		if (raw.startsWith("+") || raw.startsWith("-") || raw.startsWith(" ") || raw.startsWith("@@")) {
+			ensure(currentPath).push(raw);
+		}
+	}
+	if (groups.size === 0) return null;
+	const previews: PerFileDiffPreview[] = [];
+	for (const [path, body] of groups) {
+		if (body.length === 0) continue;
+		previews.push({ path, diff: body.join("\n") });
+	}
+	return previews.length > 0 ? previews : null;
+}
+
+/**
+ * Hashline equivalent: emit each payload line as a `+added` line in the
+ * order the model typed it. We deliberately omit op headers and removal
+ * targets from the streaming preview because their content lives in the file
+ * and would require a costly re-apply per tick; the complete unified diff is
+ * shown once streaming finishes.
+ */
+function buildHashlineNaturalOrderPreviews(
+	input: string,
+	defaultPath: string | undefined,
+): PerFileDiffPreview[] | null {
+	const lines = input.split("\n");
+	const groups = new Map<string, string[]>();
+	let currentPath = defaultPath ?? "";
+	const ensure = (path: string): string[] => {
+		let bucket = groups.get(path);
+		if (!bucket) {
+			bucket = [];
+			groups.set(path, bucket);
+		}
+		return bucket;
+	};
+	for (const raw of lines) {
+		if (isHashlineEnvelopeMarkerLine(raw)) continue;
+		if (isHashlineHeaderLine(raw)) {
+			currentPath = parseHashlineHeaderPath(raw);
+			if (currentPath) ensure(currentPath);
+			continue;
+		}
+		if (isHashlineOpLine(raw) || !currentPath) continue;
+		ensure(currentPath).push(`+${raw}`);
+	}
+	if (groups.size === 0) return null;
+	const previews: PerFileDiffPreview[] = [];
+	for (const [path, body] of groups) {
+		if (body.length === 0) continue;
+		previews.push({ path, diff: body.join("\n") });
+	}
+	return previews.length > 0 ? previews : null;
+}
+
 const hashlineStrategy: EditStreamingStrategy<HashlineArgs> = {
 	extractCompleteEdits(args) {
 		return args;
 	},
 	async computeDiffPreview(args, ctx) {
 		if (typeof args.input !== "string" || args.input.length === 0) return null;
+		const input = trimTrailingPartialLine(args.input, ctx.isStreaming);
+		if (input.length === 0) return null;
+		if (ctx.isStreaming) {
+			// Skip the costly per-tick re-apply and avoid `Diff.structuredPatch`
+			// reordering by showing payload lines in input order.
+			return buildHashlineNaturalOrderPreviews(input, args.path);
+		}
 		ctx.signal.throwIfAborted();
 
 		let sections: HashlineInputSection[];
 		try {
-			sections = splitHashlineInputs(args.input, { cwd: ctx.cwd, path: args.path });
+			sections = splitHashlineInputs(input, { cwd: ctx.cwd, path: args.path });
 		} catch {
 			// Single-section fallback keeps the original error rendering for the
-			// "haven't typed `@@ PATH` yet" case.
-			const result = await computeHashlineDiff({ input: args.input, path: args.path }, ctx.cwd, {
+			// "haven't typed `§ PATH` yet" case.
+			const result = await computeHashlineDiff({ input, path: args.path }, ctx.cwd, {
 				autoDropPureInsertDuplicates: ctx.hashlineAutoDropPureInsertDuplicates,
 			});
 			ctx.signal.throwIfAborted();
@@ -340,12 +484,21 @@ const applyPatchStrategy: EditStreamingStrategy<ApplyPatchArgs> = {
 	},
 	async computeDiffPreview(args, ctx) {
 		if (typeof args.input !== "string" || args.input.length === 0) return null;
+		const input = trimTrailingPartialLine(args.input, ctx.isStreaming);
+		if (input.length === 0) return null;
+		if (ctx.isStreaming) {
+			// Render the envelope's diff body in input order so newly streamed
+			// `+added` lines append at the bottom instead of being shuffled
+			// upward as later `-removed` lines arrive and reorder the unified
+			// diff that `Diff.structuredPatch` would otherwise produce.
+			return buildApplyPatchNaturalOrderPreviews(input);
+		}
 		let entries: ApplyPatchEntry[];
 		try {
-			entries = expandApplyPatchToEntries({ input: args.input });
+			entries = expandApplyPatchToEntries({ input });
 		} catch {
 			try {
-				entries = expandApplyPatchToPreviewEntries({ input: args.input });
+				entries = expandApplyPatchToPreviewEntries({ input });
 			} catch (err) {
 				return [{ path: "", error: err instanceof Error ? err.message : String(err) }];
 			}

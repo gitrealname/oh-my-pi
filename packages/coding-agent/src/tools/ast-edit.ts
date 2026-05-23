@@ -9,7 +9,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
-import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
@@ -18,8 +18,8 @@ import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope } from "./path-utils";
 import {
 	appendParseErrorsBulletList,
+	capParseErrors,
 	createCachedComponent,
-	dedupeParseErrors,
 	formatCodeFrameLine,
 	formatCount,
 	formatEmptyMessage,
@@ -146,6 +146,8 @@ export interface AstEditToolDetails {
 	applied: boolean;
 	limitReached: boolean;
 	parseErrors?: string[];
+	/** Total parse error count before {@link PARSE_ERRORS_LIMIT} capping. Omitted when no errors. */
+	parseErrorsTotal?: number;
 	scopePath?: string;
 	files?: string[];
 	fileReplacements?: Array<{ path: string; count: number }>;
@@ -153,6 +155,9 @@ export interface AstEditToolDetails {
 	/** Pre-formatted text for the user-visible TUI render. Mirrors `result.text` lines but uses
 	 * a `│` gutter (no model-only hashline anchors). The TUI uses this directly so it never parses model-facing text. */
 	displayContent?: string;
+	/** Absolute base directory used during the edit. Used by the renderer to resolve
+	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
+	searchPath?: string;
 }
 
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
@@ -210,7 +215,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				signal,
 			});
 
-			const dedupedParseErrors = dedupeParseErrors(result.parseErrors);
+			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
 				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
 
@@ -237,15 +242,16 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				filesSearched: result.filesSearched,
 				applied: result.applied,
 				limitReached: result.limitReached,
-				...(dedupedParseErrors.length > 0 ? { parseErrors: dedupedParseErrors } : {}),
+				...(cappedParseErrors.length > 0 ? { parseErrors: cappedParseErrors, parseErrorsTotal } : {}),
 				scopePath,
+				searchPath: resolvedSearchPath,
 				files: fileList,
 				fileReplacements: [],
 			};
 
 			if (result.totalReplacements === 0) {
-				const parseMessage = dedupedParseErrors.length
-					? `\n${formatParseErrors(dedupedParseErrors).join("\n")}`
+				const parseMessage = cappedParseErrors.length
+					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
 				return toolResult(baseDetails).text(`No replacements made${parseMessage}`).done();
 			}
@@ -308,8 +314,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			if (result.limitReached) {
 				outputLines.push("", "Limit reached; narrow paths.");
 			}
-			if (dedupedParseErrors.length) {
-				outputLines.push("", ...formatParseErrors(dedupedParseErrors));
+			if (cappedParseErrors.length) {
+				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
 
 			// Register pending action so `resolve` can apply or discard these previewed changes
@@ -326,7 +332,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							maxFiles,
 							failOnParseError: false,
 						});
-						const dedupedApplyParseErrors = dedupeParseErrors(applyResult.parseErrors);
+						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
+							applyResult.parseErrors,
+						);
 						const { record: recordAppliedFile, list: appliedFileList } = createFileRecorder();
 						const appliedFileReplacementCounts = new Map<string, number>();
 						for (const fileChange of applyResult.fileChanges) {
@@ -350,7 +358,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							filesSearched: applyResult.filesSearched,
 							applied: applyResult.applied,
 							limitReached: applyResult.limitReached,
-							...(dedupedApplyParseErrors.length > 0 ? { parseErrors: dedupedApplyParseErrors } : {}),
+							...(cappedApplyParseErrors.length > 0
+								? { parseErrors: cappedApplyParseErrors, parseErrorsTotal: applyParseErrorsTotal }
+								: {}),
 							scopePath,
 							files: appliedFileList,
 							fileReplacements: appliedFileReplacements,
@@ -441,7 +451,7 @@ export const astEditToolRenderer = {
 			if (filesSearched > 0) meta.push(`searched ${filesSearched}`);
 			const header = renderStatusLine({ icon: "warning", title: "AST Edit", description, meta }, uiTheme);
 			const lines = [header, formatEmptyMessage("No replacements made", uiTheme)];
-			appendParseErrorsBulletList(lines, details?.parseErrors, uiTheme);
+			appendParseErrorsBulletList(lines, details?.parseErrors, uiTheme, details?.parseErrorsTotal);
 			return new Text(lines.join("\n"), 0, 0);
 		}
 
@@ -470,11 +480,14 @@ export const astEditToolRenderer = {
 			extraLines.push(uiTheme.fg("warning", "limit reached; narrow path"));
 		}
 		if (details?.parseErrors?.length) {
-			extraLines.push(uiTheme.fg("warning", formatParseErrorsCountLabel(details.parseErrors)));
+			extraLines.push(
+				uiTheme.fg("warning", formatParseErrorsCountLabel(details.parseErrors, details.parseErrorsTotal)),
+			);
 		}
 		return createCachedComponent(
 			() => options.expanded,
 			width => {
+				const searchBase = details?.searchPath;
 				const changeLines = renderTreeList(
 					{
 						items: changeGroups,
@@ -482,14 +495,42 @@ export const astEditToolRenderer = {
 						maxCollapsed: changeGroups.length,
 						maxCollapsedLines: COLLAPSED_CHANGE_LIMIT,
 						itemType: "change",
-						renderItem: group =>
-							group.map(line => {
-								if (line.startsWith("## ")) return uiTheme.fg("dim", line);
-								if (line.startsWith("# ")) return uiTheme.fg("accent", line);
+						renderItem: group => {
+							let contextDir = searchBase ?? "";
+							return group.map(line => {
+								if (line.startsWith("## ")) {
+									// Strip ` (3 replacements)` suffix attached by formatGroupedFiles.
+									const fileName = line
+										.slice(3)
+										.trimEnd()
+										.replace(/\s+\([^)]*\)\s*$/, "");
+									const absPath = contextDir && fileName ? path.join(contextDir, fileName) : undefined;
+									const styled = uiTheme.fg("dim", line);
+									return absPath ? fileHyperlink(absPath, styled) : styled;
+								}
+								if (line.startsWith("# ")) {
+									const raw = line
+										.slice(2)
+										.trimEnd()
+										.replace(/\s+\([^)]*\)\s*$/, "");
+									const isDirectory = raw.endsWith("/");
+									const name = raw.replace(/\/$/, "");
+									if (isDirectory) {
+										if (searchBase) {
+											contextDir = name === "." ? searchBase : path.join(searchBase, name);
+										}
+										return uiTheme.fg("accent", line);
+									}
+									// Root-level file with optional suffix, e.g. `# foo.ts (3 replacements)`.
+									const absPath = searchBase && name ? path.join(searchBase, name) : undefined;
+									const styled = uiTheme.fg("accent", line);
+									return absPath ? fileHyperlink(absPath, styled) : styled;
+								}
 								if (line.startsWith("+")) return uiTheme.fg("toolDiffAdded", line);
 								if (line.startsWith("-")) return uiTheme.fg("toolDiffRemoved", line);
 								return uiTheme.fg("toolOutput", line);
-							}),
+							});
+						},
 					},
 					uiTheme,
 				);

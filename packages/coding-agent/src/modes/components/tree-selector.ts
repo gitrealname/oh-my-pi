@@ -405,6 +405,7 @@ class TreeList implements Component {
 
 	getSearchQuery(): string {
 		return this.#searchQuery;
+
 	}
 
 	// AWS-CORP: custom — merge with care
@@ -424,6 +425,7 @@ class TreeList implements Component {
 
 	getFilteredCount(): number {
 		return this.#filteredNodes.length;
+
 	}
 
 	getSelectedNode(): SessionTreeNode | undefined {

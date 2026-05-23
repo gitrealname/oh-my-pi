@@ -4,6 +4,7 @@
 
 export * from "./code-cell";
 export * from "./file-list";
+export * from "./hyperlink";
 export * from "./output-block";
 export * from "./status-line";
 export * from "./tree-list";

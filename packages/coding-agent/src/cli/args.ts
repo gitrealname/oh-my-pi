@@ -113,9 +113,11 @@ export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "
 			result.appendSystemPrompt = args[++i];
 		} else if (arg === "--provider-session-id" && i + 1 < args.length) {
 			result.providerSessionId = args[++i];
+
 		// AWS-CORP: custom — merge with care
 		} else if (arg === "--rpc-pipe" && i + 1 < args.length) {
 			i++; // consume the value; rpc-pipe is handled separately in main.ts via process.argv
+
 		} else if (arg === "--no-session") {
 			result.noSession = true;
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
@@ -126,9 +128,11 @@ export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {
 			result.noLsp = true;
+
 		// AWS-CORP: custom — merge with care
 		} else if (arg === "--no-memory") {
 			result.noMemory = true;
+
 		} else if (arg === "--no-pty") {
 			result.noPty = true;
 		} else if (arg === "--tools" && i + 1 < args.length) {

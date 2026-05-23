@@ -63,7 +63,6 @@ export class InputController {
 			if (this.ctx.loopModeEnabled) {
 				this.ctx.pauseLoop();
 				// AWS-CORP: custom — merge with care
-			logger.debug(`[DBG onSubmit-branch] text="${text.slice(0,60)}" isStreaming=${this.ctx.session.isStreaming} hasInputCallback=${!!this.ctx.onInputCallback}`);
 			if (this.ctx.session.isStreaming) {
 					void this.ctx.session.abort();
 				} else {

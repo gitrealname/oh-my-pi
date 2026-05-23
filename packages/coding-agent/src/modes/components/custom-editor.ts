@@ -1,7 +1,9 @@
 import { Editor, type KeyId, matchesKey, parseKittySequence } from "@oh-my-pi/pi-tui";
 import type { AppKeybinding } from "../../config/keybindings";
+
 // AWS-CORP: custom — merge with care
 import { type ScriptEditorActions, SCRIPT_DEFAULT_ACTION_KEYS } from "./custom-editor-m-scripts";
+
 
 type ConfigurableEditorAction = Extract<
 	AppKeybinding,
@@ -21,8 +23,10 @@ type ConfigurableEditorAction = Extract<
 	| "app.message.dequeue"
 	| "app.clipboard.pasteImage"
 	| "app.clipboard.copyPrompt"
+
 	// AWS-CORP: custom — merge with care
 	| ScriptEditorActions
+
 >;
 
 const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
@@ -42,8 +46,10 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.message.dequeue": ["alt+up"],
 	"app.clipboard.pasteImage": ["ctrl+v"],
 	"app.clipboard.copyPrompt": ["alt+shift+c"],
+
 	// AWS-CORP: custom — merge with care
 	...SCRIPT_DEFAULT_ACTION_KEYS,
+
 };
 
 /**

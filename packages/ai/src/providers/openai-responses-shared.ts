@@ -17,6 +17,7 @@ import {
 	type AssistantMessage,
 	type ImageContent,
 	type Model,
+	resolveServiceTier,
 	type ServiceTier,
 	type StopReason,
 	type StreamOptions,
@@ -651,7 +652,10 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 	if (options?.presencePenalty !== undefined) params.presence_penalty = options.presencePenalty;
 	if (options?.repetitionPenalty !== undefined) params.repetition_penalty = options.repetitionPenalty;
 	if (shouldSendServiceTier(options?.serviceTier, provider)) {
-		params.service_tier = options.serviceTier;
+		const resolved = resolveServiceTier(options?.serviceTier, provider);
+		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
+			params.service_tier = resolved;
+		}
 	}
 }
 

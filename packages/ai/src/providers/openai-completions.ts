@@ -10,7 +10,7 @@ import type {
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
-import type { Effort } from "../model-thinking";
+import { type Effort, getSupportedEfforts } from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
@@ -22,6 +22,7 @@ import {
 	type Model,
 	type OpenAICompat,
 	type ProviderSessionState,
+	resolveServiceTier,
 	type ServiceTier,
 	type StopReason,
 	type StreamFunction,
@@ -37,7 +38,7 @@ import {
 import { normalizeSystemPrompts } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { toFireworksWireModelId } from "../utils/fireworks-model-id";
+import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
 import {
 	type CapturedHttpErrorResponse,
 	finalizeErrorMessage,
@@ -218,7 +219,7 @@ export function isOpenAICompletionsProgressChunk(chunk: unknown): boolean {
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: ToolChoice;
 	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
-	/** Force-disable reasoning for OpenRouter-format requests (sends `reasoning: { enabled: false }`). */
+	/** Force-disable reasoning where supported, or request the lowest effort on generic effort endpoints. */
 	disableReasoning?: boolean;
 	serviceTier?: ServiceTier;
 }
@@ -486,7 +487,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 			stream.push({ type: "start", partial: output });
 
-			const parseMiniMaxThinkTags = model.provider === "minimax-code";
+			const parseMiniMaxThinkTags = model.provider === "minimax-code" || model.provider === "minimax-code-cn";
 			// Some OpenAI-compatible DeepSeek hosts (including NVIDIA NIM and DeepSeek's
 			// native API) leak chat-template tool-call markers in `delta.content` even
 			// though tool calls are also surfaced structurally. Strip the leaked markers
@@ -1037,13 +1038,23 @@ function buildParams(
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
 	const supportsReasoningParams = model.provider !== "github-copilot";
 
-	// Kimi (including via OpenRouter) calculates TPM rate limits based on max_tokens, not actual output.
-	// Always send max_tokens to avoid their high default causing rate limit issues.
+	// Kimi (including via OpenRouter and Fireworks router-form IDs such as
+	// `accounts/fireworks/routers/kimi-*`) calculates TPM rate limits based on
+	// max_tokens, not actual output. The official Kimi K2 model guidance
+	// (https://docs.fireworks.ai/models/kimi-k2) also requires `max_tokens` for
+	// every call since the family can otherwise emit very long reasoning traces
+	// before the final answer. Always send max_tokens — match the same
+	// Kimi-family regex used by the compat detector.
 	// Note: Direct kimi-code provider is handled by the dedicated Kimi provider in kimi.ts.
-	const isKimi = model.id.includes("moonshotai/kimi");
+	const isKimi = model.id.includes("moonshotai/kimi") || /(^|\/)kimi[-.]/i.test(model.id);
 	const effectiveMaxTokens = options?.maxTokens ?? (isKimi ? model.maxTokens : undefined);
 
-	const requestModelId = model.provider === "fireworks" ? toFireworksWireModelId(model.id) : model.id;
+	const requestModelId =
+		model.provider === "fireworks"
+			? toFireworksWireModelId(model.id)
+			: model.provider === "firepass"
+				? toFirepassWireModelId(model.id)
+				: model.id;
 	const params: OpenAICompletionsParams = {
 		model: requestModelId,
 		messages,
@@ -1093,20 +1104,41 @@ function buildParams(
 		params.frequency_penalty = options.frequencyPenalty;
 	}
 	if (shouldSendServiceTier(options?.serviceTier, model.provider)) {
-		params.service_tier = options.serviceTier;
+		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
+		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
+			params.service_tier = resolved;
+		}
 	}
 
-	if (context.tools) {
+	if (context.tools?.length) {
 		const builtTools = convertTools(context.tools, compat, toolStrictModeOverride);
 		params.tools = builtTools.tools;
 		toolStrictMode = builtTools.toolStrictMode;
-	} else if (hasToolHistory(context.messages)) {
-		// Anthropic (via LiteLLM/proxy) requires tools param when conversation has tool_calls/tool_results
+	} else if (context.tools === undefined && hasToolHistory(context.messages)) {
+		// Anthropic (via LiteLLM/proxy) requires the `tools` param when the conversation
+		// contains tool_calls/tool_results, even when no tools are offered this turn.
+		// Only inject the sentinel when the caller passed `context.tools = undefined`
+		// (i.e. tools were not specified at all). An explicit `context.tools = []` means
+		// the caller opted out of tools for this turn (as /btw and IRC background replies
+		// do via AgentSession.runEphemeralTurn) — honour that intent and emit nothing,
+		// so LiteLLM → Bedrock never sees an empty `toolConfig` block.
 		params.tools = [];
 	}
 
 	if (options?.toolChoice && compat.supportsToolChoice) {
 		params.tool_choice = mapToOpenAICompletionsToolChoice(options.toolChoice);
+	}
+
+	if (params.tool_choice === "none" && (!Array.isArray(params.tools) || params.tools.length === 0)) {
+		// `tool_choice: "none"` with no tools to gate is redundant and also
+		// trips LiteLLM → Bedrock: the proxy serializes the directive into a
+		// `toolConfig` block, and Bedrock requires `toolConfig.tools` to be
+		// non-empty whenever the conversation already holds `toolUse`/`toolResult`
+		// content. Drop it whenever the resolved tools list is missing or empty.
+		// Side-channel turns hit this: `/btw` and IRC background replies route
+		// through `AgentSession.runEphemeralTurn`, which sets `context.tools = []`
+		// and `toolChoice: "none"` (see packages/coding-agent/src/session/agent-session.ts).
+		delete params.tool_choice;
 	}
 
 	if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
@@ -1145,6 +1177,21 @@ function buildParams(
 	) {
 		// OpenAI-style reasoning_effort
 		params.reasoning_effort = mapReasoningEffort(options.reasoning, compat.reasoningEffortMap) as Effort;
+	} else if (
+		supportsReasoningParams &&
+		options?.disableReasoning &&
+		!options?.reasoning &&
+		model.reasoning &&
+		compat.supportsReasoningEffort
+	) {
+		// Generic OpenAI-compatible effort endpoints do not expose a true off
+		// switch. Use the model's lowest supported effort as the closest
+		// transport-level approximation when callers request disabled reasoning.
+		const minEffort = getSupportedEfforts(model)[0];
+		if (minEffort === undefined) {
+			throw new Error(`Model ${model.provider}/${model.id} has no supported reasoning efforts`);
+		}
+		params.reasoning_effort = mapReasoningEffort(minEffort, compat.reasoningEffortMap) as Effort;
 	}
 
 	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {

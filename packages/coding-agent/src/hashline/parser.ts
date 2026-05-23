@@ -1,8 +1,17 @@
 import { ABORT_MARKER, ABORT_WARNING, BEGIN_PATCH_MARKER, END_PATCH_MARKER, RANGE_INTERIOR_HASH } from "./constants";
-import { describeAnchorExamples, HL_EDIT_SEP, HL_HASH_CAPTURE_RE_RAW } from "./hash";
+import {
+	describeAnchorExamples,
+	HL_FILE_PREFIX,
+	HL_HASH_CAPTURE_RE_RAW,
+	HL_OP_CHARS,
+	HL_OP_INSERT_AFTER,
+	HL_OP_INSERT_BEFORE,
+	HL_OP_REPLACE,
+} from "./hash";
 import type { Anchor, HashlineCursor, HashlineEdit } from "./types";
 
 const LID_CAPTURE_RE = new RegExp(`^${HL_HASH_CAPTURE_RE_RAW}$`);
+const regexEscape = (str: string): string => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 function parseLid(raw: string, lineNum: number): Anchor {
 	const match = LID_CAPTURE_RE.exec(raw);
@@ -22,12 +31,8 @@ interface ParsedRange {
 
 function parseRange(raw: string, lineNum: number): ParsedRange {
 	if (!raw.includes("..")) {
-		throw new Error(
-			`line ${lineNum}: explicit ranges are required for delete/replace. ` +
-				`Repeat the same anchor on both sides for a one-line edit (for example, ` +
-				`${describeAnchorExamples("119")}..${describeAnchorExamples("119")}); ` +
-				`got ${JSON.stringify(raw)}.`,
-		);
+		const start = parseLid(raw, lineNum);
+		return { start, end: { ...start } };
 	}
 	const [startRaw, endRaw, extra] = raw.split("..");
 	if (extra !== undefined || !startRaw || !endRaw) {
@@ -64,10 +69,23 @@ function parseInsertTarget(raw: string, lineNum: number, kind: "before" | "after
 	return { kind: cursorKind, anchor: parseLid(raw, lineNum) };
 }
 
-const INSERT_BEFORE_OP_RE = /^<\s*(\S+)$/;
-const INSERT_AFTER_OP_RE = /^\+\s*(\S+)$/;
-const DELETE_OP_RE = /^-\s*(\S+)$/;
-const REPLACE_OP_RE = /^=\s*(\S+)$/;
+const INSERT_BEFORE_OP_RE = new RegExp(`^${regexEscape(HL_OP_INSERT_BEFORE)}\\s*(\\S+)\\s*$`);
+const INSERT_AFTER_OP_RE = new RegExp(`^${regexEscape(HL_OP_INSERT_AFTER)}\\s*(\\S+)\\s*$`);
+const REPLACE_OP_RE = new RegExp(`^${regexEscape(HL_OP_REPLACE)}\\s*([^\\s+<\\-=]\\S*)\\s*$`);
+
+function isEnvelopeOrAbortMarkerLine(line: string): boolean {
+	const trimmed = line.trimEnd();
+	return trimmed === BEGIN_PATCH_MARKER || trimmed === END_PATCH_MARKER || trimmed === ABORT_MARKER;
+}
+
+function isPayloadTerminatorLine(line: string): boolean {
+	const first = line[0];
+	return (
+		first === HL_FILE_PREFIX ||
+		(first !== undefined && HL_OP_CHARS.includes(first)) ||
+		isEnvelopeOrAbortMarkerLine(line)
+	);
+}
 
 export function cloneCursor(cursor: HashlineCursor): HashlineCursor {
 	if (cursor.kind === "before_anchor") return { kind: "before_anchor", anchor: { ...cursor.anchor } };
@@ -85,35 +103,14 @@ function collectPayload(
 	let index = startIndex;
 	while (index < lines.length) {
 		const line = lines[index];
-		if (line.startsWith(HL_EDIT_SEP)) {
-			payload.push(line.slice(1).trimEnd());
-			index++;
-			continue;
-		}
-		// Silently recover from a missing payload prefix on an otherwise blank
-		// line: if more payload follows (possibly past further blanks), treat
-		// each intervening blank as an empty `${HL_EDIT_SEP}` payload line.
-		// Additionally, when the op explicitly requires payload (`+`/`<`) and
-		// we have not collected any yet, accept the blank(s) themselves as the
-		// empty payload — common typo of forgetting the `${HL_EDIT_SEP}` prefix
-		// when inserting a blank line.
-		if (line.length === 0) {
-			let lookahead = index + 1;
-			while (lookahead < lines.length && lines[lookahead].length === 0) {
-				lookahead++;
-			}
-			const followedByPayload = lookahead < lines.length && lines[lookahead].startsWith(HL_EDIT_SEP);
-			const acceptBareBlank = requirePayload && payload.length === 0;
-			if (followedByPayload || acceptBareBlank) {
-				for (let j = index; j < lookahead; j++) payload.push("");
-				index = lookahead;
-				continue;
-			}
-		}
-		break;
+		if (isPayloadTerminatorLine(line)) break;
+		payload.push(line);
+		index++;
 	}
 	if (payload.length === 0 && requirePayload) {
-		throw new Error(`line ${opLineNum}: + and < operations require at least one ${HL_EDIT_SEP}TEXT payload line.`);
+		throw new Error(
+			`line ${opLineNum}: ${HL_OP_INSERT_BEFORE} and ${HL_OP_INSERT_AFTER} operations require at least one verbatim payload line.`,
+		);
 	}
 	return { payload, nextIndex: index };
 }
@@ -126,6 +123,7 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 	const edits: HashlineEdit[] = [];
 	const warnings: string[] = [];
 	const lines = diff.split(/\r?\n/);
+	if (diff.endsWith("\n") && lines.at(-1) === "") lines.pop();
 	let editIndex = 0;
 
 	const pushInsert = (cursor: HashlineCursor, text: string, lineNum: number) => {
@@ -151,9 +149,6 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 			i++;
 			continue;
 		}
-		if (line.startsWith(HL_EDIT_SEP)) {
-			throw new Error(`line ${lineNum}: payload line has no preceding +, <, or = operation.`);
-		}
 
 		const insertBeforeMatch = INSERT_BEFORE_OP_RE.exec(line);
 		if (insertBeforeMatch) {
@@ -173,29 +168,20 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 			continue;
 		}
 
-		const deleteMatch = DELETE_OP_RE.exec(line);
-		if (deleteMatch) {
-			for (const anchor of expandRange(parseRange(deleteMatch[1], lineNum))) {
-				edits.push({ kind: "delete", anchor, lineNum, index: editIndex++ });
-			}
-			i++;
-			continue;
-		}
-
 		const replaceMatch = REPLACE_OP_RE.exec(line);
 		if (replaceMatch) {
 			const range = parseRange(replaceMatch[1], lineNum);
 			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, false);
-			// `= A..B` with no payload blanks the range to a single empty line.
-			const replacement = payload.length === 0 ? [""] : payload;
-			for (const text of replacement) {
-				edits.push({
-					kind: "insert",
-					cursor: { kind: "before_anchor", anchor: { ...range.start } },
-					text,
-					lineNum,
-					index: editIndex++,
-				});
+			if (payload.length > 0) {
+				for (const text of payload) {
+					edits.push({
+						kind: "insert",
+						cursor: { kind: "before_anchor", anchor: { ...range.start } },
+						text,
+						lineNum,
+						index: editIndex++,
+					});
+				}
 			}
 			for (const anchor of expandRange(range)) {
 				edits.push({ kind: "delete", anchor, lineNum, index: editIndex++ });
@@ -204,8 +190,15 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 			continue;
 		}
 
+		if (isPayloadTerminatorLine(line) || /^[-@\u00B6]/u.test(line)) {
+			throw new Error(
+				`line ${lineNum}: unrecognized op. Use ${HL_OP_INSERT_BEFORE}ANCHOR (insert before), ${HL_OP_INSERT_AFTER}ANCHOR (insert after), or ${HL_OP_REPLACE}A..B (replace/delete). ` +
+					`Got ${JSON.stringify(line)}.`,
+			);
+		}
+
 		throw new Error(
-			`line ${lineNum}: unrecognized op. Use < ANCHOR (insert before), + ANCHOR (insert after), - A..B (delete), = A..B (replace), or "${HL_EDIT_SEP}TEXT" payload lines. ` +
+			`line ${lineNum}: payload line has no preceding ${HL_OP_INSERT_BEFORE}, ${HL_OP_INSERT_AFTER}, or ${HL_OP_REPLACE} operation. ` +
 				`Got ${JSON.stringify(line)}.`,
 		);
 	}

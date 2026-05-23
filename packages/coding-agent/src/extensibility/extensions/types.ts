@@ -26,7 +26,9 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/util
 import type * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 
+
 // AWS-CORP: custom — merge with care
+
 
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -37,7 +39,9 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 
+
 // AWS-CORP: custom — merge with care
+
 
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -291,10 +295,12 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
+
 	/** Task recursion depth. 0 = top-level session; >0 = subagent. */
 	readonly taskDepth: number;
 	/** Navigate to a different point in the session tree (available in command context). */
 	navigateTree?(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
+
 }
 
 /**
@@ -325,10 +331,12 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
 
 
+
 // AWS-CORP: custom — merge with care
 
 	/** AbortSignal for the current command invocation. */
 	signal: AbortSignal;
+
 	/** Switch to a different session file. */
 	switchSession(sessionPath: string): Promise<{ cancelled: boolean }>;
 
@@ -384,9 +392,11 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+
 	// AWS-CORP: custom — merge with care
 	/** Short snippet included in the tool prompt section to guide LLM tool selection. */
 	promptSnippet?: string;
+
 	/** Execute the tool. */
 	execute(
 		toolCallId: string,

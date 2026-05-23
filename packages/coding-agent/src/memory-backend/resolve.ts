@@ -2,8 +2,10 @@ import type { Settings } from "../config/settings";
 import { hindsightBackend } from "../hindsight";
 import { localBackend } from "./local-backend";
 import { offBackend } from "./off-backend";
+
 // AWS-CORP: custom — merge with care
 import { mmemoryBackend } from "./mmemory-backend";
+
 import type { MemoryBackend } from "./types";
 
 /**
@@ -22,7 +24,9 @@ export function resolveMemoryBackend(settings: Settings): MemoryBackend {
 	const id = settings.get("memory.backend");
 	if (id === "hindsight") return hindsightBackend;
 	if (id === "local") return localBackend;
+
 	// AWS-CORP: custom — merge with care
 	if (id === "mmemory") return mmemoryBackend;
+
 	return offBackend;
 }

@@ -51,28 +51,43 @@ export function queueResolveHandler(
 	const forced = session.buildToolChoice?.("resolve");
 	if (!queue || !forced || typeof forced === "string") return;
 
-	queue.pushOnce(forced, {
-		label: `pending-action:${options.sourceToolName}`,
-		now: true,
-		onRejected: () => "requeue",
-		onInvoked: async (input: unknown) =>
-			runResolveInvocation(input as ResolveParams, {
-				sourceToolName: options.sourceToolName,
-				label: options.label,
-				apply: options.apply,
-				reject: options.reject,
-			}),
-	});
+	const steerReminder = (): void => {
+		session.steer?.({
+			customType: "resolve-reminder",
+			content: [
+				"<system-reminder>",
+				"This is a preview. Call the `resolve` tool to apply or discard these changes.",
+				"</system-reminder>",
+			].join("\n"),
+			details: { toolName: options.sourceToolName },
+		});
+	};
 
-	session.steer?.({
-		customType: "resolve-reminder",
-		content: [
-			"<system-reminder>",
-			"This is a preview. Call the `resolve` tool to apply or discard these changes.",
-			"</system-reminder>",
-		].join("\n"),
-		details: { toolName: options.sourceToolName },
-	});
+	const pushDirective = (): void => {
+		queue.pushOnce(forced, {
+			label: `pending-action:${options.sourceToolName}`,
+			now: true,
+			onRejected: () => "requeue",
+			onInvoked: async (input: unknown) =>
+				runResolveInvocation(input as ResolveParams, {
+					sourceToolName: options.sourceToolName,
+					label: options.label,
+					apply: options.apply,
+					reject: options.reject,
+					onApplyError: () => {
+						// Apply threw (e.g. ast_edit overlapping replacements). Re-push the
+						// same directive so the preview remains pending and the model can
+						// `discard` or fix-and-retry on the next turn instead of being
+						// stranded with no pending action to address.
+						pushDirective();
+						steerReminder();
+					},
+				}),
+		});
+	};
+
+	pushDirective();
+	steerReminder();
 }
 
 /**
@@ -89,6 +104,11 @@ export async function runResolveInvocation(
 		label: string;
 		apply(reason: string, extra?: Record<string, unknown>): Promise<AgentToolResult<unknown>>;
 		reject?(reason: string, extra?: Record<string, unknown>): Promise<AgentToolResult<unknown> | undefined>;
+		/** Invoked synchronously when `apply()` throws, before the error is rethrown.
+		 *  The queued caller uses this to re-push the resolve directive so the
+		 *  pending preview survives a failed apply (e.g. overlapping ast_edit
+		 *  replacements) and the model can `discard` or fix-and-retry. */
+		onApplyError?(error: unknown): void;
 	},
 ): Promise<AgentToolResult<ResolveToolDetails>> {
 	const baseDetails: ResolveToolDetails = {
@@ -99,7 +119,19 @@ export async function runResolveInvocation(
 		...(params.extra != null ? { extra: params.extra } : {}),
 	};
 	if (params.action === "apply") {
-		const result = await options.apply(params.reason, params.extra);
+		let result: AgentToolResult<unknown>;
+		try {
+			result = await options.apply(params.reason, params.extra);
+		} catch (error) {
+			try {
+				options.onApplyError?.(error);
+			} catch {
+				// Requeue hook must not mask the original apply failure.
+			}
+			if (error instanceof ToolError) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`Apply failed: ${message}`);
+		}
 		return {
 			...result,
 			details: {

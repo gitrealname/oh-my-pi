@@ -421,6 +421,7 @@ export class TUI extends Container {
 		};
 	}
 
+
 	// AWS-CORP: custom — merge with care
 	/**
 	 * Inject a raw input sequence as if it came from the terminal.
@@ -430,6 +431,7 @@ export class TUI extends Container {
 	simulateInput(data: string): void {
 		this.#handleInput(data);
 	}
+
 
 	removeInputListener(listener: InputListener): void {
 		this.#inputListeners.delete(listener);

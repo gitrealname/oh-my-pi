@@ -27,7 +27,7 @@ import {
 	truncateHeadBytes,
 	truncateLine,
 } from "../session/streaming-output";
-import { renderCodeCell, renderMarkdownCell, renderStatusLine } from "../tui";
+import { fileHyperlink, renderCodeCell, renderMarkdownCell, renderStatusLine, tryResolveInternalUrlSync } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { ImageInputTooLargeError, loadImageInput, MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
@@ -62,7 +62,13 @@ import {
 	resolveOutputMaxColumns,
 	stripOutputNotice,
 } from "./output-meta";
-import { expandPath, formatPathRelativeToCwd, resolveReadPath, splitPathAndSel } from "./path-utils";
+import {
+	expandPath,
+	formatPathRelativeToCwd,
+	resolveReadPath,
+	splitInternalUrlSel,
+	splitPathAndSel,
+} from "./path-utils";
 import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
 import {
 	executeReadQuery,
@@ -112,8 +118,22 @@ function formatTextWithMode(
 	startNum: number,
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	truncatedLines?: ReadonlySet<number>,
 ): string {
-	if (shouldAddHashLines) return formatHashLines(text, startNum);
+	if (shouldAddHashLines) {
+		if (!truncatedLines || truncatedLines.size === 0) return formatHashLines(text, startNum);
+		// Column-truncated lines hash differently from the on-disk line that the
+		// edit verifier reads back. Drop the anchor (`LINE|TEXT` instead of
+		// `LINE+HASH|TEXT`) so the model treats the line as un-anchorable rather
+		// than copying a hash that will be rejected as stale.
+		const lines = text.split("\n");
+		return lines
+			.map((line, i) => {
+				const ln = startNum + i;
+				return truncatedLines.has(ln) ? `${ln}${HL_BODY_SEP}${line}` : formatHashLine(ln, line);
+			})
+			.join("\n");
+	}
 	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum);
 	return text;
 }
@@ -794,10 +814,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// context (added below if offset is explicit).
 		const requestedStart = offset ? Math.max(0, offset - 1) : 0;
 		const ignoreResultLimits = options.ignoreResultLimits ?? false;
-		const requestedEnd =
-			limit !== undefined && !ignoreResultLimits
-				? Math.min(requestedStart + limit, allLines.length)
-				: allLines.length;
+		const requestedEnd = limit !== undefined ? Math.min(requestedStart + limit, allLines.length) : allLines.length;
 		// Expand only on sides the user actually constrained: leading context
 		// when offset>1, trailing context when a finite limit was set.
 		const expanded = expandRangeWithContext(
@@ -805,7 +822,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			requestedEnd,
 			allLines.length,
 			offset !== undefined && offset > 1,
-			limit !== undefined && !ignoreResultLimits,
+			limit !== undefined,
 		);
 		const startLine = expanded.startLine;
 		const endLineExpanded = expanded.endLine;
@@ -836,7 +853,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const endLine = endLineExpanded;
 		const selectedContent = allLines.slice(startLine, endLine).join("\n");
-		const userLimitedLines = limit !== undefined && !ignoreResultLimits ? endLine - startLine : undefined;
+		const userLimitedLines = limit !== undefined ? endLine - startLine : undefined;
 		const truncation = ignoreResultLimits ? noTruncResult(selectedContent) : truncateHead(selectedContent);
 
 		const shouldAddHashLines = displayMode.hashLines;
@@ -1028,12 +1045,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			const collectedLines = streamResult.lines;
+			const truncatedLineNumbers = new Set<number>();
 			if (!rawSelector && maxColumns > 0) {
 				for (let i = 0; i < collectedLines.length; i++) {
 					const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
 					if (wasTruncated) {
 						collectedLines[i] = text;
 						columnTruncated = maxColumns;
+						truncatedLineNumbers.add(range.startLine + i);
 					}
 				}
 			}
@@ -1043,7 +1062,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			const blockText = collectedLines.join("\n");
-			blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddHashLines, shouldAddLineNumbers));
+			blocks.push(
+				formatTextWithMode(
+					blockText,
+					range.startLine,
+					shouldAddHashLines,
+					shouldAddLineNumbers,
+					truncatedLineNumbers,
+				),
+			);
 		}
 
 		let outputText = blocks.join("\n\n…\n\n");
@@ -1474,10 +1501,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			return executeReadUrl(this.session, { path: parsedUrlTarget.path, raw: parsedUrlTarget.raw }, signal);
 		}
 
-		// Handle internal URLs (agent://, artifact://, memory://, skill://, rule://, local://, mcp://)
-		const internalTarget = splitPathAndSel(readPath);
+		// Handle internal URLs (agent://, artifact://, memory://, skill://, rule://, local://, mcp://, omp://, issue://, pr://).
+		// Use the internal-URL-aware splitter so malformed selectors are peeled
+		// off the URL and surfaced via parseSel rather than confusing handlers.
 		const internalRouter = InternalUrlRouter.instance();
-		if (internalRouter.canHandle(internalTarget.path)) {
+		if (internalRouter.canHandle(readPath)) {
+			const internalTarget = splitInternalUrlSel(readPath);
 			const parsed = parseSel(internalTarget.sel);
 			return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 		}
@@ -1785,12 +1814,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					// view — column truncation surfaces separately via `.limits()`.
 					const rawSelector = isRawSelector(parsed);
 					const maxColumns = resolveOutputMaxColumns(this.session.settings);
+					const truncatedLineNumbers = new Set<number>();
 					if (!rawSelector && maxColumns > 0) {
 						for (let i = 0; i < collectedLines.length; i++) {
 							const { text, wasTruncated } = truncateLine(collectedLines[i], maxColumns);
 							if (wasTruncated) {
 								collectedLines[i] = text;
 								columnTruncated = maxColumns;
+								truncatedLineNumbers.add(startLineDisplay + i);
 							}
 						}
 					}
@@ -1824,7 +1855,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					let capturedDisplayContent: { text: string; startLine: number } | undefined;
 					const formatText = (text: string, startNum: number): string => {
 						capturedDisplayContent = { text, startLine: startNum };
-						return formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
+						return formatTextWithMode(
+							text,
+							startNum,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							truncatedLineNumbers,
+						);
 					};
 
 					let outputText: string;
@@ -2139,7 +2176,9 @@ export const readToolRenderer = {
 		}
 
 		const rawPath = args.file_path || args.path || "";
-		const filePath = shortenPath(rawPath);
+		const shortPath = shortenPath(rawPath);
+		const linkTarget = tryResolveInternalUrlSync(rawPath);
+		const filePath = linkTarget ? fileHyperlink(linkTarget, shortPath) : shortPath;
 		const offset = args.offset;
 		const limit = args.limit;
 
@@ -2256,7 +2295,13 @@ export const readToolRenderer = {
 		}
 
 		const suffix = details?.suffixResolution;
-		const displayPath = suffix ? shortenPath(suffix.to) : filePath;
+		const plainDisplayPath = suffix ? shortenPath(suffix.to) : filePath;
+		// resolvedPath is the absolute fs path for fs-backed reads (regular files plus
+		// local:// / memory:// / skill:// / artifact:// resources). Fall back to a sync
+		// resolver for fs-backed internal URLs so the title is clickable even before the
+		// result lands or if the handler didn't populate resolvedPath.
+		const absForLink = details?.resolvedPath ?? tryResolveInternalUrlSync(rawPath);
+		const displayPath = absForLink ? fileHyperlink(absForLink, plainDisplayPath) : plainDisplayPath;
 		const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
 		let title = displayPath ? `Read ${displayPath}${correction}` : "Read";
 		if (args?.offset !== undefined || args?.limit !== undefined) {

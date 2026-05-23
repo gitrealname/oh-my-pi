@@ -187,6 +187,7 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+
 	// AWS-CORP: custom — merge with care
 	#taskDepth = 0;
 
@@ -197,6 +198,7 @@ export class ExtensionRunner {
 	getTaskDepth(): number {
 		return this.#taskDepth;
 	}
+
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -473,7 +475,9 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
+
 			taskDepth: this.#taskDepth,
+
 		};
 	}
 
@@ -485,8 +489,10 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+
 		// AWS-CORP: custom — merge with care
 		const ac = new AbortController();
+
 		return {
 			...this.createContext(),
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -497,8 +503,10 @@ export class ExtensionRunner {
 			switchSession: sessionPath => this.#switchSessionHandler(sessionPath),
 			reload: () => this.#reloadHandler(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
+
 			// AWS-CORP: custom — merge with care
 			signal: ac.signal,
+
 		};
 	}
 

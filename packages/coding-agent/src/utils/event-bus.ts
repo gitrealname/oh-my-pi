@@ -1,5 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 
+
 // AWS-CORP: custom — merge with care
 /**
  * Channel for tools to schedule a slash command to run after the current agent turn.
@@ -16,6 +17,7 @@ export const SCHEDULE_SLASH_CHANNEL = "tui:schedule-slash";
  */
 export const PIPE_TUI_OUTPUT_CHANNEL = "tui:pipe-output";
 export type TuiOutputPayload = { level: "status" | "error" | "warning"; text: string };
+
 
 export class EventBus {
 	readonly #listeners = new Map<string, Set<(data: unknown) => void>>();

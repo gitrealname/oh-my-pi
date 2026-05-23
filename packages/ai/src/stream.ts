@@ -10,8 +10,10 @@ import {
 	requireSupportedEffort,
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
+
 // AWS-CORP: custom — merge with care
 import { streamAwsCorp } from "./providers/aws-corp";
+
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
@@ -85,6 +87,9 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	cerebras: "CEREBRAS_API_KEY",
 	xai: "XAI_API_KEY",
 	fireworks: "FIREWORKS_API_KEY",
+
+	firepass: "FIREPASS_API_KEY",
+
 	openrouter: "OPENROUTER_API_KEY",
 	kilo: "KILO_API_KEY",
 	"vercel-ai-gateway": "AI_GATEWAY_API_KEY",
@@ -146,12 +151,14 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
+
 	// AWS-CORP: custom — merge with care
 	"aws-corp": () => {
 		if ($env.AWS_CORP_PROFILE || $env.AWS_CORP_SSO_SESSION) {
 			return "<authenticated>";
 		}
 	},
+
 	synthetic: "SYNTHETIC_API_KEY",
 	"cloudflare-ai-gateway": "CLOUDFLARE_AI_GATEWAY_API_KEY",
 	huggingface: () => $pickenv("HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"),
@@ -592,6 +599,9 @@ function mapOptionsForApi<TApi extends Api>(
 					thinkingEnabled: false,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
+
+					serviceTier: options?.serviceTier,
+
 				});
 			}
 
@@ -602,6 +612,9 @@ function mapOptionsForApi<TApi extends Api>(
 					thinkingEnabled: false,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
+
+					serviceTier: options?.serviceTier,
+
 				});
 			}
 
@@ -615,6 +628,9 @@ function mapOptionsForApi<TApi extends Api>(
 					effort,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
+
+					serviceTier: options?.serviceTier,
+
 				});
 			}
 
@@ -625,6 +641,9 @@ function mapOptionsForApi<TApi extends Api>(
 					thinkingBudgetTokens: thinkingBudget,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
+
+					serviceTier: options?.serviceTier,
+
 				});
 			}
 
@@ -643,6 +662,9 @@ function mapOptionsForApi<TApi extends Api>(
 					thinkingEnabled: false,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
+
+					serviceTier: options?.serviceTier,
+
 				});
 			} else {
 				return castApi<"anthropic-messages">({
@@ -652,6 +674,9 @@ function mapOptionsForApi<TApi extends Api>(
 					thinkingBudgetTokens: thinkingBudget,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
+
+					serviceTier: options?.serviceTier,
+
 				});
 			}
 		}

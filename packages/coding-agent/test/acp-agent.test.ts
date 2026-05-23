@@ -1124,7 +1124,7 @@ describe("ACP agent", () => {
 		expect(session.customMessages).toHaveLength(1);
 		expect(session.customMessages[0]!.customType).toBe("skill-prompt");
 		expect(session.customMessages[0]!.content).toContain("# Sample\nDo work.");
-		expect(session.customMessages[0]!.content).toContain(`Skill: ${skillPath}`);
+		expect(session.customMessages[0]!.content).toContain(`Skill: ${skillPath.replace(/\\/g, "/")}`);
 		expect(session.customMessages[0]!.content).toContain("User: extra context");
 
 		harness.abortController.abort();

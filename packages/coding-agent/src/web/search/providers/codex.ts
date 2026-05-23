@@ -15,6 +15,7 @@ import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
+import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
@@ -338,11 +339,13 @@ async function callCodexSearch(
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
-		signal: options.signal,
+		signal: withHardTimeout(options.signal),
 	});
 
 	if (!response.ok) {
 		const errorText = await response.text();
+		const classified = classifyProviderHttpError("codex", response.status, errorText);
+		if (classified) throw classified;
 		throw new SearchProviderError("codex", `Codex API error (${response.status}): ${errorText}`, response.status);
 	}
 
@@ -425,6 +428,9 @@ async function callCodexSearch(
 
 	const finalAnswer = answerParts.join("\n\n").trim();
 	const streamedAnswer = streamedAnswerParts.join("").trim();
+	if (isImagePlaceholderAnswer(finalAnswer) && streamedAnswer.length === 0) {
+		throw new SearchProviderError("codex", "Codex returned image-only response", 502);
+	}
 	const answer =
 		finalAnswer.length > 0 && !isImagePlaceholderAnswer(finalAnswer)
 			? finalAnswer

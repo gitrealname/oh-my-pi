@@ -8,7 +8,7 @@ import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
-import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
@@ -18,8 +18,8 @@ import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope } from "./path-utils";
 import {
 	appendParseErrorsBulletList,
+	capParseErrors,
 	createCachedComponent,
-	dedupeParseErrors,
 	formatCodeFrameLine,
 	formatCount,
 	formatEmptyMessage,
@@ -104,6 +104,8 @@ export interface AstGrepToolDetails {
 	filesSearched: number;
 	limitReached: boolean;
 	parseErrors?: string[];
+	/** Total parse error count before {@link PARSE_ERRORS_LIMIT} capping. Omitted when no errors. */
+	parseErrorsTotal?: number;
 	scopePath?: string;
 	files?: string[];
 	fileMatches?: Array<{ path: string; count: number }>;
@@ -111,6 +113,9 @@ export interface AstGrepToolDetails {
 	/** Pre-formatted text for the user-visible TUI render. Mirrors `result.text` lines but uses
 	 * a `│` gutter and `*` to mark match lines. The TUI uses this directly so it never parses model-facing text. */
 	displayContent?: string;
+	/** Absolute base directory used during search. Used by the renderer to resolve
+	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
+	searchPath?: string;
 }
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
@@ -172,7 +177,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				const parseError = error.match(/^.+: (.+: parse error \(syntax tree contains error nodes\))$/);
 				return parseError?.[1] ?? error;
 			});
-			const dedupedParseErrors = dedupeParseErrors(normalizedParseErrors);
+			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(normalizedParseErrors);
 			const formatPath = (filePath: string): string =>
 				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
 
@@ -193,18 +198,19 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				fileCount: result.filesWithMatches,
 				filesSearched: result.filesSearched,
 				limitReached: result.limitReached,
-				...(dedupedParseErrors.length > 0 ? { parseErrors: dedupedParseErrors } : {}),
+				...(cappedParseErrors.length > 0 ? { parseErrors: cappedParseErrors, parseErrorsTotal } : {}),
 				scopePath,
+				searchPath: resolvedSearchPath,
 				files: fileList,
 				fileMatches: [],
 			};
 
 			if (result.matches.length === 0) {
-				const noMatchMessage = dedupedParseErrors.length
+				const noMatchMessage = cappedParseErrors.length
 					? "No matches found. Parse issues mean the query may be mis-scoped; narrow `paths` before concluding absence."
 					: "No matches found";
-				const parseMessage = dedupedParseErrors.length
-					? `\n${formatParseErrors(dedupedParseErrors).join("\n")}`
+				const parseMessage = cappedParseErrors.length
+					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
 				return toolResult(baseDetails).text(`${noMatchMessage}${parseMessage}`).done();
 			}
@@ -269,8 +275,8 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			if (result.limitReached) {
 				outputLines.push("", "Result limit reached; narrow paths or increase limit.");
 			}
-			if (dedupedParseErrors.length) {
-				outputLines.push("", ...formatParseErrors(dedupedParseErrors));
+			if (cappedParseErrors.length) {
+				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
 
 			return toolResult(details).text(outputLines.join("\n")).done();
@@ -329,7 +335,7 @@ export const astGrepToolRenderer = {
 			const lines = [header, formatEmptyMessage("No matches found", uiTheme)];
 			if (details?.parseErrors?.length) {
 				lines.push(uiTheme.fg("warning", "Query may be mis-scoped; narrow `paths` before concluding absence"));
-				appendParseErrorsBulletList(lines, details.parseErrors, uiTheme);
+				appendParseErrorsBulletList(lines, details.parseErrors, uiTheme, details.parseErrorsTotal);
 			}
 			return new Text(lines.join("\n"), 0, 0);
 		}
@@ -356,12 +362,15 @@ export const astGrepToolRenderer = {
 			extraLines.push(uiTheme.fg("warning", "limit reached; narrow paths or increase limit"));
 		}
 		if (details?.parseErrors?.length) {
-			extraLines.push(uiTheme.fg("warning", formatParseErrorsCountLabel(details.parseErrors)));
+			extraLines.push(
+				uiTheme.fg("warning", formatParseErrorsCountLabel(details.parseErrors, details.parseErrorsTotal)),
+			);
 		}
 
 		return createCachedComponent(
 			() => options.expanded,
 			width => {
+				const searchBase = details?.searchPath;
 				const matchLines = renderTreeList(
 					{
 						items: matchGroups,
@@ -369,13 +378,40 @@ export const astGrepToolRenderer = {
 						maxCollapsed: matchGroups.length,
 						maxCollapsedLines: COLLAPSED_MATCH_LIMIT,
 						itemType: "match",
-						renderItem: group =>
-							group.map(line => {
-								if (line.startsWith("## ")) return uiTheme.fg("dim", line);
-								if (line.startsWith("# ")) return uiTheme.fg("accent", line);
+						renderItem: group => {
+							let contextDir = searchBase ?? "";
+							return group.map(line => {
+								if (line.startsWith("## ")) {
+									const fileName = line
+										.slice(3)
+										.trimEnd()
+										.replace(/\s+\([^)]*\)\s*$/, "");
+									const absPath = contextDir && fileName ? path.join(contextDir, fileName) : undefined;
+									const styled = uiTheme.fg("dim", line);
+									return absPath ? fileHyperlink(absPath, styled) : styled;
+								}
+								if (line.startsWith("# ")) {
+									const raw = line
+										.slice(2)
+										.trimEnd()
+										.replace(/\s+\([^)]*\)\s*$/, "");
+									const isDirectory = raw.endsWith("/");
+									const name = raw.replace(/\/$/, "");
+									if (isDirectory) {
+										if (searchBase) {
+											contextDir = name === "." ? searchBase : path.join(searchBase, name);
+										}
+										return uiTheme.fg("accent", line);
+									}
+									// Root-level file (single # without trailing slash) from formatGroupedFiles.
+									const absPath = searchBase && name ? path.join(searchBase, name) : undefined;
+									const styled = uiTheme.fg("accent", line);
+									return absPath ? fileHyperlink(absPath, styled) : styled;
+								}
 								if (line.startsWith("  meta:")) return uiTheme.fg("dim", line);
 								return uiTheme.fg("toolOutput", line);
-							}),
+							});
+						},
 					},
 					uiTheme,
 				);
