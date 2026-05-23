@@ -159,6 +159,11 @@ const mmemoryHandler = async (command: ParsedSlashCommand, runtime: BuiltinSlash
 				? `mmemory: ${result.resultCount} memories found.`
 				: "mmemory: no memories found.");
 			showMPanel(runtime.ctx, `Memory Recall — "${query}"`, result.text || "_No results._");
+			// AWS-CORP: custom — merge with care
+			// Inject recall results into LLM context so the next turn can act on them.
+			// showMPanel is visual-only (excluded from LLM context); appendCustomResult
+			// pushes display:false into agent.#state.messages — LLM sees it on next turn.
+			if (result.text) appendCustomResult(runtime.ctx.session, "mmemory-recall", result.text);
 			break;
 		}
 		case "reflect": {

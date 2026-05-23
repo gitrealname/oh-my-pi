@@ -16,7 +16,8 @@
  *   3. callWithRole   — LLM call with role resolution in one step
  *   4. formatBlock    — XML block renderer for system prompt injection
  *   5. showMPanel     — render a panel into chat, excluded from LLM context
- *   6. appendCustomResult / flushCustomResults — inject tool output into LLM
+ *   6. resolveTemplateModelSpec — resolve model: / role: for prompt templates
+ *   7. appendCustomResult / flushCustomResults — inject tool output into LLM
  *      context with the same streaming guard as recordBashResult. Use this
  *      when the LLM must see the output (unlike showMPanel / showStatus).
  *
@@ -320,7 +321,7 @@ export function showMPanel(
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. resolveTemplateModelSpec (m-prompt-template support)
+// 6. resolveTemplateModelSpec (m-prompt-template support)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -332,7 +333,7 @@ export function resolveTemplateModelSpec(spec: string, settings: import("../conf
 	return roles[spec] ?? spec;
 }
 // ══════════════════════════════════════════════════════════════════════════════
-// 6. appendCustomResult
+// 7. appendCustomResult
 // ══════════════════════════════════════════════════════════════════════════════
 // Injects tool output into LLM context WITHOUT triggering a new LLM turn and
 // WITHOUT rendering to the session view.
