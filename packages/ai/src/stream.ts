@@ -11,9 +11,6 @@ import {
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 
-// AWS-CORP: custom — merge with care
-import { streamAwsCorp } from "./providers/aws-corp";
-
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
@@ -32,9 +29,11 @@ import { streamPiNative } from "./providers/pi-native-client";
 // export routing predicates (isGitLabDuoModel, isKimiModel, isSyntheticModel)
 // that must be callable synchronously before streaming begins, and their
 // modules are thin wrappers with no heavy SDK dependencies.
+// AWS-CORP: custom — merge with care
 import {
 	streamAnthropic,
 	streamAzureOpenAIResponses,
+	streamAwsCorp,
 	streamBedrock,
 	streamCursor,
 	streamGoogle,

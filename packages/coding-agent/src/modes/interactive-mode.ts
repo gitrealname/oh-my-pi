@@ -1868,7 +1868,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			["Approve and execute", "Approve and compact context", "Approve and keep context", "Refine plan"],
 			{
 				// AWS-CORP: custom — merge with care
-				initialIndex: 2,
+				initialIndex: 3,
 				helpText: this.#getPlanReviewHelpText(),
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
 			},

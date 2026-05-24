@@ -129,6 +129,14 @@ interface BedrockProviderModule {
 		options: BedrockOptions,
 	) => AssistantMessageEventStream;
 }
+// AWS-CORP: custom — merge with care
+interface AwsCorpProviderModule {
+	streamAwsCorp: (
+		model: Model<"bedrock-converse-stream">,
+		context: Context,
+		options: BedrockOptions,
+	) => AssistantMessageEventStream;
+}
 
 // ---------------------------------------------------------------------------
 // Module-level lazy promise caches
@@ -146,6 +154,9 @@ let ollamaProviderModulePromise: Promise<LazyProviderModule<"ollama-chat">> | un
 let cursorProviderModulePromise: Promise<LazyProviderModule<"cursor-agent">> | undefined;
 let bedrockProviderModuleOverride: LazyProviderModule<"bedrock-converse-stream"> | undefined;
 let bedrockProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
+// AWS-CORP: custom — merge with care
+let awsCorpProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
+
 
 export function setBedrockProviderModule(module: BedrockProviderModule): void {
 	bedrockProviderModuleOverride = {
@@ -378,3 +389,14 @@ export const streamCursor = createLazyStream(loadCursorProviderModule);
 export const streamOllama = createLazyStream(loadOllamaProviderModule);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);
+// AWS-CORP: custom — merge with care
+function loadAwsCorpProviderModule(): Promise<LazyProviderModule<"bedrock-converse-stream">> {
+	awsCorpProviderModulePromise ||= import("./aws-corp").then(module => {
+		const provider = module as AwsCorpProviderModule;
+		return { stream: provider.streamAwsCorp };
+	});
+	return awsCorpProviderModulePromise;
+}
+
+// AWS-CORP: custom — merge with care
+export const streamAwsCorp = createLazyStream(loadAwsCorpProviderModule);
