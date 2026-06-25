@@ -1,3 +1,7 @@
+# Dotfiles and dotdirs (exclude all, re-include specific ones below)
+.*
+!.gitignore
+
 # Dependencies
 node_modules/
 .npm/
@@ -57,6 +61,8 @@ pi-*.html
 
 # Generated files
 packages/coding-agent/src/export/html/tool-views.generated.js
+packages/coding-agent/src/internal-urls/docs-index.generated.ts
+packages/coding-agent/src/extensibility/embedded-shims.ts
 packages/natives/npm/
 packages/coding-agent/src/utils/mupdf-wasm.wasm
 /runs/

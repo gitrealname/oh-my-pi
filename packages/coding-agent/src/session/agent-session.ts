@@ -7080,7 +7080,7 @@ export class AgentSession {
 		}
 	}
 
-	#createCommandContext(): ExtensionCommandContext {
+    #createCommandContext(): ExtensionCommandContext {
 		if (this.#extensionRunner) {
 			return this.#extensionRunner.createCommandContext();
 		}

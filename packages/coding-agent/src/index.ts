@@ -36,7 +36,6 @@ export * from "./modes";
 export * from "./modes/components";
 // Theme utilities for custom tools
 export * from "./modes/theme/theme";
-// SDK for programmatic usage
 export * from "./sdk";
 export * from "./session/agent-session";
 // Auth and model registry
@@ -59,6 +58,8 @@ export type * from "./task/types";
 export * from "./tools";
 export * from "./utils/git";
 // UI components for extensions
+// Open-sdk exports for extensions (accessible via pi.pi.*)
+export * from "./open-sdk";
 export {
 	HookEditorComponent as ExtensionEditorComponent,
 	HookInputComponent as ExtensionInputComponent,

@@ -397,14 +397,26 @@ export class Settings {
 	}
 
 	/**
-	 * Apply runtime overrides (not persisted).
+	 * Apply a runtime override (not persisted to config.yml).
+	 * When `fireHook` is true, fires the side-effect hook for this key
+	 * (if one exists in SETTING_HOOKS) so UI/subsystems update immediately.
 	 */
-	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+	override<P extends SettingPath>(path: P, value: SettingValue<P>, options?: { fireHook?: boolean }): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
 		setByPath(this.#overrides, segments, value);
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged(path, this.get(path), prev);
+		if (options?.fireHook) {
+			const hook = SETTING_HOOKS[path];
+			if (hook) {
+				try {
+					hook(value, prev);
+				} catch (err) {
+					logger.warn(`Settings: hook failed for ${path}`, { error: String(err) });
+				}
+			}
+		}
 	}
 
 	/**
@@ -1334,9 +1346,7 @@ type SettingHook<P extends SettingPath> = (value: SettingValue<P>, prev: Setting
  */
 class SettingSignal<A extends unknown[] = []> {
 	#listeners = new Set<(...args: A) => void>();
-
 	constructor(private readonly label: string) {}
-
 	/** Subscribe `cb`; returns an unsubscribe function. */
 	on(cb: (...args: A) => void): () => void {
 		this.#listeners.add(cb);
@@ -1344,7 +1354,6 @@ class SettingSignal<A extends unknown[] = []> {
 			this.#listeners.delete(cb);
 		};
 	}
-
 	/**
 	 * Invoke every listener with `args`. Iterates a snapshot so a listener may
 	 * (un)subscribe mid-fire without re-entrancy — the Hindsight backend
@@ -1362,7 +1371,6 @@ class SettingSignal<A extends unknown[] = []> {
 		}
 	}
 }
-
 const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 	"theme.dark": value => {
 		if (typeof value === "string") {
