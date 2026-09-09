@@ -11,6 +11,8 @@ use crate::host::{self, Host, Utility, matches_parser};
 
 #[cfg(any(unix, windows))]
 use imp::Stat;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 #[cfg(not(any(unix, windows)))]
 struct Stat {

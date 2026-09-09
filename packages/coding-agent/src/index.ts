@@ -75,6 +75,8 @@ export type {
 export * from "./tools";
 export * from "./utils/github";
 // UI components for extensions
+// Open-sdk exports for extensions (accessible via pi.pi.*)
+export * from "./open-sdk";
 export {
 	HookEditorComponent as ExtensionEditorComponent,
 	HookInputComponent as ExtensionInputComponent,

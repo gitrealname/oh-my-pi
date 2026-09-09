@@ -8090,7 +8090,7 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
-	#createCommandContext(): ExtensionCommandContext {
+    #createCommandContext(): ExtensionCommandContext {
 		if (this.#extensionRunner) {
 			return this.#extensionRunner.createCommandContext();
 		}

@@ -28,6 +28,7 @@ import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import type { SendUserMessageOptions } from "../../session/agent-session";
+import * as PiOpenSdk from "../../open-sdk";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { isFilesystemSourcePath } from "../../tools/path-utils";
@@ -206,6 +207,9 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 			Object.defineProperty(this, name, { value: descriptor.value.bind(this), writable: true, configurable: true });
 		}
 	}
+
+	/** Open-sdk subpath — clean namespace for external extensions */
+	readonly openSdk = PiOpenSdk;
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
