@@ -6,6 +6,8 @@ mod count_fast {
 	use std::io::{self, ErrorKind, Read};
 	#[cfg(unix)]
 	use std::os::fd::AsRawFd;
+	#[cfg(windows)]
+	use std::os::windows::fs::MetadataExt;
 	
 	#[cfg(unix)]
 	use libc::{_SC_PAGESIZE, S_IFREG, sysconf};
@@ -13,8 +15,6 @@ mod count_fast {
 	
 	use super::WordCountable;
 	use super::{wc_simd_allowed, word_count::WordCount};
-	#[cfg(windows)]
-	use std::os::windows::fs::MetadataExt;
 	#[cfg(windows)]
 	const FILE_ATTRIBUTE_ARCHIVE: u32 = 32;
 	#[cfg(windows)]
@@ -530,6 +530,8 @@ use std::{
 	iter,
 	path::{Path, PathBuf},
 };
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use brush_core::{ShellExtensions, builtins::Registration};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};

@@ -6,6 +6,8 @@
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::{
 	ffi::{OsStr, OsString},
 	fs::{self, Metadata},

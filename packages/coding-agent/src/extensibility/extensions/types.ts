@@ -59,6 +59,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
+import type * as PiOpenSdk from "../../open-sdk";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
@@ -1228,6 +1229,9 @@ export interface ExtensionAPI {
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;
+
+	/** Open-sdk subpath — clean namespace for LLM calls, settings, stream utils, and TUI helpers */
+	openSdk: typeof PiOpenSdk;
 
 	// =========================================================================
 	// Event Subscription

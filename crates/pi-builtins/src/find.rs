@@ -4570,6 +4570,8 @@ use std::{
 	rc::Rc,
 	time::SystemTime,
 };
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use brush_core::{ShellExtensions, builtins::Registration};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::OsStringValueParser};

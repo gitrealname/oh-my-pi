@@ -102,6 +102,10 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./open-sdk": {
+      "types": "./src/open-sdk.ts",
+      "import": "./src/open-sdk.ts"
+    },
     "./*": {
       "types": "./src/*.ts",
       "import": "./src/*.ts"
