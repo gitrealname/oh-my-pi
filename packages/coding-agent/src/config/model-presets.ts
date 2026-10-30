@@ -14,6 +14,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import { cfgDefaultThinkingLevel } from "../session/settings";
@@ -75,11 +76,18 @@ export function getModelPresetNames(settings: Settings): string[] {
  * First saved preset (by name) the current setup matches: identical effective
  * role assignments and, when the preset records one, the same default thinking
  * level. Undefined when the roles were edited past every preset.
+ *
+ * A trailing `:level` on a live role selector is not part of the preset's
+ * identity when the preset pins none: the suffix is optional and, without it,
+ * the level is decided by the default thinking level (compared separately).
+ * A preset role that pins `:level` still demands an exact match — applying the
+ * preset pins that level, so a differently pinned live role is not this preset.
  */
 export function findActiveModelPreset(settings: Settings): string | undefined {
 	const roles = settings.getModelRoles();
 	// Same filter as `saveModelPreset`: empty selectors are never stored.
 	const roleIds = Object.keys(roles).filter(role => roles[role]);
+	const roleBases = new Map(roleIds.map(role => [role, splitThinkingSuffix(roles[role]!).base]));
 	const thinking = cfgDefaultThinkingLevel.get(settings);
 	return getModelPresetNames(settings).find(name => {
 		const lookup = getModelPreset(settings, name);
@@ -89,7 +97,14 @@ export function findActiveModelPreset(settings: Settings): string | undefined {
 		const presetIds = Object.keys(modelRoles);
 		return (
 			presetIds.length === roleIds.length &&
-			presetIds.every(role => Object.hasOwn(roles, role) && roles[role] === modelRoles[role])
+			presetIds.every(role => {
+				if (!Object.hasOwn(roles, role)) return false;
+				const selector = modelRoles[role];
+				// Level-pinned preset role: the live selector must match verbatim.
+				return splitThinkingSuffix(selector).level
+					? roles[role] === selector
+					: roleBases.get(role) === splitThinkingSuffix(selector).base;
+			})
 		);
 	});
 }

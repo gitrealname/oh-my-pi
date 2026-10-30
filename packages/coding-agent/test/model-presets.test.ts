@@ -23,6 +23,8 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { findActiveModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-presets";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 
 const SONNET = "anthropic/claude-sonnet-4-5";
 const SONNET_46 = "anthropic/claude-sonnet-4-6";
@@ -417,5 +419,88 @@ describe("model presets", () => {
 		release();
 		expect((await applying).kind).toBe("switched");
 		expect(settings.getModelRole("default")).toBe(OPUS);
+	});
+	it("matches a saved preset whose live roles carry optional thinking suffixes", () => {
+		const settings = Settings.isolated();
+		cfgModelPresets.setEntry(settings, "team", {
+			modelRoles: { default: OPUS, smol: SONNET_46 },
+			defaultThinkingLevel: Effort.Low,
+		});
+		cfgDefaultThinkingLevel.set(settings, Effort.Low);
+		// Suffix is optional: the level comes from defaultThinkingLevel.
+		settings.setModelRole("default", `${OPUS}:high`);
+		settings.setModelRole("smol", `${SONNET_46}:medium`);
+		expect(findActiveModelPreset(settings)).toBe("team");
+
+		// A level-pinned preset role demands an exact match: the pinned level
+		// differs, so this live setup is not the preset. Disjoint role set
+		// keeps `team` from matching instead.
+		cfgModelPresets.setEntry(settings, "pinned", {
+			modelRoles: { default: `${OPUS}:medium`, smol: SONNET_46 },
+		});
+		expect(findActiveModelPreset(settings)).toBe("team");
+		settings.setModelRole("default", `${OPUS}:medium`);
+		expect(findActiveModelPreset(settings)).toBe("pinned");
+
+		// Fully off-preset: a third model matches nothing.
+		settings.setModelRole("default", SONNET);
+		expect(findActiveModelPreset(settings)).toBeUndefined();
+	});
+});
+
+describe("status line host activeModelPreset", () => {
+	let presetFixtureDir: TempDir;
+	let presetAuthStorage: AuthStorage;
+	let presetModelRegistry: ModelRegistry;
+
+	beforeAll(async () => {
+		presetFixtureDir = TempDir.createSync("@pi-status-preset-fixture-");
+		presetAuthStorage = await AuthStorage.create(path.join(presetFixtureDir.path(), "auth.db"));
+		presetAuthStorage.keys.setRuntime("anthropic", "test-key");
+		presetModelRegistry = new ModelRegistry(presetAuthStorage, path.join(presetFixtureDir.path(), "models.yml"));
+	});
+
+	afterAll(() => {
+		presetAuthStorage.close();
+		presetFixtureDir.removeSync();
+	});
+
+	function createHostSession(settings: Settings, initialModel = SONNET, thinkingLevel: Effort = Effort.High) {
+		const agent = new Agent({
+			initialState: { model: bundled(initialModel), systemPrompt: ["Test"], tools: [], messages: [], thinkingLevel },
+		});
+		return new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: presetModelRegistry,
+		});
+	}
+
+	it("returns the matched preset name when roles equal a saved preset", async () => {
+		const settings = Settings.isolated();
+		settings.setModelRole("default", OPUS);
+		settings.setModelRole("plan", SONNET_46);
+		cfgDefaultThinkingLevel.set(settings, Effort.Low);
+		saveModelPreset(settings, "focus");
+		const session = createHostSession(settings, OPUS, Effort.Low);
+
+		expect(statusLineHost.activeModelPreset?.(session)).toBe("focus");
+	});
+
+	it("returns undefined for custom roles and drops a stale memo after a switch", async () => {
+		const settings = Settings.isolated();
+		settings.setModelRole("default", SONNET);
+		const session = createHostSession(settings);
+		expect(statusLineHost.activeModelPreset?.(session)).toBeUndefined();
+
+		// Switch roles to a saved preset's shape: revision bump must invalidate the memo.
+		settings.setModelRole("default", OPUS);
+		settings.setModelRole("plan", SONNET_46);
+		cfgDefaultThinkingLevel.set(settings, Effort.Low);
+		saveModelPreset(settings, "focus");
+
+		expect(statusLineHost.activeModelPreset?.(session)).toBe("focus");
+		expect(findActiveModelPreset(settings)).toBe("focus");
 	});
 });

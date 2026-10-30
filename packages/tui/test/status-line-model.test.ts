@@ -139,6 +139,23 @@ describe("status line model segment advisor badge", () => {
 	});
 });
 
+describe("status line model segment active preset", () => {
+	it("appends the active preset name in parens", () => {
+		const ctx = createModelContext(false);
+		ctx.activeModelPreset = "c";
+		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
+		expect(rendered).toContain("Test Model(c)");
+	});
+
+	it("keeps the plain model name when no preset matches", () => {
+		const ctx = createModelContext(false);
+		ctx.activeModelPreset = undefined;
+		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
+		expect(rendered).toContain("Test Model");
+		expect(rendered).not.toContain("Test Model(");
+	});
+});
+
 describe("status line model segment compact thinking level", () => {
 	function createThinkingContext(compactThinkingLevel: boolean): SegmentContext {
 		return {

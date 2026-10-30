@@ -2593,6 +2593,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 		const turnElapsedMs = this.getTurnElapsedMs();
 		return {
 			session: this.session,
+			activeModelPreset: this.host.activeModelPreset?.(this.session),
 			focusedAgentId: this.#focusedAgentId,
 			sessionAccent: sessionAccentEnabled,
 			previewTitle,

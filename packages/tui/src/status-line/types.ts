@@ -76,6 +76,8 @@ export type RGB = readonly [number, number, number];
 
 export interface SegmentContext {
 	session: StatusLineSession;
+	/** Name of the active model preset (host-provided), shown as a `(name)` suffix on the model segment. */
+	activeModelPreset?: string | undefined;
 	/** Deterministic wall clock for previews/tests; production omits it. */
 	now?: Date;
 	/** Deterministic host label for previews/tests; production omits it. */

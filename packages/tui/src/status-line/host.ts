@@ -109,6 +109,8 @@ export interface StatusLineHost<TSession extends StatusLineSession = StatusLineS
 	 */
 	resetExpiryNotice?(session: TSession, reports: readonly UsageReport[], nowMs: number): string | undefined;
 	computeCompactionBoundaries(session: TSession, contextWindow: number, model?: Model): CompactionBoundaries | null;
+	/** Name of the saved model preset the session's roles currently match, or undefined. */
+	activeModelPreset?(session: TSession): string | undefined;
 }
 
 export interface FooterHost {

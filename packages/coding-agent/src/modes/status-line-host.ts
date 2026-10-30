@@ -1,4 +1,5 @@
 import type { StatusLineHost, StatusLineSession } from "@oh-my-pi/pi-tui/status-line/host";
+import { findActiveModelPreset } from "../config/model-presets";
 import { Settings, settings } from "../config/settings";
 import type { AgentSession } from "../session/agent-session";
 import { getSessionCompactionBoundaries } from "../session/context-usage-runtime";
@@ -31,6 +32,30 @@ import { cfgGoalStatusInFooter } from "../goals/settings";
  */
 export type StatusLineHostSession = StatusLineSession &
 	Partial<Pick<AgentSession, "settings" | "modelRegistry" | "sessionId" | "fetchUsageReports">>;
+
+/**
+ * Memoize `findActiveModelPreset` per settings identity + revision: the status
+ * line renders per frame, but the match only changes when roles change.
+ */
+const activeModelPresetMemo = new WeakMap<object, { revision: number; name: string | undefined }>();
+
+function activeModelPresetFor(session: StatusLineHostSession): string | undefined {
+	const sessionSettings = session.settings ?? settings;
+	const identity: unknown = sessionSettings;
+	// Host frame revision first (global settings), else the session's own
+	// settings revision (isolated/tests where no global instance exists).
+	let revision: number;
+	try {
+		revision = Settings.instance.revision;
+	} catch {
+		revision = sessionSettings.revision;
+	}
+	const cached = identity === null ? undefined : activeModelPresetMemo.get(identity as object);
+	if (cached && cached.revision === revision) return cached.name;
+	const name = findActiveModelPreset(sessionSettings);
+	if (identity !== null) activeModelPresetMemo.set(identity as object, { revision, name });
+	return name;
+}
 
 /** Application policy and runtime services consumed by the portable status renderer. */
 export const statusLineHost: StatusLineHost<StatusLineHostSession> = {
@@ -73,4 +98,5 @@ export const statusLineHost: StatusLineHost<StatusLineHostSession> = {
 	},
 	computeCompactionBoundaries: (session, contextWindow, model) =>
 		getSessionCompactionBoundaries(session.settings ?? settings, contextWindow, model),
+	activeModelPreset: activeModelPresetFor,
 };

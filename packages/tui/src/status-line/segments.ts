@@ -287,7 +287,8 @@ const statusSegment: StatusLineSegment = {
 function modelDisplayName(ctx: SegmentContext): string {
 	const state = ctx.session.state;
 	const modelName = state.model?.name || state.model?.id || "no-model";
-	return modelName.startsWith("Claude ") ? modelName.slice(7) : modelName;
+	const base = modelName.startsWith("Claude ") ? modelName.slice(7) : modelName;
+	return ctx.activeModelPreset ? `${base}(${ctx.activeModelPreset})` : base;
 }
 
 /**
