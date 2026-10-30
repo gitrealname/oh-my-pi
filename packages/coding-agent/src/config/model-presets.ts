@@ -20,6 +20,7 @@ import type { AgentSession } from "../session/agent-session";
 import { cfgDefaultThinkingLevel } from "../session/settings";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "./model-resolver";
 import { cfgModelPresets, cfgModelRoleStorage, type ModelPreset } from "./model-settings";
+import { captureOverlayPresetRoles, applyOverlayPresetRolesPatch } from "./overlay-preset-roles";
 import type { Settings, SettingProvenance } from "./settings";
 
 /** Preset names: a letter, then letters, digits, `-` or `_` (the model hub's role-name rule). */
@@ -380,6 +381,12 @@ async function applyModelPresetLocked(
 	}
 
 	writePresetRoles(settings, preset);
+	// A `--config` overlay that owns the role keys shadows the roles just written
+	// to the global config; patch the in-memory overlay layer now so the live
+	// switch below resolves the preset's roles and later reloads cannot resurrect
+	// the pre-switch ones (see `overlay-preset-roles`).
+	captureOverlayPresetRoles(preset.modelRoles);
+	applyOverlayPresetRolesPatch(settings);
 	const shadowed = shadowedRoles(settings, preset);
 	const thinkingShadow = shadowedThinking(settings, preset);
 

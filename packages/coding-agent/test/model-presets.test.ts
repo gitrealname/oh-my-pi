@@ -16,6 +16,7 @@ import {
 	saveModelPreset,
 } from "@oh-my-pi/pi-coding-agent/config/model-presets";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -43,6 +44,7 @@ describe("model presets", () => {
 	let modelRegistry: ModelRegistry;
 	const sessions: AgentSession[] = [];
 	const tempDirs: TempDir[] = [];
+	const tempSettings: Settings[] = [];
 
 	beforeAll(async () => {
 		fixtureDir = TempDir.createSync("@pi-model-presets-fixture-");
@@ -169,12 +171,13 @@ describe("model presets", () => {
 		const result = await applyModelPreset(settings, session, "opus");
 
 		if (result.kind !== "switched") throw new Error(`expected switched, got ${result.kind}`);
+		// The switch patches the in-memory overlay layer, so the overlay no longer
+		// shadows `default` and the live model follows the preset; `slow` is not in
+		// the preset, and the project layer still decides it.
 		expect(result.shadowed).toEqual([
-			{ role: "default", expected: OPUS, actual: SONNET, source: "overlay" },
 			{ role: "slow", expected: undefined, actual: SONNET_46, source: "project" },
 		]);
-		// The live model follows the effective default, which the overlay still decides.
-		expect(session.model?.id).toBe("claude-sonnet-4-5");
+		expect(session.model?.id).toBe("claude-opus-4-5");
 		expect(settings.getGlobalModelRole("default")).toBe(OPUS);
 	});
 
@@ -502,5 +505,86 @@ describe("status line host activeModelPreset", () => {
 
 		expect(statusLineHost.activeModelPreset?.(session)).toBe("focus");
 		expect(findActiveModelPreset(settings)).toBe("focus");
+	});
+});
+
+describe("model presets with a shadowing overlay", () => {
+	const overlay = `modelRoles:\n  default: ${SONNET}\n  plan: ${SONNET_46}\nmodelPresets:\n  opus-set:\n    modelRoles:\n      default: ${OPUS}\n      plan: ${SONNET_46}\n`;
+	let overlayFixtureDir: TempDir;
+	let overlayAuthStorage: AuthStorage;
+	let overlayModelRegistry: ModelRegistry;
+	const sessions: AgentSession[] = [];
+	const tempDirs: TempDir[] = [];
+	const tempSettings: Settings[] = [];
+
+	beforeAll(async () => {
+		overlayFixtureDir = TempDir.createSync("@pi-model-presets-overlay-fixture-");
+		overlayAuthStorage = await AuthStorage.create(path.join(overlayFixtureDir.path(), "auth.db"));
+		overlayAuthStorage.keys.setRuntime("anthropic", "test-key");
+		overlayModelRegistry = new ModelRegistry(overlayAuthStorage, path.join(overlayFixtureDir.path(), "models.yml"));
+	});
+
+	afterAll(() => {
+		overlayAuthStorage.close();
+		overlayFixtureDir.removeSync();
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		for (const session of sessions.splice(0)) await session.dispose();
+		for (const settings of tempSettings.splice(0)) settings.stopWatching();
+		AgentStorage.close();
+		for (const dir of tempDirs.splice(0)) dir.removeSync();
+	});
+
+	async function overlaySettings() {
+		const dir = TempDir.createSync("@pi-model-presets-overlay-");
+		tempDirs.push(dir);
+		const overlayPath = path.join(dir.path(), "overlay.yml");
+		fs.writeFileSync(overlayPath, overlay);
+		const settings = await Settings.loadIsolated({
+			cwd: dir.path(),
+			agentDir: dir.path(),
+			configFiles: [overlayPath],
+		});
+		tempSettings.push(settings);
+		return settings;
+	}
+
+	function createOverlaySession(settings: Settings, initialModel = SONNET, thinkingLevel: Effort = Effort.High) {
+		const agent = new Agent({
+			initialState: { model: bundled(initialModel), systemPrompt: ["Test"], tools: [], messages: [], thinkingLevel },
+		});
+		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry: overlayModelRegistry });
+	}
+
+	it("switching to an overlay-owned preset patches the overlay roles in memory", async () => {
+		const settings = await overlaySettings();
+		const session = createOverlaySession(settings);
+		sessions.push(session);
+
+		const result = await applyModelPreset(settings, session, "opus-set");
+
+		expect(result.kind).toBe("switched");
+		// Without the patch, the overlay's ambient roles shadow the global write
+		// and the effective roles stay the overlay's.
+		expect(settings.getModelRole("default")).toBe(OPUS);
+		expect(settings.getModelRoleProvenance("default")).toBe("overlay");
+		expect(findActiveModelPreset(settings)).toBe("opus-set");
+	});
+
+	it("reload re-applies the patch so a re-read overlay cannot resurrect pre-switch roles", async () => {
+		const settings = await overlaySettings();
+		const session = createOverlaySession(settings);
+		sessions.push(session);
+		await applyModelPreset(settings, session, "opus-set");
+		expect(settings.getModelRole("default")).toBe(OPUS);
+
+		// A watcher reload re-reads the overlay from disk (still the pre-switch
+		// roles); the captured patch must be re-applied on top.
+		await settings.reloadFromDisk();
+
+		expect(settings.getModelRole("default")).toBe(OPUS);
+		expect(findActiveModelPreset(settings)).toBe("opus-set");
 	});
 });

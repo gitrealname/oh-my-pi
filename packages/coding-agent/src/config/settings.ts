@@ -56,6 +56,7 @@ import {
 // Registers every setting before any instance is read (definitions live next to their domains).
 import "./all-settings";
 import { cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
+import { applyOverlayPresetRolesPatch } from "./overlay-preset-roles";
 import { cfgShellPath } from "../exec/settings";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1449,6 +1450,7 @@ export class Settings {
 			for (const setting of settled) this.#softPins.delete(setting);
 			this.#rebuildMerged();
 			this.#fireChangesSince(previous);
+			applyOverlayPresetRolesPatch(this);
 			return;
 		}
 	}
@@ -1664,6 +1666,21 @@ export class Settings {
 	#setRuntimeModelRoleOverrides(next: Record<string, string>): void {
 		const prev = cfgModelRoles.get(this);
 		setByPath(this.#overrides, ["modelRoles"], next);
+		this.#rebuildMerged();
+		this.#fireIfChanged(cfgModelRoles, prev);
+	}
+
+	/**
+	 * Replace the in-memory overlay layer's `modelRoles` map. Memory-only: the
+	 * overlay file on disk is never written. Used by the preset switch flow
+	 * (see `overlay-preset-roles`) so a launcher overlay that owns the role
+	 * keys cannot shadow a switched-to preset; the patch is re-applied after
+	 * every overlay reload via {@link #loadConfigOverlays}.
+	 */
+	patchOverlayModelRoles(next: Record<string, string>): void {
+		const prev = cfgModelRoles.get(this);
+		const overlayRoles = this.#modelRolesFromLayer(this.#configOverlay);
+		setByPath(this.#configOverlay, ["modelRoles"], { ...overlayRoles, ...next });
 		this.#rebuildMerged();
 		this.#fireIfChanged(cfgModelRoles, prev);
 	}
@@ -2506,6 +2523,10 @@ export class Settings {
 	async #loadConfigOverlays(): Promise<RawSettings> {
 		const result = await this.#readConfigOverlays();
 		this.#overlayShellPathSource = result.shellPathSource;
+		// A preset switch patched the in-memory overlay roles; re-apply it over
+		// the freshly re-read layers so a reload cannot resurrect the pre-switch
+		// roles (see `overlay-preset-roles`).
+		applyOverlayPresetRolesPatch(this);
 		return result.settings;
 	}
 
