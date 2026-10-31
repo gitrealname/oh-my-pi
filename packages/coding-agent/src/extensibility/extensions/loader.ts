@@ -26,6 +26,7 @@ import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import { getCodingAgentApi } from "../host-api";
+import * as PiOpenSdk from "../../open-sdk";
 import type { SendUserMessageOptions } from "../../session/agent-session";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
@@ -211,6 +212,9 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	get pi() {
 		return getCodingAgentApi();
 	}
+
+	/** Open-sdk subpath — clean namespace for external extensions */
+	readonly openSdk = PiOpenSdk;
 
 	constructor(
 		private readonly extension: Extension,

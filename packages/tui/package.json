@@ -63,6 +63,10 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./open-sdk": {
+      "types": "./src/open-sdk.ts",
+      "import": "./src/open-sdk.ts"
+    },
     "./theme": {
       "types": "./src/theme/index.ts",
       "import": "./src/theme/index.ts"

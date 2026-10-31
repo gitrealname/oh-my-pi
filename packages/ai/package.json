@@ -142,6 +142,10 @@
 			"types": "./src/utils/schema/*.ts",
 			"import": "./src/utils/schema/*.ts"
 		},
+		"./open-sdk": {
+			"types": "./src/open-sdk.ts",
+			"import": "./src/open-sdk.ts"
+		},
 		"./*.js": "./src/*.ts"
 	},
 	"scripts": {
