@@ -63,6 +63,12 @@ pi-*.html
 .close_issue.sh
 
 # Generated files
+packages/natives/native/.build/
+packages/natives/native/*.node.old
+.index.html
+packages/coding-agent/src/export/html/tool-views.generated.js
+packages/coding-agent/src/internal-urls/docs-index.generated.ts
+packages/coding-agent/src/extensibility/embedded-shims.ts
 packages/coding-agent/export-assets/
 packages/natives/npm/
 /runs/

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Upstream Merge Analysis: origin/main → aws-corp</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pako/dist/pako.min.js"></script>
+<style>
+.diagram-container {
+  border: 1px solid #ddd; border-radius: 6px; overflow: hidden; margin: 12px 0;
+  position: relative; background: #fafafa; cursor: grab;
+}
+.diagram-container.dragging { cursor: grabbing; }
+.diagram-container .diagram-inner { transform-origin: 0 0; }
+.diagram-controls {
+  position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; z-index: 1;
+}
+.diagram-controls button {
+  width: 28px; height: 28px; border: 1px solid #ccc; background: #fff; border-radius: 4px;
+  cursor: pointer; font-size: 16px; line-height: 1; color: #333;
+}
+.diagram-controls button:hover { background: #e8e8e8; }
+.diagram-container.fullscreen {
+  position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+  z-index: 9999; margin: 0; border-radius: 0; border: none;
+}
+</style>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 32px 48px; background: #f5f5f5; }
+h1 { font-size: 22px; margin-bottom: 16px; }
+h2 { font-size: 17px; margin: 24px 0 12px; padding-bottom: 6px; border-bottom: 1px solid #ddd; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+th { background: #f0f0f0; font-weight: 600; }
+a { color: #1971c2; }
+ul, ol { margin: 8px 0 8px 24px; }
+li { margin: 4px 0; }
+p { margin: 8px 0; line-height: 1.6; }
+code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+pre { background: #f0f0f0; padding: 16px; border-radius: 6px; overflow-x: auto; margin: 12px 0; }
+details.sec { margin: 4px 0; padding-left: 10px; border-left: 1px dotted #ccc; padding-bottom: 2px; position: relative; }
+details.sec::after { content: ''; position: absolute; bottom: 0; left: 0; width: 20px; border-bottom: 1px dotted #ccc; }
+details.sec > summary { cursor: pointer; padding: 6px 10px; border-radius: 4px; background: #e8e8e8; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; list-style: none; }
+details.sec > summary .sec-badge { order: -1; display: inline-flex; align-items: center; justify-content: center; width: 10px; min-width: 10px; align-self: stretch; margin: -6px 0 -6px -10px; border-radius: 4px 0 0 4px; font-size: 9px; font-weight: 700; color: rgba(255,255,255,0.6); }
+details.sec > summary .sec-arrow { font-size: 10px; color: #888; transition: transform 0.15s; flex-shrink: 0; }
+details.sec[open] > summary .sec-arrow { transform: rotate(90deg); }
+details.sec.lvl-1 { padding-left: 0; border-left: none; margin-top: 20px; }
+details.sec.lvl-1::after { display: none; }
+details.sec.lvl-1 > summary { font-size: 22px; font-weight: 700; padding: 10px 12px; background: #ddd; }
+details.sec.lvl-1 > summary .sec-badge { margin: -10px 0 -10px -12px; background: #888; }
+details.sec.lvl-2 { padding-left: 10px; border-left-color: #89b4fa; margin-top: 16px; }
+details.sec.lvl-2::after { border-bottom-color: #89b4fa; }
+details.sec.lvl-2 > summary { font-size: 17px; font-weight: 600; padding: 8px 12px; }
+details.sec.lvl-2 > summary .sec-badge { margin: -8px 0 -8px -12px; background: #b8d4fa; }
+details.sec.lvl-3 { border-left-color: #a6e3a1; }
+details.sec.lvl-3::after { border-bottom-color: #a6e3a1; }
+details.sec.lvl-3 > summary { font-size: 15px; font-weight: 600; }
+details.sec.lvl-3 > summary .sec-badge { background: #c4e8c2; color: #666; }
+details.sec.lvl-4 { border-left-color: #cba6f7; }
+details.sec.lvl-4::after { border-bottom-color: #cba6f7; }
+details.sec.lvl-4 > summary { font-size: 14px; font-weight: 600; color: #444; }
+details.sec.lvl-4 > summary .sec-badge { background: #d8c6f0; }
+details.sec.lvl-5, details.sec.lvl-6 { border-left-color: #f9e2af; }
+details.sec.lvl-5::after, details.sec.lvl-6::after { border-bottom-color: #f9e2af; }
+details.sec.lvl-5 > summary, details.sec.lvl-6 > summary { font-size: 13px; font-weight: 600; color: #555; }
+details.sec.lvl-5 > summary .sec-badge, details.sec.lvl-6 > summary .sec-badge { background: #f0e4c4; color: #888; }
+</style>
+</head>
+<body>
+<div id="content"></div>
+<script>
+function _pumlEncode(text) {
+  const d = new TextEncoder().encode(text);
+  const c = new Uint8Array(pako.deflateRaw(d, {level: 9}));
+  function e6(b) {
+    if (b < 10) return String.fromCharCode(48 + b);
+    b -= 10; if (b < 26) return String.fromCharCode(65 + b);
+    b -= 26; if (b < 26) return String.fromCharCode(97 + b);
+    b -= 26; return b === 0 ? '-' : '_';
+  }
+  let r = '';
+  for (let i = 0; i < c.length; i += 3) {
+    const b1 = c[i], b2 = i+1 < c.length ? c[i+1] : 0, b3 = i+2 < c.length ? c[i+2] : 0;
+    r += e6(b1 >> 2) + e6(((b1 & 3) << 4) | (b2 >> 4)) + e6(((b2 & 0xf) << 2) | (b3 >> 6)) + e6(b3 & 0x3f);
+  }
+  return r;
+}
+
+function _makePanZoom(inner) {
+  const container = document.createElement('div');
+  container.className = 'diagram-container';
+  const controls = document.createElement('div');
+  controls.className = 'diagram-controls';
+  controls.innerHTML = '<button data-act="in">+</button><button data-act="out">−</button><button data-act="fit">⊡</button><button data-act="fs">⛶</button>';
+  container.appendChild(controls);
+  container.appendChild(inner);
+  let drag = false, sx, sy;
+  inner._s = 1; inner._tx = 0; inner._ty = 0;
+  const apply = () => { inner.style.transform = `translate(${inner._tx}px,${inner._ty}px) scale(${inner._s})`; };
+  const fit = () => {
+    inner.style.transform = 'none';
+    const cw = container.clientWidth, ch = container.clientHeight || 9999;
+    const el = inner.firstElementChild;
+    const ew = el.scrollWidth || el.naturalWidth || cw;
+    const eh = el.scrollHeight || el.naturalHeight || ch;
+    const fs = container.classList.contains('fullscreen');
+    inner._s = Math.min(cw / ew, ch / eh, fs ? 10 : 1);
+    inner._tx = 0; inner._ty = 0; apply();
+    if (!fs) container.style.height = (eh * inner._s + 16) + 'px';
+  };
+  container._fit = fit;
+  container.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect = container.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const d = e.deltaY > 0 ? 0.9 : 1.1;
+    const ns = Math.max(0.05, Math.min(5, inner._s * d));
+    inner._tx = mx - (mx - inner._tx) * (ns / inner._s);
+    inner._ty = my - (my - inner._ty) * (ns / inner._s);
+    inner._s = ns; apply();
+  });
+  container.addEventListener('mousedown', e => {
+    if (e.target.tagName === 'BUTTON') return;
+    e.preventDefault(); drag = true;
+    sx = e.clientX - inner._tx; sy = e.clientY - inner._ty;
+    container.classList.add('dragging');
+  });
+  container.addEventListener('mousemove', e => {
+    if (!drag) return;
+    inner._tx = e.clientX - sx; inner._ty = e.clientY - sy; apply();
+  });
+  container.addEventListener('mouseup', () => { drag = false; container.classList.remove('dragging'); });
+  container.addEventListener('mouseleave', () => { drag = false; container.classList.remove('dragging'); });
+  container.addEventListener('dblclick', e => { if (e.target.tagName === 'BUTTON') return; container.classList.toggle('fullscreen'); container.style.height = ''; setTimeout(fit, 50); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && container.classList.contains('fullscreen')) { container.classList.remove('fullscreen'); container.style.height = ''; setTimeout(fit, 50); } });
+  controls.addEventListener('click', e => {
+    const act = e.target.dataset.act;
+    if (act === 'in') inner._s = Math.min(5, inner._s * 1.3);
+    else if (act === 'out') inner._s = Math.max(0.05, inner._s / 1.3);
+    else if (act === 'fit') { fit(); return; }
+    else if (act === 'fs') { container.classList.toggle('fullscreen'); container.style.height = ''; setTimeout(fit, 50); return; }
+    apply();
+  });
+  return container;
+}
+
+if (!window._diagramViewerInit) {
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  window._diagramViewerInit = true;
+}
+
+function initDiagrams(root, keepSource) {
+  root.querySelectorAll('pre code.language-mermaid').forEach(el => {
+    const pre = el.closest('pre');
+    if (pre.dataset.diagramDone) return;
+    pre.dataset.diagramDone = '1';
+    const inner = document.createElement('div');
+    inner.className = 'diagram-inner';
+    const dia = document.createElement('div');
+    dia.className = 'mermaid';
+    dia.textContent = el.textContent;
+    inner.appendChild(dia);
+    const wrapper = _makePanZoom(inner);
+    if (keepSource) { pre.parentNode.insertBefore(wrapper, pre.nextSibling); }
+    else { pre.replaceWith(wrapper); }
+  });
+  mermaid.run();
+  root.querySelectorAll('pre code.language-plantuml, pre code.language-puml').forEach(el => {
+    const pre = el.closest('pre');
+    if (pre.dataset.diagramDone) return;
+    pre.dataset.diagramDone = '1';
+    const inner = document.createElement('div');
+    inner.className = 'diagram-inner';
+    const img = document.createElement('img');
+    img.src = 'https://www.plantuml.com/plantuml/svg/' + _pumlEncode(el.textContent);
+    img.style.maxWidth = 'none';
+    img.onload = () => { const c = img.closest('.diagram-container'); if (c && c._fit) c._fit(); };
+    inner.appendChild(img);
+    const wrapper = _makePanZoom(inner);
+    if (keepSource) { pre.parentNode.insertBefore(wrapper, pre.nextSibling); }
+    else { pre.replaceWith(wrapper); }
+  });
+}
+const src = "# Upstream Merge Analysis: origin/main \u2192 aws-corp\n\n**Merge base:** `f02d48c25` (v14.5.3)\n**Target:** `24fa1fa11` (v14.5.12)\n**Commits:** ~120\n**New tags:** v14.5.3 \u2192 v14.5.12\n\n---\n\n## 1. New Providers\n\n### DeepSeek (built-in)\n- **Commit:** `679e07d` \u2014 `packages/ai/src/provider-models/descriptors.ts`, `openai-compat.ts`\n- **Action:** Add `deepseek` to `disabledProviders` in all 4 config files\n\n### No new discovery providers\n- Only modification to `claude-plugins.ts` (flat `.mcp.json` shape support)\n\n---\n\n## 2. New Slash Commands\n\n| Command | Description | Action |\n|---------|-------------|--------|\n| `/loop` | Toggle loop mode \u2014 re-submits prompt after each yield | Consider for `disabledCommands` |\n| `/context` | Show estimated context usage breakdown | Keep enabled (diagnostic) |\n\n---\n\n## 3. New Tools\n\n### Eval Tool (replaces Python Tool)\n- `python.ts` \u2192 renamed to `eval.ts`\n- `PythonTool` \u2192 `EvalTool`\n- `PythonExecutionComponent` \u2192 `EvalExecutionComponent`\n- `ipy/` directory \u2192 moved to `eval/py/`\n- **New:** `eval/js/` \u2014 JavaScript eval backend\n- **New settings:**\n  - `eval.py` (boolean, default: true)\n  - `eval.js` (boolean, default: true)\n- **Action:** Add `eval.py` and `eval.js` to config inventory\n\n### Recipe Tool (new)\n- `packages/coding-agent/src/tools/recipe/` \u2014 entire new directory\n- Runners: cargo, just, make, pkg, task\n- **New setting:** `recipe.enabled` (boolean, default: true)\n- **Action:** Add `recipe.enabled` to config inventory\n\n### Browser Tool (major refactor)\n- Refactored into `tools/browser/` subdirectory (attach, launch, tab-protocol, tab-supervisor, tab-worker, etc.)\n- Dialog policy, drag targets, waitFor, new tab utility actions\n- **Impact on our `browser.connectUrl`:** Our commit `d5153405a` modified `tools/browser.ts`. The upstream refactored browser into a subdirectory. **HIGH CONFLICT RISK** \u2014 need to verify our connectUrl logic survives or port it to the new `browser/attach.ts`.\n\n### LSP Enhancements\n- rename/request/capabilities added to LSP client\n- Symbol occurrence selectors via `#N` suffix\n- No new settings \u2014 just expanded functionality\n\n---\n\n## 4. New Settings\n\n| Setting | Type | Default | Action |\n|---------|------|---------|--------|\n| `loop.mode` | enum: prompt/compact/reset | prompt | Add to config |\n| `eval.py` | boolean | true | Add to config |\n| `eval.js` | boolean | true | Add to config |\n| `recipe.enabled` | boolean | true | Add to config |\n| `searxng.basicUsername` | string | \u2014 | Add to config |\n| `searxng.basicPassword` | string | \u2014 | Add to config |\n\n### Model Registry Schema Changes\n- New fields: `requiresMistralToolIds`, `reasoningContentField`, `requiresReasoningContentForToolCalls`, `requiresAssistantContentForToolCalls`, `supportsToolChoice`, `disableReasoningOnForcedToolChoice`, `defaultLevel`\n- New provider auth: `disableStrictTools` option\n- **Impact:** Our `models-ow.yml` may need new fields for some models\n\n---\n\n## 5. Conflict Files (changed in both branches)\n\n| File | Our Changes | Upstream Changes | Risk |\n|------|-------------|------------------|------|\n| `.gitignore` | Added `.index.html` | Unknown | LOW \u2014 trivial merge |\n| `packages/ai/src/stream.ts` | aws-corp auth check + routing | AnthropicOptions typing | MEDIUM |\n| `packages/coding-agent/src/config/model-registry.ts` | `bedrock-converse-stream` API type | New schema fields, OAuth refactor, `disableStrictTools` | MEDIUM |\n| `packages/coding-agent/src/config/settings-schema.ts` | `disabledCommands` setting | New settings (loop, eval, recipe, searxng) | LOW \u2014 additive |\n| `packages/coding-agent/src/modes/controllers/selector-controller.ts` | TreePeekComponent wiring | OAuth import path change, `renderInitialMessages(sessionContext)` | MEDIUM |\n| `packages/coding-agent/src/modes/interactive-mode.ts` | Dynamic command list, `showTreeSelectorOriginal` | Loop mode, eval rename, context command, perf changes | HIGH |\n| `packages/coding-agent/src/modes/types.ts` | `showTreeSelectorOriginal` interface | Loop mode fields, eval rename, `handleContextCommand`, `renderInitialMessages` signature | HIGH |\n| `packages/coding-agent/src/sdk.ts` | Prompt engine wiring | Eval rename (`ipy/` \u2192 `eval/py/`), new imports | MEDIUM |\n| `packages/coding-agent/src/slash-commands/builtin-registry.ts` | `isCommandEnabled` guard, `getBuiltinSlashCommandDefs` | New `/loop` and `/context` commands, OAuth import change | MEDIUM |\n| `packages/coding-agent/src/tools/browser.ts` | `browser.connectUrl` | Major refactor into `browser/` subdirectory | **HIGH** |\n\n---\n\n## 6. /tree Changes\n\n**No upstream changes to tree-selector.ts or tree-peek.ts.** Our enhanced `/tree` with preview pane is untouched.\n\nHowever, `selector-controller.ts` has upstream changes:\n- OAuth import path changed: `@oh-my-pi/pi-ai` \u2192 `@oh-my-pi/pi-ai/utils/oauth`\n- `renderInitialMessages()` now accepts optional `sessionContext` parameter (perf optimization \u2014 skip second O(N) walk)\n\n**Action:** Apply the `renderInitialMessages(result.sessionContext)` optimization to our selector-controller code.\n\n---\n\n## 7. TodoPhase/TodoItem Changes\n\n- `id` field **removed** from both `TodoItem` and `TodoPhase` types\n- New `formatPhaseDisplayName` function for display\n- **Impact on session continuity:** If our session state tracks todo IDs, this will break. Need to verify.\n\n---\n\n## 8. Python \u2192 Eval Rename\n\nThis is a pervasive rename across the codebase:\n- `PythonTool` \u2192 `EvalTool`\n- `PythonExecutionComponent` \u2192 `EvalExecutionComponent`\n- `ipy/` \u2192 `eval/py/`\n- `python-execution.ts` \u2192 `eval-execution.ts`\n\n**Impact on our sdk.ts:** We import from `ipy/executor` \u2014 path changed to `eval/py/executor`. Will conflict.\n\n---\n\n## 9. Recommended Merge Order\n\n1. **Merge** `origin/main` into `aws-corp`\n2. **Resolve conflicts** in priority order:\n   - `interactive-mode.ts` + `types.ts` (highest complexity \u2014 loop mode + our tree changes)\n   - `sdk.ts` (eval rename + our prompt engine)\n   - `browser.ts` \u2192 port `connectUrl` to new `browser/attach.ts`\n   - `selector-controller.ts` (OAuth import + sessionContext optimization)\n   - `builtin-registry.ts` (new commands + our guard)\n   - `settings-schema.ts`, `model-registry.ts`, `stream.ts` (additive, lower risk)\n3. **Post-merge config updates:**\n   - Add `deepseek` to `disabledProviders`\n   - Add `eval.py`, `eval.js`, `recipe.enabled`, `loop.mode`, `searxng.*` to config inventory\n   - Decide on `/loop` for `disabledCommands`\n4. **Build and test**\n\n---\n\n## 10. Incompatibilities / Breaking Changes\n\n| Issue | Severity | Mitigation |\n|-------|----------|------------|\n| `browser.ts` refactored to `browser/` dir | HIGH | Port `connectUrl` to `browser/attach.ts` |\n| `PythonTool` \u2192 `EvalTool` rename | MEDIUM | Our sdk.ts import paths need updating |\n| `TodoItem.id` / `TodoPhase.id` removed | LOW | Verify session continuity doesn't depend on these |\n| OAuth import paths changed | LOW | Mechanical fix in selector-controller |\n| `renderInitialMessages` signature changed | LOW | Update our call sites |\n";
+const el = document.getElementById('content');
+
+const md = src.replace(/(```[\s\S]*?```|`[^`]+`)|<([A-Z][A-Z_0-9]*?)>/g, (m, code, tag) => code ? code : '&lt;' + tag + '&gt;');
+el.innerHTML = marked.parse(md, {breaks: true});
+
+// Wrap headings into collapsible sections
+(function(el) {
+  var headings = el.querySelectorAll('h1, h2, h3, h4, h5, h6');
+  var hArr = Array.from(headings).reverse();
+  hArr.forEach(function(h) {
+    var lvl = parseInt(h.tagName[1]);
+    var name = h.textContent.trim();
+    var d = document.createElement('details');
+    d.className = 'sec lvl-' + lvl;
+    d.open = true;
+    var s = document.createElement('summary');
+    s.innerHTML = '<span class="sec-badge">' + lvl + '</span><span class="sec-arrow">\u25B6</span>' + name;
+    var nodes = [];
+    var sib = h.nextElementSibling;
+    while (sib) {
+      var sibLvl = 0;
+      if (/^H[1-6]$/.test(sib.tagName)) sibLvl = parseInt(sib.tagName[1]);
+      else if (sib.tagName === 'DETAILS' && sib.classList.contains('sec')) {
+        var m = sib.className.match(/lvl-(\d)/);
+        if (m) sibLvl = parseInt(m[1]);
+      }
+      if (sibLvl && sibLvl <= lvl) break;
+      nodes.push(sib);
+      sib = sib.nextElementSibling;
+    }
+    h.parentNode.insertBefore(d, h);
+    h.remove();
+    d.appendChild(s);
+    nodes.forEach(function(n) { d.appendChild(n); });
+  });
+  // Expand/collapse toggle
+  var firstSec = el.querySelector('details.sec');
+  if (firstSec) {
+    var tog = document.createElement('div');
+    tog.style.cssText = 'font-size:11px;color:#888;cursor:pointer;margin:4px 0 8px;user-select:none;';
+    tog.textContent = '\u25BC collapse all';
+    tog.onclick = function() {
+      var open = tog.textContent.indexOf('collapse') >= 0;
+      el.querySelectorAll('details').forEach(function(d) { d.open = !open; });
+      tog.textContent = open ? '\u25B6 expand all' : '\u25BC collapse all';
+    };
+    firstSec.before(tog);
+  }
+})(el);
+
+el.querySelectorAll('a').forEach(a => { a.target = '_blank'; a.rel = 'noopener'; });
+initDiagrams(el);
+</script>
+</body>
+</html>
