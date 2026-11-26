@@ -100,3 +100,10 @@ packages/coding-agent/bench/boot-baseline.json
 /.bazelrc.user
 
 .parity/
+
+# Playwright MCP scratch: page snapshots and console logs written next to cwd
+.playwright-mcp/
+
+# Retired native addons: install-open-sdk.py renames a stale .node aside because
+# Windows cannot delete a mapped image; never commit those.
+*.stale.bak

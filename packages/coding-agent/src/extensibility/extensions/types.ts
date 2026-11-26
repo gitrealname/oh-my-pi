@@ -95,6 +95,7 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { LoopLimitConfig } from "../../modes/loop-limit";
+import type * as PiOpenSdk from "../../open-sdk";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
@@ -1942,6 +1943,9 @@ export interface ExtensionAPI {
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;
+
+	/** Open-sdk subpath — clean namespace for LLM calls, settings, stream utils, and TUI helpers */
+	openSdk: typeof PiOpenSdk;
 
 	// =========================================================================
 	// Event Subscription
